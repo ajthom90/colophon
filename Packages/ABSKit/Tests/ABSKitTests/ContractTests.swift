@@ -30,7 +30,8 @@ struct ContractTests {
         #expect(page.total >= 1)
 
         let device = DeviceInfo(deviceId: "contract-test", clientVersion: "0.1.0", model: "test")
-        let session = try await client.startPlayback(itemID: page.results[0].id, deviceInfo: device)
+        let envelope = try await client.startPlayback(itemID: page.results[0].id, deviceInfo: device)
+        let session = envelope.session
         #expect(!session.audioTracks.isEmpty)
         #expect(session.playMethod == 0)  // seeded mp3s must direct-play
 
@@ -45,6 +46,11 @@ struct ContractTests {
 
         try await client.syncSession(id: session.id, currentTime: 30, timeListened: 15, duration: session.duration)
         try await client.closeSession(id: session.id, currentTime: 30, timeListened: 0, duration: session.duration)
+
+        // Closed sessions are gone from server memory: sync must now 404.
+        await #expect(throws: ABSError.http(status: 404)) {
+            try await client.syncSession(id: session.id, currentTime: 31, timeListened: 1, duration: session.duration)
+        }
     }
 
     @Test func coverEndpointIsUnauthenticatedAndServesImage() async throws {

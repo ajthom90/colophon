@@ -19,8 +19,8 @@ import Testing
         let (client, transport) = try await makeSUT()
         await transport.enqueue(status: 200, json: sessionJSON)
         let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
-        let session = try await client.startPlayback(itemID: "li_1", deviceInfo: device)
-        #expect(session.id == "ses_1")
+        let envelope = try await client.startPlayback(itemID: "li_1", deviceInfo: device)
+        #expect(envelope.session.id == "ses_1")
         let req = await transport.recorded.first
         #expect(req?.url?.absoluteString == "http://abs.test:13378/api/items/li_1/play")
         #expect(req?.httpMethod == "POST")

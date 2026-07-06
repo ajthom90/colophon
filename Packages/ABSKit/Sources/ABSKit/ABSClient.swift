@@ -65,11 +65,20 @@ public final class ABSClient: Sendable {
     }
 }
 
+/// A `startPlayback` response paired with the raw bytes the server returned. The raw bytes
+/// are the exact shape `api/session/local` expects for 404-recovery upserts — re-encoding the
+/// decoded `PlaybackSession` would drop server fields we don't model and risk a shape mismatch.
+public struct PlaybackSessionEnvelope: Sendable {
+    public let session: PlaybackSession
+    public let rawData: Data
+    public init(session: PlaybackSession, rawData: Data) { self.session = session; self.rawData = rawData }
+}
+
 extension ABSClient {
     /// MIME types AVPlayer direct-plays; anything else transcodes to HLS server-side.
     static let supportedMimeTypes = ["audio/mpeg", "audio/mp4", "audio/aac", "audio/flac", "audio/x-m4b"]
 
-    public func startPlayback(itemID: String, deviceInfo: DeviceInfo) async throws -> PlaybackSession {
+    public func startPlayback(itemID: String, deviceInfo: DeviceInfo) async throws -> PlaybackSessionEnvelope {
         struct PlayRequest: Encodable {
             let deviceInfo: DeviceInfo
             let mediaPlayer: String
@@ -84,7 +93,26 @@ extension ABSClient {
             deviceInfo: deviceInfo, mediaPlayer: "AVPlayer",
             supportedMimeTypes: Self.supportedMimeTypes,
             forceDirectPlay: false, forceTranscode: false))
-        return try await authorizedSend(req, as: PlaybackSession.self)
+        let data = try await authorizedData(req)
+        let session = try ABSAPI.decoder.decode(PlaybackSession.self, from: data)
+        return PlaybackSessionEnvelope(session: session, rawData: data)
+    }
+
+    /// Recovery path when the server has restarted and lost the in-memory session (sync/close
+    /// then 404): resubmits the original `startPlayback` JSON with progress fields overwritten,
+    /// which the server accepts as a local-progress upsert independent of session lifecycle.
+    public func postLocalSession(rawData: Data, currentTime: Double, totalListened: Double) async throws {
+        guard var object = try JSONSerialization.jsonObject(with: rawData) as? [String: Any] else {
+            throw ABSError.invalidResponse
+        }
+        object["currentTime"] = currentTime
+        object["timeListening"] = totalListened
+        object["updatedAt"] = Int(Date().timeIntervalSince1970 * 1000)
+        var req = URLRequest(url: baseURL.appending(path: "api/session/local"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONSerialization.data(withJSONObject: object)
+        _ = try await authorizedData(req)
     }
 
     public func syncSession(id: String, currentTime: Double, timeListened: Double, duration: Double) async throws {
