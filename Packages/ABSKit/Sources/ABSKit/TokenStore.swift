@@ -34,7 +34,7 @@ public actor InMemoryTokenStore: TokenStore {
 /// Device-local by design: refresh tokens rotate on every use, so they must never
 /// sync between devices (kSecAttrSynchronizable stays false).
 public actor KeychainTokenStore: TokenStore {
-    private let service = "com.ajthom90.colophon.tokens"
+    private let service = "com.andrewthom.colophon.tokens"
     public init() {}
 
     public func tokens(for connectionID: String) -> TokenPair? {

@@ -1,6 +1,6 @@
 name: Colophon
 options:
-  bundleIdPrefix: com.ajthom90
+  bundleIdPrefix: com.andrewthom
   deploymentTarget:
     iOS: "26.0"
     macOS: "26.0"
@@ -20,7 +20,9 @@ targets:
       - package: PlayerEngine
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.ajthom90.colophon
+        PRODUCT_BUNDLE_IDENTIFIER: com.andrewthom.colophon
+        DEVELOPMENT_TEAM: LL334G7KP2
+        CODE_SIGN_STYLE: Automatic
         PRODUCT_NAME: Colophon
         SWIFT_VERSION: "6.2"
         SWIFT_STRICT_CONCURRENCY: complete
@@ -29,7 +31,6 @@ targets:
         CODE_SIGN_ENTITLEMENTS: App/Colophon.entitlements
         MARKETING_VERSION: "0.1.0"
         CURRENT_PROJECT_VERSION: 1
-        CODE_SIGN_IDENTITY[sdk=macosx*]: "-"
     info:
       path: App/Info.plist
       properties:

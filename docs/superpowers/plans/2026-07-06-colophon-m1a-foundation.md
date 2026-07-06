@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- All M0 global constraints still bind (deployment targets iOS/macOS 26.0; Xcode 26.6; strict concurrency; bundle ID `com.ajthom90.colophon`; server ≥ 2.26.0; commit trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`).
+- All M0 global constraints still bind (deployment targets iOS/macOS 26.0; Xcode 26.6; strict concurrency; server ≥ 2.26.0; commit trailer `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`) — EXCEPT the bundle ID, which is now **`com.andrewthom.colophon`** (changed 2026-07-06) with `DEVELOPMENT_TEAM: LL334G7KP2` and `CODE_SIGN_STYLE: Automatic` in project.yml. Never reintroduce the old `com.ajthom90.*` identifiers.
 - New dependencies, exactly: `https://github.com/groue/GRDB.swift` from `"7.0.0"` (LibraryCache package only) and `https://github.com/socketio/socket.io-client-swift` from `"16.1.0"` (ABSKit package's new `ABSRealtime` target only — the core `ABSKit` target stays dependency-free).
 - Socket config per the M0 spike verdict: `.forceWebsockets(true), .version(.three), .compress` plus tuned `.reconnectWait(2), .reconnectWaitMax(10)`.
 - Session semantics: `timeListened` = delta since last **successful** sync; accrual during an in-flight sync must survive (`didSync` consumes only the emitted amount); every started session is eventually closed or flushed (background/termination included); sync 404 → `POST /api/session/local` upsert fallback (server restarted; sessions are in-memory).
@@ -776,7 +776,7 @@ playback.load(session: envelope.session, trackURLs: urls)
 
 (`envelope` arrives in Task 5 — until that task lands, keep `session` naming; this task only changes construction + `load` call shape + adds to the DEBUG hook: `if env["COLOPHON_AUTO_MUTE"] == "1" { playback.muted = true }`.)
 
-- [ ] **Step 6: Run everything** — `make test` (PlayerEngine now ≥ 19 tests incl. 7 new controller tests; ABSKit unchanged), `make build-ios`, `make build-mac`. Then a short headless E2E smoke on the iOS simulator (AUTO_CONNECT/AUTO_PLAY/**AUTO_MUTE=1**/AUTO_SEEK across the boundary as in M0) to prove the AVQueuePlayerBackend refactor didn't regress: server progress advances continuously across the 506.775s boundary. **Terminate the app afterward** (`xcrun simctl terminate booted com.ajthom90.colophon`).
+- [ ] **Step 6: Run everything** — `make test` (PlayerEngine now ≥ 19 tests incl. 7 new controller tests; ABSKit unchanged), `make build-ios`, `make build-mac`. Then a short headless E2E smoke on the iOS simulator (AUTO_CONNECT/AUTO_PLAY/**AUTO_MUTE=1**/AUTO_SEEK across the boundary as in M0) to prove the AVQueuePlayerBackend refactor didn't regress: server progress advances continuously across the 506.775s boundary. **Terminate the app afterward** (`xcrun simctl terminate booted com.andrewthom.colophon`).
 
 - [ ] **Step 7: Commit** — `git add Packages/PlayerEngine App && git commit -m "refactor(PlayerEngine): PlayerBackend seam; unit-tested controller; mute hook"`
 
@@ -1377,7 +1377,7 @@ ContentUnavailableView {
 
 (Cover grid cell layout unchanged; `CachedLibrary` needs `Hashable` for the navigation value — it is, via Equatable+Codable synthesis with Hashable added to the record conformances in Task 6; if omitted there, add it now and note it.)
 
-- [ ] **Step 3: Verify** — `make test && make build-ios && make build-mac`. Manual/headless evidence (all MUTED): (a) fresh connect → browse works; (b) relaunch with `docker stop colophon-abs` → libraries and items still render from cache (screenshot or log the observed cache counts); (c) `docker start colophon-abs`. Keychain migration: verified by connecting once on a build BEFORE this task (M0 keychain key), then once after — no re-login prompt (document in report; if testing that flow is impractical in the simulator timeline, verify the migration function with a temporary in-memory store test in ABSKitTests and note it).
+- [ ] **Step 3: Verify** — `make test && make build-ios && make build-mac`. Manual/headless evidence (all MUTED): (a) fresh connect → browse works; (b) relaunch with `docker stop colophon-abs` → libraries and items still render from cache (screenshot or log the observed cache counts); (c) `docker start colophon-abs`. Keychain migration: NOTE — the 2026-07-06 bundle-ID change also changed the Keychain service name, so no real legacy entries exist to migrate on dev machines; keep the migration code (it is the correct behavior for any hypothetical M0-era install) and verify the function with an in-memory-store unit test in ABSKitTests instead of a manual flow.
 
 - [ ] **Step 4: Commit** — `git add App Packages && git commit -m "feat(app): cache-backed browse, connection UUIDs, keychain migration, retry UX"`
 

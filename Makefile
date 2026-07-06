@@ -5,11 +5,13 @@ gen:
 
 build-ios: gen
 	xcodebuild -project Colophon.xcodeproj -scheme Colophon \
-	  -destination 'platform=iOS Simulator,name=$(SIM)' build | tail -5
+	  -destination 'platform=iOS Simulator,name=$(SIM)' \
+	  -allowProvisioningUpdates build | tail -5
 
 build-mac: gen
 	xcodebuild -project Colophon.xcodeproj -scheme Colophon \
-	  -destination 'platform=macOS' build | tail -5
+	  -destination 'platform=macOS' \
+	  -allowProvisioningUpdates build | tail -5
 
 test:
 	cd Packages/ABSKit && swift test
