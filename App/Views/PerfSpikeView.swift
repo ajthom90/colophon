@@ -4,10 +4,16 @@ import Foundation
 
 /// Cross-file handoff for "time from window-open request to first rendered content".
 /// `ColophonApp`'s auto-opener stamps `windowOpenRequestedAt` right before calling
-/// `openWindow(id:)`; `PerfSpikeView` reads it when its first cell appears. When the
-/// window is opened manually (no env flag), this stays nil and elapsed-since-`Date()`
-/// collapses to ~0 — that path isn't meaningful and isn't used for verdicts.
+/// `openWindow(id:)`; `PerfSpikeView` reads it when its first cell appears.
+///
+/// Gotcha this design has to survive: if the previous process was killed with the
+/// perf-spike window open, macOS state restoration re-creates that window at launch
+/// BEFORE the auto-opener's `.task` runs — so `windowOpenRequestedAt` is still nil when
+/// the first cell appears. `processLaunch` (stamped in `ColophonApp.init()`) is the
+/// fallback origin for that path, and the measurement log line labels which origin was
+/// used so a restored-window measurement can never masquerade as an open-window one.
 enum PerfSpikeClock {
+    static var processLaunch: Date?
     static var windowOpenRequestedAt: Date?
 }
 
@@ -106,9 +112,18 @@ struct PerfSpikeView: View {
     private func recordFirstContentIfNeeded(cellID: Int) {
         guard cellID == 0, !firstContentRecorded else { return }
         firstContentRecorded = true
-        let start = PerfSpikeClock.windowOpenRequestedAt ?? Date()
-        let elapsedMS = Date().timeIntervalSince(start) * 1000
-        perfLog("[PerfSpike] time_to_first_content_ms=\(fmt(elapsedMS))")
+        let now = Date()
+        if let requested = PerfSpikeClock.windowOpenRequestedAt {
+            let elapsedMS = now.timeIntervalSince(requested) * 1000
+            perfLog("[PerfSpike] time_to_first_content_ms=\(fmt(elapsedMS)) origin=open_window_request")
+        } else if let launch = PerfSpikeClock.processLaunch {
+            let elapsedMS = now.timeIntervalSince(launch) * 1000
+            perfLog("[PerfSpike] time_to_first_content_ms=\(fmt(elapsedMS)) origin=process_launch "
+                    + "(window existed before auto-opener ran — likely state restoration; "
+                    + "NOT comparable to origin=open_window_request)")
+        } else {
+            perfLog("[PerfSpike] time_to_first_content_ms=unmeasured (no launch timestamp; window opened manually)")
+        }
     }
 
     /// Runs `COLOPHON_PERF_SWEEP_COUNT` (default 2) top→bottom→top passes, each ~20s

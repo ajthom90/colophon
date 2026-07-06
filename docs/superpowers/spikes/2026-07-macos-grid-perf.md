@@ -1,22 +1,28 @@
 # Spike: macOS LazyVGrid performance at 10k items
 
 **Date:** 2026-07-06
-**Task:** M0 Task 14 — go/no-go for the M3 Mac shell's library grid
+**Task:** M0 Task 14 — go/no-go for the Milestone 3 (Mac polish) shell's library grid
 **Code:** `App/Views/PerfSpikeView.swift` (DEBUG+macOS only), `App/ColophonApp.swift`
 (DEBUG+macOS-only `Window("Perf Spike", id: "perf-spike")` scene + auto-opener)
+
+**Terminology:** in this project, "M0"/"M1"/"M3" are *plan milestones* (M1 =
+Milestone 1, the first shipping library UI; M3 = Milestone 3, the Mac-polish
+milestone) — **not** Apple silicon chip generations. Where hardware is meant, the
+chip is named in full (e.g., "Apple M2 Ultra").
 
 ## Verdict: LazyVGrid OK to proceed, budget for cell simplification — NOT yet a full sign-off
 
 Plain `LazyVGrid` inside a `ScrollView` handles a synthetic 10,000-item grid on this
 machine with a **low but non-zero rate of frame-scheduling hitches** (0.04%–1.56% of
 timer samples across four sweeps) and no sustained stalls. That is a green light to
-**keep building the M3 library grid on `LazyVGrid`** rather than reaching for an
-`NSCollectionView` wrapper right now. It is **not** an unconditional "ships as-is":
-the occasional hitches showed up even with cells far lighter than real book covers
-(see caveats), the test hardware is a much more powerful chip than the actual M3
-target, and no human has watched this scroll yet. Recommendation and conditions are
-in full below — treat this as "proceed, with two follow-up gates before M1 locks in
-the grid," not "done."
+**keep building the Milestone 3 (Mac shell) library grid on `LazyVGrid`** rather
+than reaching for an `NSCollectionView` wrapper right now. It is **not** an
+unconditional "ships as-is": the occasional hitches showed up even with cells far
+lighter than real book covers (see Caveats), the test hardware (an Apple M2 Ultra —
+a powerful desktop-class chip) is far above the low-end consumer Macs real users
+will run, and no human has watched this scroll yet. Recommendation and conditions
+are in full below — treat this as "proceed, with two follow-up gates before
+Milestone 3 (Mac polish) locks in the grid," not "done."
 
 ## Environment
 
@@ -41,11 +47,13 @@ swift-driver version: 1.148.6 Apple Swift version 6.3.3 (swiftlang-6.3.3.1.3 cla
 Target: arm64-apple-macosx26.0
 ```
 
-**This is not M3 hardware.** The brief targets "the M3 Mac shell"; the only Mac
-available to run this spike is an M2 Ultra Mac Studio-class machine — 24 CPU cores
-(16P+8E) and far more memory bandwidth/GPU throughput than a base M3 MacBook
-Air/Pro or Mac mini will have. Every millisecond in this document should be read as
-**a lower bound on hitching, not an M3 prediction** — see Caveats.
+**This is high-end hardware, not what typical users run.** The only Mac available
+to run this spike is an Apple M2 Ultra Mac Studio-class machine — 24 CPU cores
+(16P+8E) and far more memory bandwidth/GPU throughput than the low-end consumer
+Macs (e.g., a base MacBook Air) at the bottom of the range real users will run
+Colophon on. Every millisecond in this document should be read as **a lower bound
+on hitching for the consumer-hardware range, not a prediction of it** — see
+Caveats.
 
 `system_profiler SPDisplaysDataType` reported one attached display at
 "3200×1800 @ 30.00Hz" and a second at "2560×1440 @ 100.00Hz," both non-standard
@@ -82,7 +90,15 @@ main-thread scheduling gaps in milliseconds (see Instrumentation).
     CVDisplayLink/CADisplayLink tie-in to real vsync. Reports max/mean gap and count
     of gaps >33ms.
   - Time-to-first-content: `PerfSpikeClock.windowOpenRequestedAt` (set by the
-    auto-opener) vs. the first grid cell's `onAppear`, printed once.
+    auto-opener right before `openWindow`) vs. the first grid cell's `onAppear`,
+    printed once with an `origin=` label. If the window already existed before the
+    auto-opener ran (macOS state restoration re-creates it when the previous
+    process was killed with the window open), the measurement instead uses a
+    process-launch timestamp stamped in `ColophonApp.init()` and is labeled
+    `origin=process_launch` so it can never masquerade as an
+    `origin=open_window_request` number. (The first version of this instrumentation
+    lacked the label and silently fell back to "now", printing a meaningless
+    `0.00` — see the fix note under Measurements.)
   - All results printed to stdout via a `perfLog` helper that calls
     `fflush(stdout)` after every `print`, so output is captured in real time
     through a redirected log file even though stdout isn't a TTY when launched via
@@ -153,14 +169,34 @@ mean 9.87ms, 2263 samples, 16 hitches (0.71%), `time_to_first_content_ms=69.04`,
 a primary data point since it predates the final instrumentation.)
 
 **Time to first content** (window-open request → first grid cell's `onAppear`):
-Launch A = 0.00ms, Launch B = 0.00ms (both effectively instant — dyld/shared-cache
-and window-server connections were already warm from the immediately-preceding
-launch); the isolated dry run above, further from any prior launch, measured
-69.04ms. Read this as "sub-100ms either way on this hardware," not as a precise
-number — see Caveats on timer resolution.
+**23–42ms** on this hardware, from two clean re-runs after an instrumentation fix
+(42.12ms and 22.99ms, both labeled `origin=open_window_request`).
 
-**Memory footprint** (`footprint <pid>` after both in-process sweeps completed,
-before killing the process):
+*Fix note — the original launches A/B printed `time_to_first_content_ms=0.00`,
+which was an instrumentation bug, not a measurement.* Root cause, confirmed by a
+diagnostic re-run: launches A and B were each started after killing a previous
+process that had the perf-spike window open, so macOS state restoration re-created
+that window at launch, and the first cell's `onAppear` fired *before* the
+auto-opener's `.task` stamped `windowOpenRequestedAt`. The first version of the
+code silently fell back to "now" as the start time, yielding exactly 0.00. The
+fixed instrumentation labels every measurement's origin; the diagnostic run (state
+restoration still active) printed `time_to_first_content_ms=175.93
+origin=process_launch (window existed before auto-opener ran…)` — proving the
+restored-window path — and the two clean runs (state restoration suppressed via
+`defaults write com.ajthom90.colophon ApplePersistenceIgnoreState YES`) measured
+the real openWindow→first-content path at 42.12ms and 22.99ms. Note this also
+means the sweep in launches A/B ran in a *restored* window rather than a
+freshly-opened one; the frame-gap data is unaffected (the sweep triggers off the
+view's `onAppear` + env var either way, and no duplicate sweep starts appear in
+the logs), but it explains the 0.00 artifact lines preserved in the raw output
+below. The dry run's 69.04ms predates the origin labeling but was a genuine
+openWindow-path measurement (no perf-spike window existed in saved state at that
+point — the prior process had died windowless).
+
+**Memory footprint** — sampled *externally* from the terminal by running Apple's
+`/usr/bin/footprint <pid>` against the live process (this is not in-process
+instrumentation), after both in-process sweeps completed and before killing the
+process:
 
 | Launch | phys_footprint | phys_footprint_peak | RSS (`ps`) |
 |---|---|---|---|
@@ -172,7 +208,9 @@ within ~1.3x of the post-sweep resting value) — no evidence of a cell/view lea
 this run, though two ~45-second sessions is a thin basis for a leak verdict either
 way.
 
-**Raw log output** (Launch A, in full):
+**Raw log output** (Launch A, in full — the `time_to_first_content_ms=0.00` lines
+are the instrumentation artifact explained in the fix note above, preserved here
+because raw evidence shouldn't be retouched):
 
 ```
 [PerfSpike] time_to_first_content_ms=0.00
@@ -194,6 +232,19 @@ Launch B:
 [PerfSpike] ALL_SWEEPS_COMPLETE
 ```
 
+Diagnostic + clean re-runs after the first-content instrumentation fix (first
+lines only; sweeps were not left to complete since the frame-gap data above
+already stands):
+
+```
+# diagnostic (state restoration active — proves the restored-window path):
+[PerfSpike] time_to_first_content_ms=175.93 origin=process_launch (window existed before auto-opener ran — likely state restoration; NOT comparable to origin=open_window_request)
+# clean run 1 (ApplePersistenceIgnoreState YES):
+[PerfSpike] time_to_first_content_ms=42.12 origin=open_window_request
+# clean run 2:
+[PerfSpike] time_to_first_content_ms=22.99 origin=open_window_request
+```
+
 Note Launch B's warm sweep (32 hitches) was *worse* than its own cold sweep (26
 hitches), while Launch A's warm sweep (1 hitch) was much *better* than its cold
 sweep (12 hitches). Cold-vs-warm is not a clean monotonic win in this data — the
@@ -201,7 +252,9 @@ between-launch variance (driven by whatever else was running on this shared
 machine at the time) is at least as large as the cold/warm effect within a launch.
 Treat "warm is better" as unconfirmed, not as a finding.
 
-## What this instrumentation CAN and CANNOT tell us
+## Caveats — what this instrumentation CAN and CANNOT tell us
+
+(All "see Caveats" references elsewhere in this document point here.)
 
 **Can tell us:**
 - Whether the main thread's run loop goes substantially unresponsive (tens/hundreds
@@ -232,10 +285,10 @@ Treat "warm is better" as unconfirmed, not as a finding.
   meaningfully more CPU/GPU per layout pass, the hitch rates measured here
   (0.04%–1.56%) should be expected to be a **floor, not a ceiling**, for the real
   grid.
-- M3 behavior. Measured on an M2 Ultra (16P+8E, 24 cores) — a chip with far more
-  raw throughput than any actual M3 Mac shipping today. A base M3 (4P+4E on
-  MacBook Air) doing the same work should be expected to show a *higher* hitch
-  rate than what's reported here, not the same or lower.
+- Low-end-hardware behavior. Measured on an Apple M2 Ultra (16P+8E, 24 cores) — a
+  powerful desktop-class chip. Real users run everything from base MacBook Airs
+  up; a low-end consumer machine doing the same work should be expected to show a
+  *higher* hitch rate than what's reported here, not the same or lower.
 - Scrollbar-drag / discontinuous jump-scroll. The brief's Step 3 also suggested
   testing a scroller-drag jump; this spike only exercises smooth animated
   `scrollTo` sweeps, not a discontinuous multi-thousand-row jump, which forces a
@@ -244,27 +297,28 @@ Treat "warm is better" as unconfirmed, not as a finding.
   background system load contention (this machine is shared/multi-purpose during
   this session).
 
-## Recommendation for the M3 Mac shell
+## Recommendation for the Milestone 3 (Mac polish) shell
 
-**Proceed with `LazyVGrid`** for the M3 library grid — do not pre-emptively build
-an `NSCollectionView` wrapper. Nothing observed here indicates `LazyVGrid` is
-structurally unable to handle a 10k-item macOS grid; the hitch rates are low, and
-SwiftUI's own diffing/recycling handled the synthetic content without any
-catastrophic multi-hundred-ms stalls.
+**Proceed with `LazyVGrid`** for the Milestone 3 Mac library grid — do not
+pre-emptively build an `NSCollectionView` wrapper. Nothing observed here indicates
+`LazyVGrid` is structurally unable to handle a 10k-item macOS grid; the hitch
+rates are low, and SwiftUI's own diffing/recycling handled the synthetic content
+without any catastrophic multi-hundred-ms stalls.
 
 **But treat this as conditional, not a final sign-off**, given the caveats above.
-Two concrete gates before trusting the grid at M1 scale:
+Two concrete gates before Milestone 3 (Mac polish) locks in this grid:
 
 1. **Re-run with real cell content** (actual cover-art loading path + real
-   title/author strings) once that view exists, using the same
-   `COLOPHON_PERF_AUTOSCROLL`/`COLOPHON_PERF_SWEEP_COUNT` harness — watch
-   specifically whether the hitch rate stays in the same ballpark or climbs once
-   image decode/state-transition cost is added per cell.
-2. **Get a human to actually watch it scroll** (ideally on real M3 hardware, or at
-   minimum on this machine) — fast continuous scroll top-to-bottom, then a
-   scrollbar-drag jump, per the brief's original Step 3. This spike's numeric
-   instrumentation is a proxy; it is not a substitute for eyes on the screen.
-   **PENDING HUMAN VERIFICATION.**
+   title/author strings) once the real library-grid cell view exists — the library
+   UI ships in Milestone 1, so this gate can run any time after that view lands —
+   using the same `COLOPHON_PERF_AUTOSCROLL`/`COLOPHON_PERF_SWEEP_COUNT` harness.
+   Watch specifically whether the hitch rate stays in the same ballpark or climbs
+   once image decode/state-transition cost is added per cell.
+2. **Get a human to actually watch it scroll** (ideally on a low-end consumer
+   machine — e.g., a base MacBook Air — or at minimum on this machine) — fast
+   continuous scroll top-to-bottom, then a scrollbar-drag jump, per the brief's
+   original Step 3. This spike's numeric instrumentation is a proxy; it is not a
+   substitute for eyes on the screen. **PENDING HUMAN VERIFICATION.**
 
 If gate 1 shows a meaningfully higher hitch rate with real covers, the next lever
 to pull is cell simplification (downsampled/pre-resized thumbnails, avoid
@@ -289,3 +343,11 @@ shows `LazyVGrid` itself is the bottleneck.
 - `print()` piped through `open --stdout <file>` is not line-buffered by default;
   call `fflush(stdout)` after every `print()` you need to observe in real time from
   a polling script, or you'll only see it at process exit.
+- **State restoration races your on-launch hooks.** If a previous process was
+  killed with app windows open, the next LaunchServices launch re-creates those
+  windows via state restoration *before* your own `.task`/auto-open hooks run. Any
+  "time from window-open" instrumentation must label its timing origin explicitly
+  (or suppress restoration for the run:
+  `defaults write <bundle-id> ApplePersistenceIgnoreState YES`), or it will
+  silently measure garbage — this exact failure produced the `0.00`
+  first-content artifact documented and fixed above.

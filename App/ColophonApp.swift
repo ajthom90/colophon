@@ -22,6 +22,12 @@ private struct PerfSpikeAutoOpener: View {
 struct ColophonApp: App {
     @State private var app = AppState()
 
+    init() {
+        #if DEBUG && os(macOS)
+        PerfSpikeClock.processLaunch = Date()
+        #endif
+    }
+
     var body: some Scene {
         WindowGroup {
             Group {
