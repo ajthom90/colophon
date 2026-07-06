@@ -20,12 +20,14 @@ public actor CoverStore {
         if let data = try? Data(contentsOf: file), !data.isEmpty { return data }
         let data = try await fetch()
         try FileManager.default.createDirectory(at: connDir, withIntermediateDirectories: true)
+        // Write the new file BEFORE sweeping stale ones (excluding the fresh file from the
+        // sweep) so a crash mid-sequence never leaves an item with zero cached covers.
+        try data.write(to: file, options: .atomic)
         if let stale = try? FileManager.default.contentsOfDirectory(atPath: connDir.path) {
-            for name in stale where name.hasPrefix("\(itemID)-") {
+            for name in stale where name.hasPrefix("\(itemID)-") && name != file.lastPathComponent {
                 try? FileManager.default.removeItem(at: connDir.appending(path: name))
             }
         }
-        try data.write(to: file, options: .atomic)
         return data
     }
 }
