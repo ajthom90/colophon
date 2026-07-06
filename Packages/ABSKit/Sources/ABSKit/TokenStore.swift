@@ -16,6 +16,15 @@ public enum TokenStoreError: Error, Equatable {
     case encodingFailure
 }
 
+extension TokenStoreError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .keychainFailure(let status): "Couldn't store credentials securely (Keychain error \(status))."
+        case .encodingFailure: "Couldn't encode credentials for storage."
+        }
+    }
+}
+
 public protocol TokenStore: Sendable {
     func tokens(for connectionID: String) async -> TokenPair?
     func save(_ tokens: TokenPair, for connectionID: String) async throws

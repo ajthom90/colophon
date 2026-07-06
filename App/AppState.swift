@@ -42,6 +42,11 @@ final class AppState {
             let transport = URLSessionTransport()
             let status = try await ABSClient.status(baseURL: url, transport: transport)
             guard status.isInit else { throw ABSError.invalidResponse }
+            guard let versionString = status.serverVersion,
+                  let version = ServerVersion(versionString),
+                  !(version < ABSKit.minimumServerVersion) else {
+                throw ABSError.serverTooOld(found: status.serverVersion ?? "unknown")
+            }
             let auth = AuthManager(baseURL: url, connectionID: url.absoluteString,
                                    transport: transport, store: tokenStore)
             _ = try await auth.login(username: username, password: password)
@@ -55,7 +60,7 @@ final class AppState {
             errorMessage = "Wrong username or password"
         } catch {
             phase = .disconnected
-            errorMessage = "Could not connect: \(error.localizedDescription)"
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 

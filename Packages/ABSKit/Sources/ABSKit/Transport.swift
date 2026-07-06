@@ -32,6 +32,20 @@ public enum ABSError: Error, Equatable {
     case notAuthenticated
     case reauthRequired
     case invalidResponse
+    case serverTooOld(found: String)
+}
+
+extension ABSError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .http(let status): "The server returned an error (HTTP \(status))."
+        case .notAuthenticated: "You're not signed in to this server."
+        case .reauthRequired: "Your session expired. Please sign in again."
+        case .invalidResponse: "The server sent an unexpected response."
+        case .serverTooOld(let found):
+            "This server runs Audiobookshelf \(found). Colophon requires 2.26.0 or newer."
+        }
+    }
 }
 
 public enum ABSAPI {
