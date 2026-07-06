@@ -1,8 +1,8 @@
 # Native Apple Audiobookshelf Client — Design Spec
 
 **Date:** 2026-07-06
-**Status:** Approved design, pending final user review
-**Working title:** TBD (name shortlist under evaluation; App Store naming will follow the accepted "*Name* — for Audiobookshelf" pattern used by third-party clients)
+**Status:** Approved (user-reviewed 2026-07-06)
+**Name:** **Colophon** — App Store listing "Colophon — for Audiobookshelf" (nominative-use pattern shared by other third-party clients). Collision-checked 2026-07-06: no App Store name matches; nearest brand (Colophon Foundry) is a Monotype-owned type foundry, different category. OIDC URL scheme: `colophon://oauth`.
 
 ## 1. Overview
 
@@ -126,7 +126,7 @@ Free app, all features free. **Tip jar**: StoreKit 2 consumable IAPs (e.g., $1.9
 
 ## 7. App Store & legal
 
-- Name pattern "*Name* — for Audiobookshelf" (nominative use; matches Still/Absorb precedent). Working title pending user pick.
+- Name: "Colophon — for Audiobookshelf" (nominative use; matches Still/Absorb precedent).
 - Review prep: hosted demo ABS server + demo credentials in review notes (reviewers must exercise login/playback); note explaining self-hosted-server requirement (Plex/Jellyfin precedent).
 - **CarPlay audio entitlement (`com.apple.developer.carplay-audio`): apply at project start** — case-by-case approval, days-to-weeks, blocks even building the CarPlay scene with a real profile.
 - Licenses: GRDB (MIT), socket.io-client-swift (MIT), AudiobookshelfKit (MIT, reference only). Never copy from ShelfPlayer (MPL + Commons Clause) or GPL projects (official app, absorb, swiftshelf). AudioBooth (plain MPL-2.0): study freely; any copied file keeps MPL notice — prefer clean-room.
@@ -167,6 +167,7 @@ Each milestone ends with the superpowers verification/review flow before moving 
 
 ## 11. Open decisions
 
-1. **App name** — shortlist with collision-check in progress; user picks.
-2. **Source license / repo visibility** — user preference; nothing blocks on it.
-3. Post-v1 candidates (explicitly deferred): simultaneous multi-server browsing, AppleScript + MCP server on Mac, ambient visionOS space, stats/year-in-review views, ebook support.
+1. **Source license / repo visibility** — user preference; nothing blocks on it.
+2. Post-v1 candidates (explicitly deferred): simultaneous multi-server browsing, AppleScript + MCP server on Mac, ambient visionOS space, stats/year-in-review views, ebook support.
+
+*(Resolved 2026-07-06: app name = Colophon.)*
