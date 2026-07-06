@@ -1,0 +1,6 @@
+Colophon.xcodeproj/
+DerivedData/
+.DS_Store
+devserver/data/
+xcuserdata/
+.build/
