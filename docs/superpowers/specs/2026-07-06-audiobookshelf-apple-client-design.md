@@ -29,7 +29,7 @@ A single native SwiftUI application for **iOS, iPadOS, macOS, tvOS, visionOS, an
 | Decision | Choice |
 |---|---|
 | Offline downloads | In v1, with offline progress sync-back |
-| Companion surfaces | CarPlay, Widgets + Live Activity, Siri/App Intents — all v1; watchOS in scope, final milestone |
+| Companion surfaces | Widgets + Live Activity, Siri/App Intents — v1; watchOS in scope, final milestone. **CarPlay deferred (user decision 2026-07-06: no CarPlay device to test on; revisit when hardware is available — entitlement application filed then)** |
 | Distribution | App Store, free; consumable-IAP **tip jar** (no paywalled features) |
 | Deployment targets | iOS/iPadOS/macOS/tvOS/visionOS/watchOS **26+** (Liquid Glass baseline; no legacy conditionals) |
 | Toolchain | Xcode 26.6 / 26.5 SDKs for releases; Xcode 27 beta for exploratory testing only |
@@ -128,7 +128,7 @@ Free app, all features free. **Tip jar**: StoreKit 2 consumable IAPs (e.g., $1.9
 
 - Name: "Colophon — for Audiobookshelf" (nominative use; matches Still/Absorb precedent).
 - Review prep: hosted demo ABS server + demo credentials in review notes (reviewers must exercise login/playback); note explaining self-hosted-server requirement (Plex/Jellyfin precedent).
-- **CarPlay audio entitlement (`com.apple.developer.carplay-audio`): apply at project start** — case-by-case approval, days-to-weeks, blocks even building the CarPlay scene with a real profile.
+- CarPlay audio entitlement (`com.apple.developer.carplay-audio`): **deferred with the CarPlay feature** (2026-07-06). When revisited: apply immediately — case-by-case approval, days-to-weeks, blocks even building the CarPlay scene with a real profile.
 - Licenses: GRDB (MIT), socket.io-client-swift (MIT), AudiobookshelfKit (MIT, reference only). Never copy from ShelfPlayer (MPL + Commons Clause) or GPL projects (official app, absorb, swiftshelf). AudioBooth (plain MPL-2.0): study freely; any copied file keeps MPL notice — prefer clean-room.
 - Our license: TBD with user (open-sourcing was not selected; default private).
 
@@ -145,7 +145,7 @@ Free app, all features free. **Tip jar**: StoreKit 2 consumable IAPs (e.g., $1.9
 
 - **M0 — Walking skeleton + spikes.** Repo/workspace/package scaffold; CarPlay entitlement application filed; ABSKit auth (password) + library list; play one book end-to-end (streaming) on iPhone **and** Mac; socket.io + macOS grid-perf spikes.
 - **M1 — Streaming core (iPhone/iPad/Mac).** Home shelves, library browse/sort/filter, search, item detail, full player (chapters/speed/sleep/bookmarks), session sync + socket live updates, covers cache, OIDC login, multi-connection management, serif/SF setting.
-- **M2 — Offline + companions.** Downloads with background sessions, offline playback + local-session sync-back, CarPlay UI, widgets, Live Activity, Control widgets, App Intents/Siri/Spotlight, tip jar.
+- **M2 — Offline + companions.** Downloads with background sessions, offline playback + local-session sync-back, widgets, Live Activity, Control widgets, App Intents/Siri/Spotlight, tip jar. (CarPlay UI removed — deferred with the entitlement.)
 - **M3 — Mac flagship polish.** Menu bar extra, mini-player window, full command set, Table/inspector views, dock menu, drag-and-drop, window restoration audit, keyboard-navigation audit, Control Center widget.
 - **M4 — tvOS + visionOS.** Streaming-only TV shell + sign-in flow; visionOS ornament player + window polish.
 - **M5 — watchOS.** Standalone watch app, transfer-to-watch downloads, complications.
