@@ -6,8 +6,10 @@ Liquid Glass, and unapologetically Mac-assed on the Mac.
 
 **Status:** M0 walking skeleton — password login, library browse, multi-file
 streaming playback with server progress sync, on iOS + macOS. Spikes for
-socket.io handshake and macOS grid performance are documented (see below).
-CarPlay entitlement request filed with Apple; response still pending.
+socket.io handshake and macOS grid performance are documented in
+`docs/superpowers/spikes/`.
+CarPlay entitlement application: pending user filing (will be recorded in
+docs/superpowers/carplay-entitlement.md).
 
 ## Development
 
