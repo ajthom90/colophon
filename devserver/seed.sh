@@ -35,6 +35,15 @@ if [ ! -d "$BOOK_DIR" ]; then
   mv "$TMP/unzipped" "$BOOK_DIR"
 fi
 
+COVER="$BOOK_DIR/cover.jpg"
+if [ ! -f "$COVER" ]; then
+  echo "→ downloading cover art"
+  curl -fsSL --retry 3 --connect-timeout 15 --max-time 120 \
+    "https://archive.org/services/img/art_of_war_librivox" -o "$COVER" \
+    || echo "⚠ cover download failed — continuing without cover"
+  [ -s "$COVER" ] || rm -f "$COVER"
+fi
+
 echo "→ logging in"
 TOKEN=$(curl -fsS -X POST "$BASE/login" -H 'Content-Type: application/json' -H 'x-return-tokens: true' \
   -d "{\"username\":\"$USER\",\"password\":\"$PASS\"}" \

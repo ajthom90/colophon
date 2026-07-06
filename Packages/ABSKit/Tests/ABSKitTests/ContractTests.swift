@@ -47,26 +47,13 @@ struct ContractTests {
         try await client.closeSession(id: session.id, currentTime: 30, timeListened: 0, duration: session.duration)
     }
 
-    @Test func coverEndpointIsUnauthenticated() async throws {
+    @Test func coverEndpointIsUnauthenticatedAndServesImage() async throws {
         let client = try await loggedInClient()
         let libs = try await client.libraries()
         let page = try await client.items(libraryID: libs[0].id, limit: 1, page: 0)
         let url = client.coverURL(itemID: page.results[0].id, width: 200, updatedAt: page.results[0].updatedAt)
-
-        let unauthenticated = try await transport.send(URLRequest(url: url))  // no Authorization header
-
-        var authedRequest = URLRequest(url: url)
-        let token = try await client.auth.currentAccessToken()
-        authedRequest.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let authenticated = try await transport.send(authedRequest)
-
-        // Empirical deviation from the brief: the seeded LibriVox book (a public-domain
-        // archive.org zip with no ID3 artwork or folder image) has no cover, so ABS
-        // returns 404 for /api/items/:id/cover regardless of auth — not the 200 the
-        // brief assumed. Hardcoding 200 would fail against this reality for a reason
-        // unrelated to what the test name asserts. The actual contract under test —
-        // that this endpoint doesn't gate on the Authorization header — still holds:
-        // status codes are identical with and without a bearer token.
-        #expect(unauthenticated.statusCode == authenticated.statusCode)
+        let unauthed = try await transport.send(URLRequest(url: url))   // no Authorization header
+        #expect(unauthed.statusCode == 200, "seed must provide cover.jpg — re-run make seed after wiping devserver/data")
+        #expect(unauthed.data.count > 1_000)                            // a real image, not an error body
     }
 }
