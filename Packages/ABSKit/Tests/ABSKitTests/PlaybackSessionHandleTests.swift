@@ -48,6 +48,20 @@ import Testing
         #expect(await handle.sync(currentTime: 10, timeListened: 10) == false)
     }
 
+    @Test func closeFallsBackToLocalUpsertOn404() async throws {
+        let (handle, transport) = try await makeSUT()
+        await transport.enqueue(status: 200, json: "{}")            // one sync: total 15
+        _ = await handle.sync(currentTime: 15, timeListened: 15)
+        await transport.enqueue(status: 404, json: "{}")            // close hits restarted server
+        await transport.enqueue(status: 200, json: "{}")            // local upsert OK
+        await handle.close(currentTime: 20, timeListened: 5)
+        let req = await transport.recorded.last
+        #expect(req?.url?.path == "/api/session/local")
+        let body = try JSONSerialization.jsonObject(with: req?.httpBody ?? Data()) as! [String: Any]
+        #expect(body["currentTime"] as? Double == 20)
+        #expect(body["timeListening"] as? Double == 20)             // 15 synced + 5 at close
+    }
+
     @Test func closePostsFinalPayload() async throws {
         let (handle, transport) = try await makeSUT()
         await transport.enqueue(status: 200, json: "{}")

@@ -65,22 +65,25 @@ final class AppState {
         }
     }
 
+    /// Retire the current session completely (ordering matters: flush → detach sync callback →
+    /// close server-side → tear down local playback). pause() also flushes, but via a
+    /// fire-and-forget Task with no ordering guarantee against the next line — so flush
+    /// deterministically before severing onSyncDue (idempotent: a harmless no-op if pause()'s
+    /// internal flush already landed).
+    private func retireCurrentSession() async {
+        guard let handle = sessionHandle else { return }
+        playback.pause()
+        await playback.flushOnly()
+        playback.onSyncDue = nil
+        await handle.close(currentTime: playback.globalTime, timeListened: 0)
+        playback.unload()
+        sessionHandle = nil
+    }
+
     func startPlayback(item: LibraryItemSummary) async {
         guard let client else { return }
-        // Retire the old session completely before touching the new one (ordering matters:
-        // flush → detach sync callback → close server-side → tear down local playback).
-        if let old = sessionHandle {
-            playback.pause()                       // stop audio; pause() also flushes, but via a
-                                                     // fire-and-forget Task with no ordering guarantee
-                                                     // against the next line — so flush deterministically
-                                                     // before severing onSyncDue (idempotent: a harmless
-                                                     // no-op if pause()'s internal flush already landed).
-            await playback.flushOnly()
-            playback.onSyncDue = nil
-            await old.close(currentTime: playback.globalTime, timeListened: 0)
-            playback.unload()
-            sessionHandle = nil
-        }
+        // Retire the old session completely before touching the new one.
+        await retireCurrentSession()
         do {
             let envelope = try await client.startPlayback(itemID: item.id, deviceInfo: deviceInfo)
             let handle = PlaybackSessionHandle(client: client, envelope: envelope)
@@ -103,11 +106,9 @@ final class AppState {
         Task { await playback.flushOnly() }
     }
 
+    /// Entry point for a future explicit "stop" affordance.
     func closeCurrentSession() async {
-        guard let handle = sessionHandle else { return }
-        playback.pause()
-        await handle.close(currentTime: playback.globalTime, timeListened: 0)
-        sessionHandle = nil
+        await retireCurrentSession()
     }
 
     #if DEBUG
