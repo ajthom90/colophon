@@ -11,9 +11,14 @@ public struct TokenPair: Sendable, Equatable, Codable {
     }
 }
 
+public enum TokenStoreError: Error, Equatable {
+    case keychainFailure(OSStatus)
+    case encodingFailure
+}
+
 public protocol TokenStore: Sendable {
     func tokens(for connectionID: String) async -> TokenPair?
-    func save(_ tokens: TokenPair, for connectionID: String) async
+    func save(_ tokens: TokenPair, for connectionID: String) async throws
     func clear(for connectionID: String) async
 }
 
@@ -21,10 +26,11 @@ public actor InMemoryTokenStore: TokenStore {
     private var storage: [String: TokenPair] = [:]
     public init() {}
     public func tokens(for connectionID: String) -> TokenPair? { storage[connectionID] }
-    public func save(_ tokens: TokenPair, for connectionID: String) { storage[connectionID] = tokens }
+    public func save(_ tokens: TokenPair, for connectionID: String) throws { storage[connectionID] = tokens }
     public func clear(for connectionID: String) { storage[connectionID] = nil }
 }
 
+#if canImport(Security)
 /// Device-local by design: refresh tokens rotate on every use, so they must never
 /// sync between devices (kSecAttrSynchronizable stays false).
 public actor KeychainTokenStore: TokenStore {
@@ -41,17 +47,22 @@ public actor KeychainTokenStore: TokenStore {
         return try? JSONDecoder().decode(TokenPair.self, from: data)
     }
 
-    public func save(_ tokens: TokenPair, for connectionID: String) {
-        guard let data = try? JSONEncoder().encode(tokens) else { return }
+    public func save(_ tokens: TokenPair, for connectionID: String) throws {
+        guard let data = try? JSONEncoder().encode(tokens) else {
+            throw TokenStoreError.encodingFailure
+        }
         var query = baseQuery(connectionID)
         let attrs: [String: Any] = [
             kSecValueData as String: data,
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlock,
         ]
-        let status = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
-        if status == errSecItemNotFound {
+        var finalStatus = SecItemUpdate(query as CFDictionary, attrs as CFDictionary)
+        if finalStatus == errSecItemNotFound {
             query.merge(attrs) { _, new in new }
-            SecItemAdd(query as CFDictionary, nil)
+            finalStatus = SecItemAdd(query as CFDictionary, nil)
+        }
+        guard finalStatus == errSecSuccess else {
+            throw TokenStoreError.keychainFailure(finalStatus)
         }
     }
 
@@ -65,3 +76,4 @@ public actor KeychainTokenStore: TokenStore {
          kSecAttrAccount as String: connectionID]
     }
 }
+#endif
