@@ -2,6 +2,7 @@ import Foundation
 import SwiftUI
 import ABSKit
 import PlayerEngine
+import LibraryCache
 
 @Observable
 final class AppState {
@@ -9,13 +10,28 @@ final class AppState {
 
     var phase: Phase = .disconnected
     var errorMessage: String?
-    var libraries: [Library] = []
     var client: ABSClient?
     let playback = PlaybackController(backend: AVQueuePlayerBackend())
+    let cache: LibraryCacheStore
+
+    /// UUID of the `CachedConnection` row for whatever server/user is currently signed in —
+    /// the key views use to scope their `cache.observe*` calls, and the Keychain lookup key.
+    private(set) var activeConnectionID: String?
+    /// Last library ID `refreshItems` was asked to page — recorded so a future first-run/
+    /// offline flow (M1b) can resume browsing the last-viewed library without a live server.
+    private(set) var activeLibraryID: String?
 
     private var auth: AuthManager?
     private let tokenStore = KeychainTokenStore()
     private var sessionHandle: PlaybackSessionHandle?
+
+    init() {
+        let supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appending(path: "Colophon")
+        // LibraryCacheStore.init creates its parent directory itself. A broken cache DB is
+        // unrecoverable dev-state — crash loudly rather than run split-brain.
+        cache = try! LibraryCacheStore(databaseURL: supportDir.appending(path: "cache.sqlite"))
+    }
 
     var deviceInfo: DeviceInfo {
         let id: String
@@ -35,7 +51,7 @@ final class AppState {
 
     func connect(serverURL: String, username: String, password: String) async {
         errorMessage = nil
-        guard let url = URL(string: serverURL.trimmingCharacters(in: .whitespaces)) else {
+        guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
         }
         phase = .connecting
@@ -48,13 +64,23 @@ final class AppState {
                   !(version < ABSKit.minimumServerVersion) else {
                 throw ABSError.serverTooOld(found: status.serverVersion ?? "unknown")
             }
-            let auth = AuthManager(baseURL: url, connectionID: url.absoluteString,
+            let connection = try findOrCreateConnection(address: url.absoluteString, username: username)
+            // Awaited (not fire-and-forget) so migration can never race a fresh login's token
+            // save — it must finish moving any legacy entry before `auth.login` writes new ones.
+            await TokenMigration.migrateLegacyTokensIfNeeded(
+                from: url.absoluteString, to: connection.id, store: tokenStore)
+            let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             _ = try await auth.login(username: username, password: password)
             let client = ABSClient(baseURL: url, transport: transport, auth: auth)
             self.auth = auth
             self.client = client
-            self.libraries = try await client.libraries()
+            self.activeConnectionID = connection.id
+            let libs = try await client.libraries()
+            try cache.upsertLibraries(libs.enumerated().map { index, lib in
+                CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
+                              mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
+            }, connectionID: connection.id)
             phase = .connected
         } catch ABSError.http(status: 401) {
             phase = .disconnected
@@ -62,6 +88,59 @@ final class AppState {
         } catch {
             phase = .disconnected
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Trims whitespace, drops a trailing "/", and lowercases scheme+host so the same server
+    /// typed as "Http://NAS.local:13378/" and "http://nas.local:13378" resolve to the same
+    /// `CachedConnection` row instead of silently creating a second one.
+    private func normalizedServerURL(_ raw: String) -> URL? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        var stripped = trimmed
+        while stripped.hasSuffix("/") { stripped.removeLast() }
+        guard var comps = URLComponents(string: stripped),
+              let scheme = comps.scheme, let host = comps.host, !host.isEmpty else { return nil }
+        comps.scheme = scheme.lowercased()
+        comps.host = host.lowercased()
+        return comps.url
+    }
+
+    private func findOrCreateConnection(address: String, username: String) throws -> CachedConnection {
+        if let existing = try cache.connections().first(where: {
+            $0.address == address && $0.username == username
+        }) {
+            return existing
+        }
+        let fresh = CachedConnection(id: UUID().uuidString, address: address,
+                                     name: URL(string: address)?.host() ?? address,
+                                     username: username, authMethod: "local",
+                                     sortIndex: try cache.connections().count)
+        try cache.upsertConnection(fresh)
+        return fresh
+    }
+
+    /// Pages `client.items` (50/page) into the cache until the server-reported total is
+    /// satisfied or a 20-page (1000-item) cap is hit — a deliberate M1a limit; full unbounded
+    /// paging is out of scope until it's needed.
+    func refreshItems(libraryID: String) async throws {
+        guard let client, let connectionID = activeConnectionID else {
+            throw ABSError.notAuthenticated
+        }
+        activeLibraryID = libraryID
+        let limit = 50
+        var accumulated = 0
+        for page in 0..<20 {
+            let result = try await client.items(libraryID: libraryID, limit: limit, page: page)
+            let mapped = result.results.map { item in
+                CachedItem(id: item.id, connectionID: connectionID, libraryID: libraryID,
+                          title: item.media.metadata.title ?? "Untitled",
+                          authorName: item.media.metadata.authorName,
+                          duration: item.media.duration, updatedAt: item.updatedAt)
+            }
+            try cache.upsertItemsPage(mapped, connectionID: connectionID, libraryID: libraryID)
+            accumulated += result.results.count
+            if result.results.isEmpty || accumulated >= result.total { break }
         }
     }
 
@@ -80,12 +159,12 @@ final class AppState {
         sessionHandle = nil
     }
 
-    func startPlayback(item: LibraryItemSummary) async {
+    func startPlayback(itemID: String) async {
         guard let client else { return }
         // Retire the old session completely before touching the new one.
         await retireCurrentSession()
         do {
-            let envelope = try await client.startPlayback(itemID: item.id, deviceInfo: deviceInfo)
+            let envelope = try await client.startPlayback(itemID: itemID, deviceInfo: deviceInfo)
             let handle = PlaybackSessionHandle(client: client, envelope: envelope)
             sessionHandle = handle
             playback.onSyncDue = { payload in
@@ -125,10 +204,16 @@ final class AppState {
         if env["COLOPHON_AUTO_MUTE"] == "1" { playback.muted = true }
         await connect(serverURL: parts[0], username: parts[1], password: parts[2])
         guard phase == .connected, env["COLOPHON_AUTO_PLAY"] == "1",
-              let library = libraries.first, let client else { return }
-        guard let result = try? await client.items(libraryID: library.id, limit: 1, page: 0),
-              let first = result.results.first else { return }
-        await startPlayback(item: first)
+              let client, let connectionID = activeConnectionID else { return }
+        // Views now get their item lists from cache observation (an AsyncSequence), which
+        // isn't a natural fit for this one-shot debug hook — fetch the library list directly
+        // from the client (cheap; already just wrote it to cache in `connect`), then reuse
+        // the real `refreshItems` pager (same code path `LibraryItemsView` drives) so this
+        // hook also exercises and populates the item cache instead of bypassing it.
+        guard let libraries = try? await client.libraries(), let library = libraries.first else { return }
+        try? await refreshItems(libraryID: library.id)
+        guard let first = try? cache.items(connectionID: connectionID, libraryID: library.id).first else { return }
+        await startPlayback(itemID: first.id)
         if let seekSpec = env["COLOPHON_AUTO_SEEK"], let target = TimeInterval(seekSpec) {
             playback.seek(toGlobal: target)
         }

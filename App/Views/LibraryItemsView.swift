@@ -1,56 +1,71 @@
 import SwiftUI
 import ABSKit
+import LibraryCache
 
 struct LibraryItemsView: View {
     @Environment(AppState.self) private var app
-    let library: Library
-    @State private var items: [LibraryItemSummary] = []
-    @State private var total = 0
-    @State private var page = 0
-    @State private var isLoading = false
-    private let pageSize = 50
+    let library: CachedLibrary
+    @State private var items: [CachedItem] = []
+    @State private var loadError: String?
 
     private let columns = [GridItem(.adaptive(minimum: 150), spacing: 16)]
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(items) { item in
-                    Button {
-                        Task { await app.startPlayback(item: item) }
-                    } label: {
-                        VStack(alignment: .leading) {
-                            AsyncImage(url: app.client?.coverURL(itemID: item.id, width: 300, updatedAt: item.updatedAt)) { image in
-                                image.resizable().aspectRatio(contentMode: .fit)
-                            } placeholder: {
-                                RoundedRectangle(cornerRadius: 8).fill(.quaternary).aspectRatio(1, contentMode: .fit)
+        Group {
+            if items.isEmpty, let loadError {
+                ContentUnavailableView {
+                    Label("Couldn't load library", systemImage: "wifi.exclamationmark")
+                } description: {
+                    Text(loadError)
+                } actions: {
+                    Button("Retry") { Task { await refresh() } }
+                }
+            } else {
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 16) {
+                        ForEach(items) { item in
+                            Button {
+                                Task { await app.startPlayback(itemID: item.id) }
+                            } label: {
+                                VStack(alignment: .leading) {
+                                    AsyncImage(url: app.client?.coverURL(itemID: item.id, width: 300, updatedAt: item.updatedAt)) { image in
+                                        image.resizable().aspectRatio(contentMode: .fit)
+                                    } placeholder: {
+                                        RoundedRectangle(cornerRadius: 8).fill(.quaternary).aspectRatio(1, contentMode: .fit)
+                                    }
+                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    Text(item.title).font(.headline).lineLimit(2)
+                                    Text(item.authorName ?? "").font(.subheadline)
+                                        .foregroundStyle(.secondary).lineLimit(1)
+                                }
                             }
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                            Text(item.media.metadata.title ?? "Untitled").font(.headline).lineLimit(2)
-                            Text(item.media.metadata.authorName ?? "").font(.subheadline)
-                                .foregroundStyle(.secondary).lineLimit(1)
+                            .buttonStyle(.plain)
                         }
                     }
-                    .buttonStyle(.plain)
-                    .onAppear { if item.id == items.last?.id { Task { await loadMore() } } }
+                    .padding()
                 }
             }
-            .padding()
         }
         .fontDesign(.serif)
         .navigationTitle(library.name)
-        .task { await loadMore() }
+        .task(id: library.id) {
+            do {
+                for try await value in app.cache.observeItems(connectionID: library.connectionID, libraryID: library.id) {
+                    items = value
+                }
+            } catch {
+                loadError = error.localizedDescription
+            }
+        }
+        .task(id: library.id) { await refresh() }
     }
 
-    private func loadMore() async {
-        guard !isLoading else { return }  // no concurrent/duplicate page fetches
-        guard let client = app.client, items.count < total || page == 0 else { return }
-        isLoading = true
-        defer { isLoading = false }
-        if let result = try? await client.items(libraryID: library.id, limit: pageSize, page: page) {
-            items.append(contentsOf: result.results)
-            total = result.total
-            page += 1
+    private func refresh() async {
+        loadError = nil
+        do {
+            try await app.refreshItems(libraryID: library.id)
+        } catch {
+            loadError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
 }
