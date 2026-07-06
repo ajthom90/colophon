@@ -30,6 +30,12 @@ public struct SessionSyncController: Sendable {
         return SyncPayload(currentTime: currentTime, timeListened: accumulatedListened)
     }
 
+    /// Accumulate listened time without considering emission — used while a sync
+    /// is in flight so an unsent payload can never clobber pendingEmission.
+    public mutating func accumulateOnly(listenedDelta: Double) {
+        accumulatedListened += max(0, listenedDelta)
+    }
+
     /// Consume ONLY the amount carried by the last emitted/flushed payload —
     /// seconds accrued while that sync was in flight stay accumulated.
     public mutating func didSync() {

@@ -71,4 +71,13 @@ import Testing
         sut.didSync()
         #expect(sut.flush(currentTime: 7) == SyncPayload(currentTime: 7, timeListened: 2))
     }
+
+    @Test func accumulateOnlyNeverEmitsNorClobbersPendingEmission() {
+        var sut = SessionSyncController(interval: 15)
+        let payload = sut.noteProgress(currentTime: 15, listenedDelta: 15, now: t0.addingTimeInterval(15))
+        #expect(payload?.timeListened == 15)          // pendingEmission = 15
+        sut.accumulateOnly(listenedDelta: 20)          // would be "due" — must NOT emit or touch pendingEmission
+        sut.didSync()                                  // acks the 15s payload only
+        #expect(sut.flush(currentTime: 35) == SyncPayload(currentTime: 35, timeListened: 20))
+    }
 }
