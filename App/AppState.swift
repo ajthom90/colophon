@@ -11,7 +11,7 @@ final class AppState {
     var errorMessage: String?
     var libraries: [Library] = []
     var client: ABSClient?
-    let playback = PlaybackController()
+    let playback = PlaybackController(backend: AVQueuePlayerBackend())
 
     private var auth: AuthManager?
     private let tokenStore = KeychainTokenStore()
@@ -78,9 +78,9 @@ final class AppState {
                     return false  // keep accumulating; retried next interval
                 }
             }
-            playback.load(session: session) { track in
-                client.publicTrackURL(sessionID: session.id, trackIndex: track.index)
-            }
+            let timelineTracks = session.audioTracks.sorted { $0.startOffset < $1.startOffset }
+            let urls = timelineTracks.map { client.publicTrackURL(sessionID: session.id, trackIndex: $0.index) }
+            playback.load(session: session, trackURLs: urls)
             playback.play()
         } catch {
             errorMessage = "Playback failed: \(error.localizedDescription)"
@@ -90,12 +90,15 @@ final class AppState {
     #if DEBUG
     /// Headless E2E hook: if `COLOPHON_AUTO_CONNECT=serverURL|username|password` is set,
     /// auto-connect on launch; if `COLOPHON_AUTO_PLAY=1` is also set, start the first item;
-    /// if `COLOPHON_AUTO_SEEK=<globalSeconds>` is also set, seek there once after playback starts.
+    /// if `COLOPHON_AUTO_MUTE=1` is also set, mute the backend before playback (keeps CI/E2E
+    /// runs silent); if `COLOPHON_AUTO_SEEK=<globalSeconds>` is also set, seek there once after
+    /// playback starts.
     func runAutoConnectIfRequested() async {
         let env = ProcessInfo.processInfo.environment
         guard let spec = env["COLOPHON_AUTO_CONNECT"] else { return }
         let parts = spec.split(separator: "|", maxSplits: 2, omittingEmptySubsequences: false).map(String.init)
         guard parts.count == 3 else { return }
+        if env["COLOPHON_AUTO_MUTE"] == "1" { playback.muted = true }
         await connect(serverURL: parts[0], username: parts[1], password: parts[2])
         guard phase == .connected, env["COLOPHON_AUTO_PLAY"] == "1",
               let library = libraries.first, let client else { return }
