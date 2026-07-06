@@ -13,6 +13,7 @@ final class AppState {
     var client: ABSClient?
     let playback = PlaybackController(backend: AVQueuePlayerBackend())
     let cache: LibraryCacheStore
+    let coverStore: CoverStore
 
     /// UUID of the `CachedConnection` row for whatever server/user is currently signed in —
     /// the key views use to scope their `cache.observe*` calls, and the Keychain lookup key.
@@ -31,6 +32,8 @@ final class AppState {
         // LibraryCacheStore.init creates its parent directory itself. A broken cache DB is
         // unrecoverable dev-state — crash loudly rather than run split-brain.
         cache = try! LibraryCacheStore(databaseURL: supportDir.appending(path: "cache.sqlite"))
+        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        coverStore = CoverStore(directory: cachesDir.appending(path: "covers"))
     }
 
     var deviceInfo: DeviceInfo {

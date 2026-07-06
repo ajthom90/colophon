@@ -28,12 +28,8 @@ struct LibraryItemsView: View {
                                 Task { await app.startPlayback(itemID: item.id) }
                             } label: {
                                 VStack(alignment: .leading) {
-                                    AsyncImage(url: app.client?.coverURL(itemID: item.id, width: 300, updatedAt: item.updatedAt)) { image in
-                                        image.resizable().aspectRatio(contentMode: .fit)
-                                    } placeholder: {
-                                        RoundedRectangle(cornerRadius: 8).fill(.quaternary).aspectRatio(1, contentMode: .fit)
-                                    }
-                                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    CachedCoverView(itemID: item.id, updatedAt: item.updatedAt)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
                                     Text(item.title).font(.headline).lineLimit(2)
                                     Text(item.authorName ?? "").font(.subheadline)
                                         .foregroundStyle(.secondary).lineLimit(1)
