@@ -1,0 +1,73 @@
+import Foundation
+
+public actor AuthManager {
+    private let baseURL: URL
+    private let connectionID: String
+    private let transport: Transport
+    private let store: TokenStore
+    private var inFlightRefresh: Task<String, Error>?
+
+    public init(baseURL: URL, connectionID: String, transport: Transport, store: TokenStore) {
+        self.baseURL = baseURL
+        self.connectionID = connectionID
+        self.transport = transport
+        self.store = store
+    }
+
+    public func login(username: String, password: String) async throws -> LoginResponse {
+        let response = try await ABSAPI.send(
+            ABSAPI.loginRequest(baseURL: baseURL, username: username, password: password),
+            as: LoginResponse.self, via: transport)
+        guard let access = response.user.accessToken else { throw ABSError.invalidResponse }
+        try await store.save(TokenPair(accessToken: access, refreshToken: response.user.refreshToken),
+                             for: connectionID)
+        return response
+    }
+
+    public func currentAccessToken() async throws -> String {
+        guard let pair = await store.tokens(for: connectionID) else { throw ABSError.notAuthenticated }
+        return pair.accessToken
+    }
+
+    public func refreshAfterAuthFailure(staleToken: String) async throws -> String {
+        // Someone already refreshed while we were failing — use theirs.
+        if let current = await store.tokens(for: connectionID), current.accessToken != staleToken {
+            return current.accessToken
+        }
+        if let existing = inFlightRefresh { return try await existing.value }
+
+        let task = Task<String, Error> { [baseURL, transport, store, connectionID] in
+            guard let pair = await store.tokens(for: connectionID),
+                  let refreshToken = pair.refreshToken else { throw ABSError.reauthRequired }
+            var req = URLRequest(url: baseURL.appending(path: "auth/refresh"))
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.setValue(refreshToken, forHTTPHeaderField: "x-refresh-token")
+            do {
+                let response = try await ABSAPI.send(req, as: LoginResponse.self, via: transport)
+                guard let access = response.user.accessToken else { throw ABSError.invalidResponse }
+                // Server rotates the refresh token; keep the old one only if none returned.
+                let newPair = TokenPair(accessToken: access,
+                                        refreshToken: response.user.refreshToken ?? refreshToken)
+                try await store.save(newPair, for: connectionID)
+                return access
+            } catch ABSError.http(status: 401) {
+                await store.clear(for: connectionID)
+                throw ABSError.reauthRequired
+            }
+        }
+        inFlightRefresh = task
+        defer { inFlightRefresh = nil }
+        return try await task.value
+    }
+
+    public func logout() async {
+        if let pair = await store.tokens(for: connectionID), let refresh = pair.refreshToken {
+            var req = URLRequest(url: baseURL.appending(path: "logout"))
+            req.httpMethod = "POST"
+            req.setValue(refresh, forHTTPHeaderField: "x-refresh-token")
+            _ = try? await transport.send(req)
+        }
+        await store.clear(for: connectionID)
+    }
+}
