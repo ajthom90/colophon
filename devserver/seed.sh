@@ -13,7 +13,7 @@ until curl -fsS "$BASE/status" >/dev/null 2>&1; do
   sleep 1
   ELAPSED=$((ELAPSED + 1))
   if [ $ELAPSED -ge $TIMEOUT ]; then
-    echo "✗ server did not respond within ${TIMEOUT}s. Check status: docker compose logs"
+    echo "✗ server did not respond within ${TIMEOUT}s. Check status: docker compose -f devserver/docker-compose.yml logs"
     exit 1
   fi
 done
@@ -28,8 +28,8 @@ fi
 if [ ! -d "$BOOK_DIR" ]; then
   echo "→ downloading The Art of War (LibriVox, public domain)"
   TMP=$(mktemp -d)
-  trap "rm -rf \"$TMP\"" RETURN
-  curl -fL --retry 3 --connect-timeout 15 "https://archive.org/download/art_of_war_librivox/art_of_war_librivox_64kb_mp3.zip" -o "$TMP/book.zip"
+  trap 'rm -rf "$TMP"' EXIT
+  curl -fL --retry 3 --connect-timeout 15 --max-time 600 "https://archive.org/download/art_of_war_librivox/art_of_war_librivox_64kb_mp3.zip" -o "$TMP/book.zip"
   unzip -q "$TMP/book.zip" -d "$TMP/unzipped"
   mkdir -p "$(dirname "$BOOK_DIR")"
   mv "$TMP/unzipped" "$BOOK_DIR"
