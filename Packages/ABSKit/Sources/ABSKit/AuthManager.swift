@@ -7,11 +7,20 @@ public actor AuthManager {
     private let store: TokenStore
     private var inFlightRefresh: Task<String, Error>?
 
+    /// Emits the latest access token after every successful login or refresh, so long-lived
+    /// consumers (e.g. the playback session heartbeat) can pick up rotated tokens without
+    /// polling the token store themselves. Single-consumer by design; buffers only the most
+    /// recent value since only the current token is ever useful to a new subscriber.
+    public let tokenUpdates: AsyncStream<String>
+    private let tokenContinuation: AsyncStream<String>.Continuation
+
     public init(baseURL: URL, connectionID: String, transport: Transport, store: TokenStore) {
         self.baseURL = baseURL
         self.connectionID = connectionID
         self.transport = transport
         self.store = store
+        (self.tokenUpdates, self.tokenContinuation) = AsyncStream.makeStream(
+            of: String.self, bufferingPolicy: .bufferingNewest(1))
     }
 
     public func login(username: String, password: String) async throws -> LoginResponse {
@@ -21,6 +30,7 @@ public actor AuthManager {
         guard let access = response.user.accessToken else { throw ABSError.invalidResponse }
         try await store.save(TokenPair(accessToken: access, refreshToken: response.user.refreshToken),
                              for: connectionID)
+        tokenContinuation.yield(access)
         return response
     }
 
@@ -36,7 +46,7 @@ public actor AuthManager {
         }
         if let existing = inFlightRefresh { return try await existing.value }
 
-        let task = Task<String, Error> { [baseURL, transport, store, connectionID] in
+        let task = Task<String, Error> { [baseURL, transport, store, connectionID, tokenContinuation] in
             guard let pair = await store.tokens(for: connectionID),
                   let refreshToken = pair.refreshToken else { throw ABSError.reauthRequired }
             var req = URLRequest(url: baseURL.appending(path: "auth/refresh"))
@@ -50,6 +60,7 @@ public actor AuthManager {
                 let newPair = TokenPair(accessToken: access,
                                         refreshToken: response.user.refreshToken ?? refreshToken)
                 try await store.save(newPair, for: connectionID)
+                tokenContinuation.yield(access)
                 return access
             } catch ABSError.http(status: 401) {
                 await store.clear(for: connectionID)

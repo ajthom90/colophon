@@ -75,4 +75,26 @@ import Testing
         }
         #expect(await store.tokens(for: "c1") == nil)
     }
+
+    @Test func tokenUpdatesYieldOnLoginAndRefresh() async throws {
+        let (auth, transport, store) = await makeSUT()
+        var iterator = await auth.tokenUpdates.makeAsyncIterator()
+        await transport.enqueue(status: 200, json: loginJSON)                       // acc1
+        _ = try await auth.login(username: "root", password: "pw")
+        #expect(await iterator.next() == "acc1")
+        await transport.enqueue(status: 200, json: #"{"user":{"id":"u1","username":"root","accessToken":"acc2","refreshToken":"ref2"}}"#)
+        _ = try await auth.refreshAfterAuthFailure(staleToken: "acc1")
+        #expect(await iterator.next() == "acc2")
+    }
+
+    @Test func logoutPostsRefreshHeaderAndClears() async throws {
+        let (auth, transport, store) = await makeSUT()
+        try await store.save(TokenPair(accessToken: "acc1", refreshToken: "ref1"), for: "c1")
+        await transport.enqueue(status: 200, json: "{}")
+        await auth.logout()
+        let req = await transport.recorded.last
+        #expect(req?.url?.path == "/logout")
+        #expect(req?.value(forHTTPHeaderField: "x-refresh-token") == "ref1")
+        #expect(await store.tokens(for: "c1") == nil)
+    }
 }

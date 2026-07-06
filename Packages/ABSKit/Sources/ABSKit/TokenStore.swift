@@ -82,7 +82,8 @@ public actor KeychainTokenStore: TokenStore {
     private func baseQuery(_ connectionID: String) -> [String: Any] {
         [kSecClass as String: kSecClassGenericPassword,
          kSecAttrService as String: service,
-         kSecAttrAccount as String: connectionID]
+         kSecAttrAccount as String: connectionID,
+         kSecUseDataProtectionKeychain as String: true]
     }
 }
 #endif

@@ -49,7 +49,8 @@ final class AppState {
         #else
         let model = "iPhone"
         #endif
-        return DeviceInfo(deviceId: id, clientVersion: "0.1.0", model: model)
+        let clientVersion = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.0.0"
+        return DeviceInfo(deviceId: id, clientVersion: clientVersion, model: model)
     }
 
     func connect(serverURL: String, username: String, password: String) async {

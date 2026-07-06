@@ -38,6 +38,8 @@ targets:
       path: App/Info.plist
       properties:
         CFBundleDisplayName: Colophon
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
         NSAppTransportSecurity:
