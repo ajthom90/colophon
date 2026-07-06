@@ -126,6 +126,9 @@ public init(backend: PlayerBackend, now: @escaping @Sendable () -> Date = Date.i
 public func load(session: PlaybackSession, trackURLs: [URL])          // urls parallel to sorted timeline tracks
 // SessionSyncController (changed):
 public mutating func didSync()                                        // now consumes ONLY the emitted amount
+public mutating func accumulateOnly(listenedDelta: Double)            // AMENDED: accumulate without emission —
+                                                                      // callers use this while a sync is in flight so
+                                                                      // pendingEmission can never be clobbered by an unsent payload
 ```
 
 ---
@@ -739,8 +742,13 @@ public final class PlaybackController {
         let delta = max(0, globalTime - lastTickGlobalTime)
         lastTickGlobalTime = globalTime
         let listened = Double(delta) / Double(max(rate, 0.1))
-        if let payload = sync.noteProgress(currentTime: globalTime, listenedDelta: listened, now: now()),
-           let onSyncDue, !syncInFlight {
+        // AMENDED (Task 2 review finding): while a sync is in flight, only accumulate —
+        // never let noteProgress emit, or an unsent payload clobbers pendingEmission and
+        // the eventual didSync() over-consumes (lost listened seconds on slow networks).
+        if syncInFlight || onSyncDue == nil {
+            sync.accumulateOnly(listenedDelta: listened)
+        } else if let payload = sync.noteProgress(currentTime: globalTime, listenedDelta: listened, now: now()),
+                  let onSyncDue {
             syncInFlight = true
             Task {
                 if await onSyncDue(payload) { self.sync.didSync() }
