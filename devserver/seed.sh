@@ -7,7 +7,16 @@ PASS="colophon-dev"
 BOOK_DIR="$(dirname "$0")/data/audiobooks/Sun Tzu/The Art of War"
 
 echo "→ waiting for server"
-until curl -fsS "$BASE/status" >/dev/null 2>&1; do sleep 1; done
+TIMEOUT=120
+ELAPSED=0
+until curl -fsS "$BASE/status" >/dev/null 2>&1; do
+  sleep 1
+  ELAPSED=$((ELAPSED + 1))
+  if [ $ELAPSED -ge $TIMEOUT ]; then
+    echo "✗ server did not respond within ${TIMEOUT}s. Check status: docker compose logs"
+    exit 1
+  fi
+done
 
 IS_INIT=$(curl -fsS "$BASE/status" | python3 -c 'import json,sys; print(json.load(sys.stdin)["isInit"])')
 if [ "$IS_INIT" = "False" ] || [ "$IS_INIT" = "false" ]; then
@@ -18,11 +27,12 @@ fi
 
 if [ ! -d "$BOOK_DIR" ]; then
   echo "→ downloading The Art of War (LibriVox, public domain)"
-  mkdir -p "$BOOK_DIR"
   TMP=$(mktemp -d)
-  curl -fL "https://archive.org/download/art_of_war_librivox/art_of_war_librivox_64kb_mp3.zip" -o "$TMP/book.zip"
-  unzip -q "$TMP/book.zip" -d "$BOOK_DIR"
-  rm -rf "$TMP"
+  trap "rm -rf \"$TMP\"" RETURN
+  curl -fL --retry 3 --connect-timeout 15 "https://archive.org/download/art_of_war_librivox/art_of_war_librivox_64kb_mp3.zip" -o "$TMP/book.zip"
+  unzip -q "$TMP/book.zip" -d "$TMP/unzipped"
+  mkdir -p "$(dirname "$BOOK_DIR")"
+  mv "$TMP/unzipped" "$BOOK_DIR"
 fi
 
 echo "→ logging in"
