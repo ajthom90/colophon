@@ -74,12 +74,13 @@ public struct CachedProgress: Codable, FetchableRecord, PersistableRecord, Senda
 
     public var connectionID: String
     public var itemID: String
-    public var episodeID: String?
+    /// Empty string means book-style progress (no episode).
+    public var episodeID: String
     public var currentTime: Double
     public var isFinished: Bool
     public var lastUpdate: Int
 
-    public var id: String { connectionID + "/" + itemID }
+    public var id: String { connectionID + "/" + itemID + "/" + episodeID }
 
     public init(
         connectionID: String,
@@ -91,7 +92,7 @@ public struct CachedProgress: Codable, FetchableRecord, PersistableRecord, Senda
     ) {
         self.connectionID = connectionID
         self.itemID = itemID
-        self.episodeID = episodeID
+        self.episodeID = episodeID ?? ""
         self.currentTime = currentTime
         self.isFinished = isFinished
         self.lastUpdate = lastUpdate

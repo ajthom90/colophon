@@ -31,11 +31,11 @@ enum Schema {
             try db.create(table: "cachedProgress") { t in
                 t.column("connectionID", .text).notNull()
                 t.column("itemID", .text).notNull()
-                t.column("episodeID", .text)
+                t.column("episodeID", .text).notNull().defaults(to: "")   // "" = book/no episode
                 t.column("currentTime", .double).notNull()
                 t.column("isFinished", .boolean).notNull()
                 t.column("lastUpdate", .integer).notNull()
-                t.primaryKey(["connectionID", "itemID"])
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
             }
             try db.create(virtualTable: "itemFTS", using: FTS5()) { t in
                 t.synchronize(withTable: "cachedItem")

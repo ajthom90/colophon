@@ -48,6 +48,26 @@ import Testing
         #expect(try store.progress(connectionID: "C1", itemID: "i1")?.currentTime == 99)
     }
 
+    @Test func episodesStoreIndependentProgress() throws {
+        let store = try makeStore()
+        let a = CachedProgress(connectionID: "C1", itemID: "i1", episodeID: "e1",
+                               currentTime: 10, isFinished: false, lastUpdate: 200)
+        let b = CachedProgress(connectionID: "C1", itemID: "i1", episodeID: "e2",
+                               currentTime: 20, isFinished: true, lastUpdate: 300)
+        try store.upsertProgress(a)
+        try store.upsertProgress(b)
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e1")?.currentTime == 10)
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.currentTime == 20)
+        let staleA = CachedProgress(connectionID: "C1", itemID: "i1", episodeID: "e1",
+                                    currentTime: 1, isFinished: false, lastUpdate: 100)
+        try store.upsertProgress(staleA)   // stale write to episode A...
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e1")?.currentTime == 10)
+        // ...never touches episode B
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.currentTime == 20)
+        // book-style progress (no episode) is a distinct row, absent here
+        #expect(try store.progress(connectionID: "C1", itemID: "i1") == nil)
+    }
+
     @Test func ftsFindsByTitleAndAuthorPrefix() throws {
         let store = try makeStore()
         try store.upsertItemsPage([
