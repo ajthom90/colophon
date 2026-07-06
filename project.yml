@@ -10,6 +10,8 @@ packages:
     path: Packages/ABSKit
   PlayerEngine:
     path: Packages/PlayerEngine
+  LibraryCache:
+    path: Packages/LibraryCache
 targets:
   Colophon:
     type: application
@@ -18,6 +20,7 @@ targets:
     dependencies:
       - package: ABSKit
       - package: PlayerEngine
+      - package: LibraryCache
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.andrewthom.colophon

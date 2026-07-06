@@ -16,6 +16,7 @@ build-mac: gen
 test:
 	cd Packages/ABSKit && swift test
 	cd Packages/PlayerEngine && swift test
+	cd Packages/LibraryCache && swift test
 
 server-up:
 	docker compose -f devserver/docker-compose.yml up -d
