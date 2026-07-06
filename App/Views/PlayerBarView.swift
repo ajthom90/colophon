@@ -19,9 +19,9 @@ struct PlayerBarView: View {
                         Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title2)
                     }
                     Button { playback.skip(15) } label: { Image(systemName: "goforward.15") }
-                    Menu(String(format: "%.2g×", playback.rate)) {
+                    Menu(String(format: "%g×", playback.rate)) {
                         ForEach(rates, id: \.self) { rate in
-                            Button(String(format: "%.2g×", rate)) { playback.setRate(rate) }
+                            Button(String(format: "%g×", rate)) { playback.setRate(rate) }
                         }
                     }
                     .fixedSize()

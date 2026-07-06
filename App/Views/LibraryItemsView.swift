@@ -7,6 +7,7 @@ struct LibraryItemsView: View {
     @State private var items: [LibraryItemSummary] = []
     @State private var total = 0
     @State private var page = 0
+    @State private var isLoading = false
     private let pageSize = 50
 
     private let columns = [GridItem(.adaptive(minimum: 150), spacing: 16)]
@@ -42,7 +43,10 @@ struct LibraryItemsView: View {
     }
 
     private func loadMore() async {
+        guard !isLoading else { return }  // no concurrent/duplicate page fetches
         guard let client = app.client, items.count < total || page == 0 else { return }
+        isLoading = true
+        defer { isLoading = false }
         if let result = try? await client.items(libraryID: library.id, limit: pageSize, page: page) {
             items.append(contentsOf: result.results)
             total = result.total

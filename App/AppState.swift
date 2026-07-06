@@ -84,7 +84,8 @@ final class AppState {
 
     #if DEBUG
     /// Headless E2E hook: if `COLOPHON_AUTO_CONNECT=serverURL|username|password` is set,
-    /// auto-connect on launch; if `COLOPHON_AUTO_PLAY=1` is also set, start the first item.
+    /// auto-connect on launch; if `COLOPHON_AUTO_PLAY=1` is also set, start the first item;
+    /// if `COLOPHON_AUTO_SEEK=<globalSeconds>` is also set, seek there once after playback starts.
     func runAutoConnectIfRequested() async {
         let env = ProcessInfo.processInfo.environment
         guard let spec = env["COLOPHON_AUTO_CONNECT"] else { return }
@@ -96,6 +97,9 @@ final class AppState {
         guard let result = try? await client.items(libraryID: library.id, limit: 1, page: 0),
               let first = result.results.first else { return }
         await startPlayback(item: first)
+        if let seekSpec = env["COLOPHON_AUTO_SEEK"], let target = TimeInterval(seekSpec) {
+            playback.seek(toGlobal: target)
+        }
     }
     #endif
 }

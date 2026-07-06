@@ -10,5 +10,6 @@ struct LibrariesView: View {
         }
         .navigationTitle("Libraries")
         .navigationDestination(for: Library.self) { LibraryItemsView(library: $0) }
+        .fontDesign(.serif)
     }
 }
