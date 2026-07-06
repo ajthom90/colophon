@@ -1,6 +1,21 @@
 import Testing
 @testable import ABSKit
 
+/// Reads/clears delegate to a backing InMemoryTokenStore; `save` always throws — models a
+/// Keychain write failure mid-migration.
+private actor ThrowingSaveTokenStore: TokenStore {
+    let backing = InMemoryTokenStore()
+    func tokens(for connectionID: String) async -> TokenPair? {
+        await backing.tokens(for: connectionID)
+    }
+    func save(_ tokens: TokenPair, for connectionID: String) async throws {
+        throw TokenStoreError.keychainFailure(-1)
+    }
+    func clear(for connectionID: String) async {
+        await backing.clear(for: connectionID)
+    }
+}
+
 @Suite struct TokenMigrationTests {
     @Test func movesLegacyTokensToNewKeyAndClearsLegacy() async throws {
         let store = InMemoryTokenStore()
@@ -27,5 +42,16 @@ import Testing
         await TokenMigration.migrateLegacyTokensIfNeeded(from: "legacy-key", to: "NEW-UUID", store: store)
         #expect(await store.tokens(for: "NEW-UUID") == nil)
         #expect(await store.tokens(for: "legacy-key") == nil)
+    }
+
+    @Test func failedSavePreservesLegacyTokens() async throws {
+        let store = ThrowingSaveTokenStore()
+        let legacy = TokenPair(accessToken: "a1", refreshToken: "r1")
+        try await store.backing.save(legacy, for: "legacy-key")
+        await TokenMigration.migrateLegacyTokensIfNeeded(from: "legacy-key", to: "NEW-UUID", store: store)
+        // The failed save must not destroy the sole remaining copy of the tokens...
+        #expect(await store.tokens(for: "legacy-key") == legacy)
+        // ...and nothing landed under the new key.
+        #expect(await store.tokens(for: "NEW-UUID") == nil)
     }
 }

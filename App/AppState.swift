@@ -84,9 +84,11 @@ final class AppState {
             phase = .connected
         } catch ABSError.http(status: 401) {
             phase = .disconnected
+            activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = "Wrong username or password"
         } catch {
             phase = .disconnected
+            activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }

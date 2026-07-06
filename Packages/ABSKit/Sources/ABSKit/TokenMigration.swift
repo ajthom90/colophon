@@ -8,13 +8,20 @@ import Foundation
 public enum TokenMigration {
     /// If `newKey` has no tokens yet and `legacyKey` does, moves them to `newKey` and clears
     /// `legacyKey`. No-ops if `newKey` already has tokens (already migrated, or a fresh login
-    /// already happened) or if there's nothing under `legacyKey` to migrate.
+    /// already happened) or if there's nothing under `legacyKey` to migrate. The legacy entry
+    /// is cleared ONLY after the save succeeds — a throwing save must not destroy the sole
+    /// remaining copy of the tokens.
     public static func migrateLegacyTokensIfNeeded(
         from legacyKey: String, to newKey: String, store: TokenStore
     ) async {
         guard await store.tokens(for: newKey) == nil,
               let legacy = await store.tokens(for: legacyKey) else { return }
-        try? await store.save(legacy, for: newKey)
-        await store.clear(for: legacyKey)
+        do {
+            try await store.save(legacy, for: newKey)
+            await store.clear(for: legacyKey)
+        } catch {
+            // Leave the legacy entry intact; the caller's fresh login will overwrite the
+            // new key anyway.
+        }
     }
 }
