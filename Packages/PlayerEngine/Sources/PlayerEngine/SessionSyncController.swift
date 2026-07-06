@@ -14,6 +14,7 @@ public struct SessionSyncController: Sendable {
     private let interval: TimeInterval
     private var accumulatedListened: Double = 0
     private var lastEmission: Date?
+    private var pendingEmission: Double = 0
 
     public init(interval: TimeInterval = 15) {
         self.interval = interval
@@ -25,15 +26,20 @@ public struct SessionSyncController: Sendable {
         let due = lastEmission.map { now.timeIntervalSince($0) >= interval } ?? (accumulatedListened >= interval)
         guard due else { return nil }
         lastEmission = now
+        pendingEmission = accumulatedListened
         return SyncPayload(currentTime: currentTime, timeListened: accumulatedListened)
     }
 
+    /// Consume ONLY the amount carried by the last emitted/flushed payload —
+    /// seconds accrued while that sync was in flight stay accumulated.
     public mutating func didSync() {
-        accumulatedListened = 0
+        accumulatedListened = max(0, accumulatedListened - pendingEmission)
+        pendingEmission = 0
     }
 
     public mutating func flush(currentTime: TimeInterval) -> SyncPayload? {
         guard accumulatedListened > 0 else { return nil }
+        pendingEmission = accumulatedListened
         return SyncPayload(currentTime: currentTime, timeListened: accumulatedListened)
     }
 }

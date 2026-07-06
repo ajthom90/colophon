@@ -51,4 +51,24 @@ import Testing
         let payload = sut.flush(currentTime: 500)
         #expect(payload == SyncPayload(currentTime: 500, timeListened: 1))
     }
+
+    @Test func accrualDuringInFlightSyncSurvivesDidSync() {
+        var sut = SessionSyncController(interval: 15)
+        // Emission captures 15s; while that POST is in flight, 4 more seconds accrue.
+        let payload = sut.noteProgress(currentTime: 15, listenedDelta: 15, now: t0.addingTimeInterval(15))
+        #expect(payload?.timeListened == 15)
+        _ = sut.noteProgress(currentTime: 19, listenedDelta: 4, now: t0.addingTimeInterval(19))
+        sut.didSync()   // server acked the 15s payload — the 4s must survive
+        #expect(sut.flush(currentTime: 19) == SyncPayload(currentTime: 19, timeListened: 4))
+    }
+
+    @Test func flushThenDidSyncConsumesOnlyFlushedAmount() {
+        var sut = SessionSyncController(interval: 15)
+        _ = sut.noteProgress(currentTime: 5, listenedDelta: 5, now: t0.addingTimeInterval(5))
+        let flushed = sut.flush(currentTime: 5)
+        #expect(flushed?.timeListened == 5)
+        _ = sut.noteProgress(currentTime: 7, listenedDelta: 2, now: t0.addingTimeInterval(7))
+        sut.didSync()
+        #expect(sut.flush(currentTime: 7) == SyncPayload(currentTime: 7, timeListened: 2))
+    }
 }
