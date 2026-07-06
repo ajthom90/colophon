@@ -64,3 +64,49 @@ public final class ABSClient: Sendable {
         return response.data
     }
 }
+
+extension ABSClient {
+    /// MIME types AVPlayer direct-plays; anything else transcodes to HLS server-side.
+    static let supportedMimeTypes = ["audio/mpeg", "audio/mp4", "audio/aac", "audio/flac", "audio/x-m4b"]
+
+    public func startPlayback(itemID: String, deviceInfo: DeviceInfo) async throws -> PlaybackSession {
+        struct PlayRequest: Encodable {
+            let deviceInfo: DeviceInfo
+            let mediaPlayer: String
+            let supportedMimeTypes: [String]
+            let forceDirectPlay: Bool
+            let forceTranscode: Bool
+        }
+        var req = URLRequest(url: baseURL.appending(path: "api/items/\(itemID)/play"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try ABSAPI.encoder.encode(PlayRequest(
+            deviceInfo: deviceInfo, mediaPlayer: "AVPlayer",
+            supportedMimeTypes: Self.supportedMimeTypes,
+            forceDirectPlay: false, forceTranscode: false))
+        return try await authorizedSend(req, as: PlaybackSession.self)
+    }
+
+    public func syncSession(id: String, currentTime: Double, timeListened: Double, duration: Double) async throws {
+        try await postSessionPayload(path: "api/session/\(id)/sync",
+                                     currentTime: currentTime, timeListened: timeListened, duration: duration)
+    }
+
+    public func closeSession(id: String, currentTime: Double, timeListened: Double, duration: Double) async throws {
+        try await postSessionPayload(path: "api/session/\(id)/close",
+                                     currentTime: currentTime, timeListened: timeListened, duration: duration)
+    }
+
+    public func publicTrackURL(sessionID: String, trackIndex: Int) -> URL {
+        baseURL.appending(path: "public/session/\(sessionID)/track/\(trackIndex)")
+    }
+
+    private func postSessionPayload(path: String, currentTime: Double, timeListened: Double, duration: Double) async throws {
+        var req = URLRequest(url: baseURL.appending(path: path))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try ABSAPI.encoder.encode(
+            ["currentTime": currentTime, "timeListened": timeListened, "duration": duration])
+        _ = try await authorizedData(req)
+    }
+}
