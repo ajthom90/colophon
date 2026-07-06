@@ -1,0 +1,10 @@
+services:
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:2.35.1
+    container_name: colophon-abs
+    ports:
+      - "13378:80"
+    volumes:
+      - ./data/audiobooks:/audiobooks
+      - ./data/config:/config
+      - ./data/metadata:/metadata
