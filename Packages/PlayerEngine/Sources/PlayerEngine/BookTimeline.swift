@@ -10,11 +10,6 @@ public struct BookTimeline: Sendable {
         public init(trackIndex: Int, offset: TimeInterval) {
             self.trackIndex = trackIndex; self.offset = offset
         }
-
-        public static func == (lhs: Position, rhs: Position) -> Bool {
-            lhs.trackIndex == rhs.trackIndex &&
-            abs(lhs.offset - rhs.offset) < 1e-9
-        }
     }
 
     public let tracks: [AudioTrack]
