@@ -97,6 +97,10 @@ extension ABSClient {
                                      currentTime: currentTime, timeListened: timeListened, duration: duration)
     }
 
+    /// Verified against a live ABS 2.35.1 server (see ContractTests.fullPlaybackLifecycle):
+    /// pass the audio track's own 1-indexed `AudioTrack.index` value directly as `trackIndex`,
+    /// not its position in the `audioTracks` array — the server resolves the URL by that field
+    /// and serves the correct bytes. Range requests are honored (206 + exact byte count).
     public func publicTrackURL(sessionID: String, trackIndex: Int) -> URL {
         baseURL.appending(path: "public/session/\(sessionID)/track/\(trackIndex)")
     }
