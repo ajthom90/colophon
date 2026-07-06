@@ -14,6 +14,10 @@ public struct ProgressUpdate: Sendable, Equatable {
 
 public enum ServerEvent: Sendable, Equatable {
     case progressUpdated(ProgressUpdate)
+    /// `user_updated`: the server pushes the WHOLE user object (web-UI mark-finished / manual
+    /// progress edits don't get a per-item `user_item_progress_updated` — the only signal is
+    /// this batch), so decoding maps its `mediaProgress` array into one update per entry.
+    case progressBatch([ProgressUpdate])
     case itemChanged(id: String)
     case itemsChanged(ids: [String])
     case itemRemoved(id: String)
@@ -32,6 +36,22 @@ public enum ServerEvent: Sendable, Equatable {
                 currentTime: currentTime,
                 isFinished: data["isFinished"] as? Bool ?? false,
                 lastUpdate: lastUpdate))
+        case "user_updated":
+            guard let user = payload.first as? [String: Any],
+                  let mediaProgress = user["mediaProgress"] as? [[String: Any]],
+                  !mediaProgress.isEmpty else { return nil }
+            let updates = mediaProgress.compactMap { entry -> ProgressUpdate? in
+                guard let itemID = entry["libraryItemId"] as? String,
+                      let currentTime = entry["currentTime"] as? Double,
+                      let lastUpdate = entry["lastUpdate"] as? Int else { return nil }
+                return ProgressUpdate(
+                    itemID: itemID,
+                    episodeID: entry["episodeId"] as? String,
+                    currentTime: currentTime,
+                    isFinished: entry["isFinished"] as? Bool ?? false,
+                    lastUpdate: lastUpdate)
+            }
+            return updates.isEmpty ? nil : .progressBatch(updates)
         case "item_updated", "item_added":
             guard let dict = payload.first as? [String: Any], let id = dict["id"] as? String else { return nil }
             return .itemChanged(id: id)

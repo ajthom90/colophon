@@ -1,6 +1,7 @@
 import Foundation
 import SwiftUI
 import ABSKit
+import ABSRealtime
 import PlayerEngine
 import LibraryCache
 
@@ -25,6 +26,12 @@ final class AppState {
     private var auth: AuthManager?
     private let tokenStore = KeychainTokenStore()
     private var sessionHandle: PlaybackSessionHandle?
+
+    /// Real-time updates: one socket per active connection, one consumer task draining its
+    /// event stream, one task forwarding `auth.tokenUpdates` into `socket.reauthenticate()`.
+    private var socket: SocketService?
+    private var socketTask: Task<Void, Never>?
+    private var reauthTask: Task<Void, Never>?
 
     init() {
         let supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -85,15 +92,71 @@ final class AppState {
                 CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
                               mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
             }, connectionID: connection.id)
+            // Real-time updates: one socket per active connection. Defensive teardown first —
+            // guards a repeat connect() call (e.g. switching servers while already connected)
+            // from leaking the previous connection's socket/tasks.
+            stopSocket()
+            let service = SocketService(serverURL: url) { [weak auth] in
+                try? await auth?.currentAccessToken()
+            }
+            socket = service
+            socketTask = Task { [weak self] in
+                for await event in service.events() {
+                    await self?.apply(event)
+                }
+            }
+            reauthTask = Task { [weak self] in
+                // `auth` is an actor: reading its `tokenUpdates` stream (a Sendable value)
+                // requires an isolation hop, but the stream itself can then be iterated freely.
+                guard let updates = await self?.auth?.tokenUpdates else { return }
+                for await _ in updates {
+                    await self?.socket?.reauthenticate()
+                }
+            }
             phase = .connected
         } catch ABSError.http(status: 401) {
+            stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = "Wrong username or password"
         } catch {
+            stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Tears down the live socket and both of its driving tasks. Called defensively before
+    /// wiring a fresh socket, and on every path that leaves `phase != .connected`.
+    private func stopSocket() {
+        socket?.stop()
+        socket = nil
+        socketTask?.cancel()
+        socketTask = nil
+        reauthTask?.cancel()
+        reauthTask = nil
+    }
+
+    /// Applies a decoded server event to local state. `progressUpdated`/`progressBatch` upsert
+    /// straight into the cache (last-write-wins by `lastUpdate`, enforced in
+    /// `LibraryCacheStore.upsertProgress`); item lifecycle events do a coarse re-page of
+    /// whatever library is currently open (M1a scope — per-item patch is M1c polish).
+    private func apply(_ event: ServerEvent) async {
+        guard let connectionID = activeConnectionID else { return }
+        switch event {
+        case .progressUpdated(let update):
+            try? cache.upsertProgress(CachedProgress(
+                connectionID: connectionID, itemID: update.itemID, episodeID: update.episodeID,
+                currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate))
+        case .progressBatch(let updates):
+            for update in updates {
+                try? cache.upsertProgress(CachedProgress(
+                    connectionID: connectionID, itemID: update.itemID, episodeID: update.episodeID,
+                    currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate))
+            }
+        case .itemChanged, .itemsChanged, .itemRemoved:
+            if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
         }
     }
 

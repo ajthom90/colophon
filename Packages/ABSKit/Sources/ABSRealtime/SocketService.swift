@@ -30,7 +30,7 @@ public final class SocketService {
             socket.on(clientEvent: .connect) { [weak self] _, _ in
                 Task { @MainActor in await self?.emitAuth() }
             }
-            for name in ["user_item_progress_updated", "item_updated", "item_added",
+            for name in ["user_item_progress_updated", "user_updated", "item_updated", "item_added",
                          "item_removed", "items_updated", "items_added"] {
                 socket.on(name) { [weak self] payload, _ in
                     Task { @MainActor in

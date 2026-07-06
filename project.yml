@@ -19,6 +19,8 @@ targets:
     sources: [App]
     dependencies:
       - package: ABSKit
+      - package: ABSKit
+        product: ABSRealtime
       - package: PlayerEngine
       - package: LibraryCache
     settings:
