@@ -73,9 +73,10 @@ public struct HTTPResponse: Sendable { public let statusCode: Int; public let da
 public protocol Transport: Sendable { func send(_ request: URLRequest) async throws -> HTTPResponse }
 
 public struct TokenPair: Sendable, Equatable { public var accessToken: String; public var refreshToken: String? }
+public enum TokenStoreError: Error, Equatable { case keychainFailure(OSStatus); case encodingFailure }
 public protocol TokenStore: Sendable {
     func tokens(for connectionID: String) async -> TokenPair?
-    func save(_ tokens: TokenPair, for connectionID: String) async
+    func save(_ tokens: TokenPair, for connectionID: String) async throws   // AMENDED 2026-07-06 (user-approved): throws TokenStoreError so a failed persist of a rotated refresh token surfaces immediately instead of silent session loss. Every call site in this plan's code blocks gains `try` (and `throws` where needed).
     func clear(for connectionID: String) async
 }
 
@@ -1072,8 +1073,8 @@ public actor AuthManager {
             ABSAPI.loginRequest(baseURL: baseURL, username: username, password: password),
             as: LoginResponse.self, via: transport)
         guard let access = response.user.accessToken else { throw ABSError.invalidResponse }
-        await store.save(TokenPair(accessToken: access, refreshToken: response.user.refreshToken),
-                         for: connectionID)
+        try await store.save(TokenPair(accessToken: access, refreshToken: response.user.refreshToken),
+                             for: connectionID)
         return response
     }
 
@@ -1102,7 +1103,7 @@ public actor AuthManager {
                 // Server rotates the refresh token; keep the old one only if none returned.
                 let newPair = TokenPair(accessToken: access,
                                         refreshToken: response.user.refreshToken ?? refreshToken)
-                await store.save(newPair, for: connectionID)
+                try await store.save(newPair, for: connectionID)
                 return access
             } catch ABSError.http(status: 401) {
                 await store.clear(for: connectionID)
