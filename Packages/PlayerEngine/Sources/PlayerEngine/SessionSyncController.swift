@@ -19,11 +19,10 @@ public struct SessionSyncController: Sendable {
         self.interval = interval
     }
 
+    /// First payload emits once ≥ interval seconds of listened time accumulate; thereafter a payload emits when ≥ interval wall-clock seconds have passed since the last emission.
     public mutating func noteProgress(currentTime: TimeInterval, listenedDelta: TimeInterval, now: Date) -> SyncPayload? {
         accumulatedListened += max(0, listenedDelta)
-        let reference = lastEmission ?? now.addingTimeInterval(-min(accumulatedListened, interval))
-        let due = lastEmission.map { now.timeIntervalSince($0) >= interval }
-            ?? (accumulatedListened >= interval || now.timeIntervalSince(reference) >= interval)
+        let due = lastEmission.map { now.timeIntervalSince($0) >= interval } ?? (accumulatedListened >= interval)
         guard due else { return nil }
         lastEmission = now
         return SyncPayload(currentTime: currentTime, timeListened: accumulatedListened)
