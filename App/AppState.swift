@@ -32,6 +32,10 @@ final class AppState {
     private var socket: SocketService?
     private var socketTask: Task<Void, Never>?
     private var reauthTask: Task<Void, Never>?
+    /// Reentrancy guard for `startPlayback`: without it, two rapid taps both pass
+    /// `retireCurrentSession` (handle nil) and both await `client.startPlayback`; if response A
+    /// lands after B, the user hears the wrong item and B's server session leaks open.
+    private var isStartingPlayback = false
 
     init() {
         let supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -61,6 +65,9 @@ final class AppState {
     }
 
     func connect(serverURL: String, username: String, password: String) async {
+        // Closes the same-frame double-tap window: without this, two rapid taps both race past
+        // the stopSocket/ID-nil prefix below and each spins up its own socket, leaking one live.
+        guard phase != .connecting else { return }
         errorMessage = nil
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
@@ -234,6 +241,12 @@ final class AppState {
     }
 
     func startPlayback(itemID: String) async {
+        // First-tap-wins reentrancy guard: without it, two rapid taps both pass
+        // `retireCurrentSession` (handle nil) and both await `client.startPlayback`; if response
+        // A lands after B, the user hears the wrong item and B's server session leaks open.
+        guard !isStartingPlayback else { return }
+        isStartingPlayback = true
+        defer { isStartingPlayback = false }
         guard let client else { return }
         // Retire the old session completely before touching the new one.
         await retireCurrentSession()
