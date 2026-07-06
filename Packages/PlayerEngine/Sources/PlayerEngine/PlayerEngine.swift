@@ -74,6 +74,10 @@ public final class PlaybackController {
 
     public func unload() { backend.teardown(); isPlaying = false }
 
+    /// Flush any accumulated listened-time to the server WITHOUT pausing playback —
+    /// used on scene backgrounding, where background audio must keep playing.
+    public func flushOnly() async { await flushSync() }
+
     private func tick() {
         guard isPlaying, let position = backend.currentPosition else { return }
         globalTime = timeline.globalTime(trackIndex: position.index, offset: position.offset)

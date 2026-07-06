@@ -21,6 +21,7 @@ private struct PerfSpikeAutoOpener: View {
 @main
 struct ColophonApp: App {
     @State private var app = AppState()
+    @Environment(\.scenePhase) private var scenePhase
 
     init() {
         #if DEBUG && os(macOS)
@@ -51,6 +52,9 @@ struct ColophonApp: App {
                 #if DEBUG
                 await app.runAutoConnectIfRequested()
                 #endif
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase == .background { app.flushForBackground() }
             }
             #if DEBUG && os(macOS)
             .background(PerfSpikeAutoOpener())

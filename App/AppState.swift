@@ -15,6 +15,7 @@ final class AppState {
 
     private var auth: AuthManager?
     private let tokenStore = KeychainTokenStore()
+    private var sessionHandle: PlaybackSessionHandle?
 
     var deviceInfo: DeviceInfo {
         let id: String
@@ -66,25 +67,47 @@ final class AppState {
 
     func startPlayback(item: LibraryItemSummary) async {
         guard let client else { return }
+        // Retire the old session completely before touching the new one (ordering matters:
+        // flush → detach sync callback → close server-side → tear down local playback).
+        if let old = sessionHandle {
+            playback.pause()                       // stop audio; pause() also flushes, but via a
+                                                     // fire-and-forget Task with no ordering guarantee
+                                                     // against the next line — so flush deterministically
+                                                     // before severing onSyncDue (idempotent: a harmless
+                                                     // no-op if pause()'s internal flush already landed).
+            await playback.flushOnly()
+            playback.onSyncDue = nil
+            await old.close(currentTime: playback.globalTime, timeListened: 0)
+            playback.unload()
+            sessionHandle = nil
+        }
         do {
-            let session = try await client.startPlayback(itemID: item.id, deviceInfo: deviceInfo)
-            playback.onSyncDue = { [weak client] payload in
-                guard let client else { return false }
-                do {
-                    try await client.syncSession(id: session.id, currentTime: payload.currentTime,
-                                                 timeListened: payload.timeListened, duration: session.duration)
-                    return true
-                } catch {
-                    return false  // keep accumulating; retried next interval
-                }
+            let envelope = try await client.startPlayback(itemID: item.id, deviceInfo: deviceInfo)
+            let handle = PlaybackSessionHandle(client: client, envelope: envelope)
+            sessionHandle = handle
+            playback.onSyncDue = { payload in
+                await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }
-            let timelineTracks = session.audioTracks.sorted { $0.startOffset < $1.startOffset }
-            let urls = timelineTracks.map { client.publicTrackURL(sessionID: session.id, trackIndex: $0.index) }
-            playback.load(session: session, trackURLs: urls)
+            let ordered = envelope.session.audioTracks.sorted { $0.startOffset < $1.startOffset }
+            let urls = ordered.map { client.publicTrackURL(sessionID: envelope.session.id, trackIndex: $0.index) }
+            playback.load(session: envelope.session, trackURLs: urls)
             playback.play()
         } catch {
-            errorMessage = "Playback failed: \(error.localizedDescription)"
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    /// Scene backgrounding: flush accumulated listened-time WITHOUT pausing — background
+    /// audio must keep playing (server-side 36h reaping + 404-recovery cover full termination).
+    func flushForBackground() {
+        Task { await playback.flushOnly() }
+    }
+
+    func closeCurrentSession() async {
+        guard let handle = sessionHandle else { return }
+        playback.pause()
+        await handle.close(currentTime: playback.globalTime, timeListened: 0)
+        sessionHandle = nil
     }
 
     #if DEBUG
