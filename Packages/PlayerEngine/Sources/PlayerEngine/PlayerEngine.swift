@@ -133,8 +133,14 @@ public final class PlaybackController {
         // Periodic observer is delivered on .main → safe to assume MainActor isolation.
         timeObserver = queue.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.5, preferredTimescale: 10), queue: .main
-        ) { [weak self] time in
-            MainActor.assumeIsolated { self?.tick(trackTime: time.seconds) }
+        ) { [weak self] _ in
+            // The callback's `time` is ignored: by the time this block runs on .main, a
+            // boundary crossing may have already advanced `player.currentItem` to the NEXT
+            // track, and pairing this stale near-end offset with the new item's index would
+            // inflate listened time by up to a track duration. `tick()` re-derives the offset
+            // from the resolved current item itself, so (index, offset) are atomic by
+            // construction.
+            MainActor.assumeIsolated { self?.tick() }
         }
         // NotificationCenter delivers on .main queue → safe to assume MainActor isolation.
         // `Notification`/`AVPlayerItem` are non-Sendable, so reduce the finished item to a
@@ -155,13 +161,17 @@ public final class PlaybackController {
         }
     }
 
-    private func tick(trackTime: TimeInterval) {
+    private func tick() {
         guard isPlaying else { return }
         // Derive the track index from the queue's current item rather than counting
         // end notifications, which can be stale/duplicated across queue rebuilds.
         // Unmapped or nil current item → no state mutation this tick.
         guard let current = player?.currentItem,
               let index = itemIndexByID[ObjectIdentifier(current)] else { return }
+        // Derive the offset from the SAME captured item so (index, offset) are atomic —
+        // no stale offset from a since-superseded item can pair with this index.
+        let trackTime = current.currentTime().seconds
+        guard trackTime.isFinite else { return }  // unknown/indeterminate item time → skip tick
         currentTrackIndex = index
         globalTime = timeline.globalTime(trackIndex: currentTrackIndex, offset: trackTime)
         let delta = max(0, globalTime - lastTickGlobalTime)
