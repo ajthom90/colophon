@@ -1,0 +1,1 @@
+{"user":{"id":"usr_abc123","username":"root","type":"root","accessToken":"eyJ.access.1","refreshToken":"eyJ.refresh.1","token":"legacy-token","mediaProgress":[],"bookmarks":[],"permissions":{"download":true,"update":true}},"userDefaultLibraryId":"lib_1","serverSettings":{"version":"2.35.1"},"Source":"docker"}

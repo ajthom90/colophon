@@ -1,0 +1,1 @@
+{"libraries":[{"id":"lib_1","name":"Books","folders":[{"id":"fol_1","fullPath":"/audiobooks"}],"displayOrder":1,"icon":"audiobookshelf","mediaType":"book","provider":"google","settings":{"coverAspectRatio":1},"createdAt":1751000000000,"lastUpdate":1751000000000}]}
