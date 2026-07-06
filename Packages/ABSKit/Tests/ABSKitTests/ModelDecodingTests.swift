@@ -55,4 +55,17 @@ private func fixture(_ name: String) throws -> Data {
         #expect(s.displayTitle == nil)
         #expect(s.audioTracks.isEmpty)
     }
+
+    @Test func deviceInfoEncodesWithDefaults() throws {
+        let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
+        let data = try JSONEncoder().encode(device)
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: String]
+        #expect(json == [
+            "deviceId": "dev-1",
+            "clientName": "Colophon",
+            "clientVersion": "0.1.0",
+            "manufacturer": "Apple",
+            "model": "Mac16,1",
+        ])
+    }
 }
