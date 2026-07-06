@@ -65,6 +65,12 @@ final class AppState {
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
         }
+        // Tear down the previous connection's socket BEFORE any await, and clear the active
+        // connection ID with it: otherwise the old socket stays live across the awaits below
+        // while `activeConnectionID` may already reference the new connection, and a stray
+        // server-A progress event would be upserted under server-B's ID.
+        stopSocket()
+        activeConnectionID = nil
         phase = .connecting
         do {
             let transport = URLSessionTransport()
@@ -92,10 +98,8 @@ final class AppState {
                 CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
                               mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
             }, connectionID: connection.id)
-            // Real-time updates: one socket per active connection. Defensive teardown first —
-            // guards a repeat connect() call (e.g. switching servers while already connected)
-            // from leaking the previous connection's socket/tasks.
-            stopSocket()
+            // Real-time updates: one socket per active connection (the previous connection's
+            // socket was torn down at the top of connect(), before any await).
             let service = SocketService(serverURL: url) { [weak auth] in
                 try? await auth?.currentAccessToken()
             }
@@ -127,8 +131,9 @@ final class AppState {
         }
     }
 
-    /// Tears down the live socket and both of its driving tasks. Called defensively before
-    /// wiring a fresh socket, and on every path that leaves `phase != .connected`.
+    /// Tears down the live socket and both of its driving tasks. Called at the top of
+    /// `connect()` (before any await — no old socket may outlive an `activeConnectionID`
+    /// change) and, defensively, on every path that leaves `phase != .connected`.
     private func stopSocket() {
         socket?.stop()
         socket = nil
