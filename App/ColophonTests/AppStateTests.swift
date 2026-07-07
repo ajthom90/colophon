@@ -520,6 +520,106 @@ struct AppStateTests {
         while !app.isOnline { await Task.yield() }
     }
 
+    // MARK: - Connection generation token (final-review fix batch)
+
+    /// Race A — a probe must not RESURRECT a signed-out connection. Activate `C1` with its
+    /// `authorize()` parked on a `GatedTransport`; while the probe hangs, `signOut(C1)` (which
+    /// deliberately leaves `activeConnectionID == C1`, the old guard's blind spot). Release the
+    /// gate: `authorize()` returns 200, but the connection-generation bump `signOut` performed
+    /// makes the resumed probe stale, so it no-ops — it must NOT flip `isOnline`, clear the
+    /// needs-sign-in mark, or build a socket for the connection the user just abandoned.
+    @Test func signOutCancelsInFlightProbe() async throws {
+        final class SocketConstructionCounter { private(set) var count = 0; func record() { count += 1 } }
+
+        let dir = makeTempDir()
+        let transport = GatedTransport(gatePath: "/api/authorize")   // park the probe mid-authorize
+        let tokenStore = InMemoryTokenStore()
+        let sockets = SocketConstructionCounter()
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in sockets.record(); return FakeSocket() },
+            tokenStore: tokenStore,
+            oidcTransportProvider: { transport }
+        )
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+
+        await app.activateConnection("C1")        // returns; the probe is launched and parks on the gate
+        // Ensure the probe has actually reached (and is suspended at) the /api/authorize send.
+        while await transport.requestCount(pathContains: "/api/authorize") == 0 { await Task.yield() }
+        #expect(app.isOnline == false)
+
+        await app.signOut(connectionID: "C1")     // bumps the generation → the parked probe is now stale
+
+        // Release the gate: the probe resumes and `authorize()` returns 200, but the generation
+        // guard turns it into a no-op — the connection stays signed out.
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.openGate()
+        // Drain the cooperative executor so the resumed probe runs to its (stale) guard and returns.
+        // On the stale path it writes nothing, so there is no positive signal to await; a regression
+        // (missing guard) would instead flip `isOnline` / build a socket synchronously right after
+        // `authorize()` returns — well within this bound — which the asserts below would catch.
+        for _ in 0..<200 { await Task.yield() }
+
+        #expect(app.needsSignIn.contains("C1"))                                // stays signed-out
+        #expect(app.isOnline == false)                                         // NOT resurrected
+        #expect(sockets.count == 0)                                            // no socket constructed after signOut
+        #expect(await transport.requestCount(pathContains: "/libraries") == 0) // probe never reached libraries
+    }
+
+    /// Race B — a slow/abandoned `connect()` must not clobber a newer activation. Begin a connect
+    /// whose login is parked on a `GatedTransport`; while it hangs, `activateConnection(NEWER)`
+    /// supersedes it (bumping the generation) and its probe brings `NEWER` online with a live
+    /// socket. Release the stale connect's gate so its login SUCCEEDS — the generation guard must
+    /// make it discard itself: `activeConnectionID` stays `NEWER` (no silent reassignment) and
+    /// `NEWER`'s socket is never torn down (no `startSocket`/`stopSocket` from the stale connect).
+    @Test func staleConnectDoesNotClobberNewerActivation() async throws {
+        final class SocketConstructionCounter { private(set) var count = 0; func record() { count += 1 } }
+
+        let dir = makeTempDir()
+        let transport = GatedTransport(gatePath: "/login")   // park the connect mid-login
+        // FIFO responses, consumed in the deterministic order the barriers below enforce:
+        await transport.enqueue(status: 200, json: statusOK)      // connect: /status
+        await transport.enqueue(status: 200, json: "{}")          // NEWER probe: /api/authorize
+        await transport.enqueue(status: 200, json: librariesOK)   // NEWER probe: /libraries
+        await transport.enqueue(status: 200, json: loginOK)       // connect: /login (served on gate open)
+        let tokenStore = InMemoryTokenStore()
+        let sockets = SocketConstructionCounter()
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in sockets.record(); return FakeSocket() },
+            tokenStore: tokenStore,
+            oidcTransportProvider: { transport }
+        )
+        // The newer connection, seeded with tokens so its probe comes online with a socket.
+        try app.cache.upsertConnection(CachedConnection(id: "NEWER", address: "http://newer:13378", name: "Newer",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "NEWER")
+
+        // Begin a connect that clears /status then parks mid-login.
+        let stale = Task { await app.connect(serverURL: "http://stale:13378", username: "root", password: "pw") }
+        while await transport.requestCount(pathContains: "/login") == 0 { await Task.yield() }
+        #expect(app.phase == .connecting)
+
+        // While the connect hangs, activate a different connection — supersedes the connect.
+        await app.activateConnection("NEWER")
+        #expect(app.activeConnectionID == "NEWER")
+        while !app.isOnline { await Task.yield() }   // probe consumed /api/authorize + /libraries, socket up
+        #expect(sockets.count == 1)
+
+        // Release the stale connect's gate: its login succeeds (200) but the generation guard
+        // discards it — no reassignment of activeConnectionID, no teardown of NEWER's socket.
+        await transport.openGate()
+        await stale.value
+
+        #expect(app.activeConnectionID == "NEWER")   // stale connect discarded, NOT clobbered
+        #expect(app.isOnline == true)                 // NEWER still online
+        #expect(sockets.count == 1)                   // NEWER's socket never torn down or rebuilt
+    }
+
     // MARK: - OIDC
 
     /// A canned OIDC browser closure: ignores the authorize URL and returns a fixed

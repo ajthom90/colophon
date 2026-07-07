@@ -3,13 +3,15 @@ SIM ?= iPhone 17
 gen:
 	xcodegen generate
 
+# pipefail: without it the pipeline exits with tail's status (always 0) and a
+# BUILD FAILED would be reported green.
 build-ios: gen
-	xcodebuild -project Colophon.xcodeproj -scheme Colophon \
+	set -o pipefail; xcodebuild -project Colophon.xcodeproj -scheme Colophon \
 	  -destination 'platform=iOS Simulator,name=$(SIM)' \
 	  -allowProvisioningUpdates build | tail -5
 
 build-mac: gen
-	xcodebuild -project Colophon.xcodeproj -scheme Colophon \
+	set -o pipefail; xcodebuild -project Colophon.xcodeproj -scheme Colophon \
 	  -destination 'platform=macOS' \
 	  -allowProvisioningUpdates build | tail -5
 

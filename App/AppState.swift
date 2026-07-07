@@ -117,6 +117,16 @@ final class AppState {
     /// doc comment. Not awaited by `activateConnection` itself; exists so a fresh activation can
     /// cancel whatever probe preceded it.
     private var probeTask: Task<Void, Never>?
+    /// Monotonic token capturing "the latest connection-mutating user intent." Every flow that
+    /// mutates connection state (`connect`, `connectWithOIDC`, `activateConnection`, `signOut`,
+    /// `removeConnection`) bumps this at entry and captures its value; after every `await` — and in
+    /// the detached `probeTask` — it re-checks `connectionGeneration == myGeneration` before writing
+    /// any shared state or standing up a socket, and bails if a newer flow has superseded it. This
+    /// is the authoritative "am I still the current intent?" guard that composes across all four
+    /// flows, where the per-flow guards (`phase`, `activatingConnectionID`, `activeConnectionID`)
+    /// did not: it stops a slow/abandoned connect from clobbering a newer activation, and stops an
+    /// in-flight probe from resurrecting a connection the user just signed out of or removed.
+    private var connectionGeneration = 0
 
     /// Every argument defaults to production behavior; tests override them to run entirely
     /// offline (MockTransport, temp-dir cache, FakeSocket, `InMemoryTokenStore` — the Keychain
@@ -172,6 +182,8 @@ final class AppState {
         // Closes the same-frame double-tap window: without this, two rapid taps both race past
         // the stopSocket/ID-nil prefix below and each spins up its own socket, leaking one live.
         guard phase != .connecting else { return }
+        connectionGeneration += 1
+        let myGeneration = connectionGeneration
         errorMessage = nil
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
@@ -189,22 +201,34 @@ final class AppState {
         do {
             let transport = self.transport
             let status = try await ABSClient.status(baseURL: url, transport: transport)
+            // A newer flow (a fresh activation/connect, or a sign-out) superseded this connect
+            // while `/status` was in flight: discard silently — the newer flow owns the state now.
+            guard connectionGeneration == myGeneration else { return }
             try checkVersionGate(status)
             let connection = try findOrCreateConnection(address: url.absoluteString, username: username)
             // Awaited (not fire-and-forget) so migration can never race a fresh login's token
             // save — it must finish moving any legacy entry before `auth.login` writes new ones.
             await TokenMigration.migrateLegacyTokensIfNeeded(
                 from: url.absoluteString, to: connection.id, store: tokenStore)
+            guard connectionGeneration == myGeneration else { return }
             let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             _ = try await auth.login(username: username, password: password)
-            try await completeConnection(connection: connection, auth: auth, url: url)
+            // A stale connect whose (possibly minutes-long) login finally landed must NOT clobber
+            // the connection a newer activation put in place. Its saved tokens are harmless —
+            // keyed by this connection's own id — so just discard without touching shared state.
+            guard connectionGeneration == myGeneration else { return }
+            try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
         } catch ABSError.http(status: 401) {
+            // Only surface the error / reset state if we're still the current intent — a stale
+            // connect must not stopSocket a newer connection nor bounce the user out.
+            guard connectionGeneration == myGeneration else { return }
             stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = "Wrong username or password"
         } catch {
+            guard connectionGeneration == myGeneration else { return }
             stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
@@ -229,6 +253,8 @@ final class AppState {
     /// supplies the username up front.
     func connectWithOIDC(serverURL: String, browser: @Sendable (URL) async throws -> URL) async {
         guard phase != .connecting else { return }
+        connectionGeneration += 1
+        let myGeneration = connectionGeneration
         errorMessage = nil
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
@@ -240,16 +266,23 @@ final class AppState {
         do {
             let transport = self.transport
             let status = try await ABSClient.status(baseURL: url, transport: transport)
+            guard connectionGeneration == myGeneration else { return }
             try checkVersionGate(status)
             let flow = OIDCFlow(serverURL: url, transport: oidcTransport)
+            // The browser hop can sit open for minutes; a newer activation/connect in that window
+            // supersedes this one and its `myGeneration` will no longer match below.
             let loginResponse = try await flow.authenticate(browser: browser)
+            guard connectionGeneration == myGeneration else { return }
             let connection = try findOrCreateConnection(
                 address: url.absoluteString, username: loginResponse.user.username, authMethod: "openid")
             let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             try await auth.completeOIDC(loginResponse: loginResponse)
-            try await completeConnection(connection: connection, auth: auth, url: url)
+            guard connectionGeneration == myGeneration else { return }
+            try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
         } catch {
+            // A stale OIDC connect must not tear down or reset a newer connection's state.
+            guard connectionGeneration == myGeneration else { return }
             stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
@@ -282,13 +315,17 @@ final class AppState {
     /// The tail both sign-in paths share once they hold an authenticated `AuthManager`: build the
     /// client, publish connection state, fetch+cache the library list, and stand up the realtime
     /// socket. Only reached after a successful login/OIDC exchange, so `phase` ends `.connected`.
-    private func completeConnection(connection: CachedConnection, auth: AuthManager, url: URL) async throws {
+    private func completeConnection(connection: CachedConnection, auth: AuthManager, url: URL, generation: Int) async throws {
         let transport = self.transport
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
         self.client = client
         self.activeConnectionID = connection.id
         let libs = try await client.libraries()
+        // A newer flow superseded this connect while the library list was in flight — it already
+        // owns `activeConnectionID`/socket/phase, so bail without stomping any of it (in particular
+        // without `startSocket`, which would tear down the newer connection's live socket).
+        guard connectionGeneration == generation else { return }
         try cache.upsertLibraries(libs.enumerated().map { index, lib in
             CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
                           mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
@@ -369,6 +406,10 @@ final class AppState {
         guard activatingConnectionID != id else { return }
         activatingConnectionID = id
         defer { activatingConnectionID = nil }
+        // Bump AFTER the same-id reentrancy guard above: a reentrant same-id call bails without a
+        // bump, so it can't invalidate the first (still legitimate) activation's own probe.
+        connectionGeneration += 1
+        let myGeneration = connectionGeneration
 
         guard let connection = try? cache.connections().first(where: { $0.id == id }),
               let url = URL(string: connection.address) else { return }
@@ -392,44 +433,51 @@ final class AppState {
 
         // No stored credentials: surface re-auth, don't probe (nothing to probe with).
         guard await tokenStore.tokens(for: id) != nil else {
+            // The token lookup is a real suspension point — a newer flow may have superseded us
+            // while it was in flight; if so, leave its state alone.
+            guard connectionGeneration == myGeneration else { return }
             client = nil
             auth = nil
             needsSignIn.insert(id)
             return
         }
+        guard connectionGeneration == myGeneration else { return }
         let auth = AuthManager(baseURL: url, connectionID: id, transport: transport, store: tokenStore)
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
         self.client = client
 
         // The network probe: detached so `activateConnection` returns now, with cached browsing
-        // already live. Every branch re-checks `activeConnectionID == id` since a newer
-        // activation (of this id or a different one) may have superseded this probe by the time
-        // any await resumes.
+        // already live. Every branch re-checks the generation (authoritative — a sign-out/removal
+        // or a newer activation of this or another id supersedes this probe) plus `activeConnectionID
+        // == id` for id-specificity, since either an in-flight `authorize()` or the `libraries()`
+        // that follows can resume long after the user has moved on. A signed-out connection leaves
+        // `activeConnectionID == id`, so without the generation check the probe would RESURRECT it
+        // (needsSignIn.remove, isOnline, socket) for a connection the user just abandoned.
         probeTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await client.authorize()
-                guard self.activeConnectionID == id else { return }
+                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
                 self.needsSignIn.remove(id)
                 self.isOnline = true
                 self.startSocket(url: url, auth: auth)
                 if let libs = try? await client.libraries() {
-                    guard self.activeConnectionID == id else { return }
+                    guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
                     try? self.cache.upsertLibraries(libs.enumerated().map { index, lib in
                         CachedLibrary(id: lib.id, connectionID: id, name: lib.name,
                                       mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
                     }, connectionID: id)
                 }
             } catch ABSError.reauthRequired, ABSError.notAuthenticated {
-                guard self.activeConnectionID == id else { return }
+                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
                 self.isOnline = false
                 self.needsSignIn.insert(id)
             } catch {
                 // Host down / transport error: stay in cached-only offline mode. `isOnline ==
                 // false` drives the offline banner; no blocking error alert for an expected
                 // offline case.
-                guard self.activeConnectionID == id else { return }
+                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
                 self.isOnline = false
             }
         }
@@ -440,6 +488,11 @@ final class AppState {
     /// cached rows so the user can still browse offline and sign back in later. Marks it
     /// `needsSignIn` so `ConnectionsView` badges it and routes a tap to re-auth.
     func signOut(connectionID id: String) async {
+        // Bump FIRST, before any await: an in-flight `activateConnection` probe for THIS connection
+        // (parked in `authorize()`/`libraries()`) captured the previous generation, so bumping here
+        // immediately makes it stale — when it resumes it will no-op instead of resurrecting the
+        // connection we're signing out (needsSignIn.remove + isOnline + socket for a dead session).
+        connectionGeneration += 1
         if playingConnectionID == id {
             await retireCurrentSession()
         }
