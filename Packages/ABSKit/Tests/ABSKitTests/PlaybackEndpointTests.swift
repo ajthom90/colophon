@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import ABSKit
+import ABSKitTestSupport
 
 @Suite struct PlaybackEndpointTests {
     let base = URL(string: "http://abs.test:13378")!

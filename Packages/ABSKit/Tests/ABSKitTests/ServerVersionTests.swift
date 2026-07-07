@@ -24,4 +24,11 @@ import Testing
         #expect(ABSError.invalidResponse.errorDescription?.isEmpty == false)
         #expect(TokenStoreError.keychainFailure(-25300).errorDescription?.contains("-25300") == true)
     }
+
+    @Test func toleratesPreReleaseAndBuildSuffixes() {
+        #expect(ServerVersion("2.36.0-beta.1") == ServerVersion("2.36.0"))
+        #expect(ServerVersion("2.36.0+build5") == ServerVersion("2.36.0"))
+        #expect(ServerVersion("2.36.0-beta")! > ServerVersion("2.26.0")!)
+        #expect(ServerVersion("2.36-beta") == nil)
+    }
 }

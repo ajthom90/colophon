@@ -15,7 +15,22 @@ public protocol Transport: Sendable {
 
 public struct URLSessionTransport: Transport {
     let session: URLSession
-    public init(session: URLSession = .shared) { self.session = session }
+    public let followRedirects: Bool
+
+    public init(session: URLSession = .shared, followRedirects: Bool = true) {
+        self.followRedirects = followRedirects
+        if followRedirects {
+            self.session = session
+        } else {
+            let configuration = session.configuration
+            self.session = URLSession(
+                configuration: configuration,
+                delegate: NoRedirectSessionDelegate(),
+                delegateQueue: session.delegateQueue
+            )
+        }
+    }
+
     public func send(_ request: URLRequest) async throws -> HTTPResponse {
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw ABSError.invalidResponse }
@@ -24,6 +39,22 @@ public struct URLSessionTransport: Transport {
             if let k = k as? String, let v = v as? String { headers[k] = v }
         }
         return HTTPResponse(statusCode: http.statusCode, data: data, headers: headers)
+    }
+}
+
+/// Stops `URLSession` from automatically following HTTP redirects. Passing `nil` to the
+/// completion handler makes the redirect response itself (headers, status, body) surface as
+/// the task's result — callers that need the raw `Location`/`Set-Cookie` headers (e.g. an
+/// OIDC authorization redirect) get them instead of the followed destination's response.
+final class NoRedirectSessionDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        completionHandler(nil)
     }
 }
 

@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .library(name: "ABSKit", targets: ["ABSKit"]),
         .library(name: "ABSRealtime", targets: ["ABSRealtime"]),
+        .library(name: "ABSKitTestSupport", targets: ["ABSKitTestSupport"]),
     ],
     dependencies: [
         .package(url: "https://github.com/socketio/socket.io-client-swift", from: "16.1.0"),
@@ -15,7 +16,8 @@ let package = Package(
         .target(name: "ABSKit"),
         .target(name: "ABSRealtime",
                 dependencies: ["ABSKit", .product(name: "SocketIO", package: "socket.io-client-swift")]),
-        .testTarget(name: "ABSKitTests", dependencies: ["ABSKit"], resources: [.copy("Fixtures")]),
+        .target(name: "ABSKitTestSupport", dependencies: ["ABSKit"]),
+        .testTarget(name: "ABSKitTests", dependencies: ["ABSKit", "ABSKitTestSupport"], resources: [.copy("Fixtures")]),
         .testTarget(name: "ABSRealtimeTests", dependencies: ["ABSRealtime"]),
     ]
 )

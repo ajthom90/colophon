@@ -4,7 +4,10 @@ public struct ServerVersion: Comparable, Sendable, Equatable {
     public let major: Int, minor: Int, patch: Int
 
     public init?(_ string: String) {
-        let parts = string.split(separator: ".", omittingEmptySubsequences: false)
+        // Tolerate pre-release/build suffixes (e.g. "2.36.0-beta.1", "2.36.0+build5") by
+        // parsing only the leading core before the first "-" or "+".
+        let core = string.prefix { $0 != "-" && $0 != "+" }
+        let parts = core.split(separator: ".", omittingEmptySubsequences: false)
         guard parts.count == 3,
               let major = Int(parts[0]), let minor = Int(parts[1]), let patch = Int(parts[2])
         else { return nil }

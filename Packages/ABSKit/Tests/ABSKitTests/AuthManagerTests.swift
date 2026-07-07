@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 @testable import ABSKit
+import ABSKitTestSupport
 
 @Suite struct AuthManagerTests {
     let base = URL(string: "http://abs.test:13378")!
@@ -77,7 +78,7 @@ import Testing
     }
 
     @Test func tokenUpdatesYieldOnLoginAndRefresh() async throws {
-        let (auth, transport, store) = await makeSUT()
+        let (auth, transport, _) = await makeSUT()
         var iterator = await auth.tokenUpdates.makeAsyncIterator()
         await transport.enqueue(status: 200, json: loginJSON)                       // acc1
         _ = try await auth.login(username: "root", password: "pw")
