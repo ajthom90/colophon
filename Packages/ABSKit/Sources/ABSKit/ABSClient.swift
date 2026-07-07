@@ -51,6 +51,64 @@ public final class ABSClient: Sendable {
         return try await authorizedSend(URLRequest(url: comps.url!), as: LibraryItemDetail.self)
     }
 
+    /// `GET /api/libraries/:id/personalized?limit=` — home-screen shelves (Continue Listening,
+    /// Recently Added, Newest Authors on a book library; podcast libraries add episode shelves).
+    public func personalizedShelves(libraryID: String, limit: Int = 10) async throws -> [Shelf] {
+        var comps = URLComponents(url: baseURL.appending(path: "api/libraries/\(libraryID)/personalized"),
+                                  resolvingAgainstBaseURL: false)!
+        comps.queryItems = [.init(name: "limit", value: String(limit))]
+        return try await authorizedSend(URLRequest(url: comps.url!), as: [Shelf].self)
+    }
+
+    /// `GET /api/libraries/:id/filterdata` — facet values + counts for the library's sort/filter UI.
+    public func filterData(libraryID: String) async throws -> FilterData {
+        try await authorizedSend(get("api/libraries/\(libraryID)/filterdata"), as: FilterData.self)
+    }
+
+    /// `GET /api/libraries/:id/series?limit=` — `limit` is REQUIRED by the server (verified live).
+    public func series(libraryID: String, limit: Int) async throws -> [SeriesSummary] {
+        var comps = URLComponents(url: baseURL.appending(path: "api/libraries/\(libraryID)/series"),
+                                  resolvingAgainstBaseURL: false)!
+        comps.queryItems = [.init(name: "limit", value: String(limit))]
+        return try await authorizedSend(URLRequest(url: comps.url!), as: SeriesListResponse.self).results
+    }
+
+    /// `GET /api/libraries/:id/authors` — all authors in the library (browse list).
+    public func authors(libraryID: String) async throws -> [AuthorSummary] {
+        try await authorizedSend(get("api/libraries/\(libraryID)/authors"), as: AuthorsResponse.self).authors
+    }
+
+    /// `GET /api/authors/:id?include=items` — one author's detail. `include: "items"` (the
+    /// default here) also populates `libraryItems` with that author's books.
+    public func author(id: String, include: String? = "items") async throws -> AuthorDetail {
+        var comps = URLComponents(url: baseURL.appending(path: "api/authors/\(id)"), resolvingAgainstBaseURL: false)!
+        if let include { comps.queryItems = [.init(name: "include", value: include)] }
+        return try await authorizedSend(URLRequest(url: comps.url!), as: AuthorDetail.self)
+    }
+
+    /// `GET /api/libraries/:id/search?q=&limit=` — per-library search.
+    ///
+    /// **Caller contract:** never call with an empty query, and treat sub-2-character queries as
+    /// not worth sending — the server 400s on an empty/missing `q` (verified live) and match
+    /// quality is poor below ~2 characters. Guard client-side; this method does not.
+    ///
+    /// **Match-bucket behavior (verified live):** the `book` bucket matches
+    /// title/subtitle/isbn/asin ONLY — NOT author name. A query that only matches an author
+    /// (e.g. "sun" → "Sun Tzu") returns an EMPTY `book` bucket; the hit surfaces instead in the
+    /// `authors` bucket. Render both.
+    public func searchLibrary(libraryID: String, query: String, limit: Int = 12) async throws -> SearchResults {
+        var comps = URLComponents(url: baseURL.appending(path: "api/libraries/\(libraryID)/search"),
+                                  resolvingAgainstBaseURL: false)!
+        comps.queryItems = [.init(name: "q", value: query), .init(name: "limit", value: String(limit))]
+        return try await authorizedSend(URLRequest(url: comps.url!), as: SearchResults.self)
+    }
+
+    /// `GET /api/me` — the progress-join source (`mediaProgress[]`, since shelf entities carry no
+    /// progress — verified live) and bookmarks for the M1c-b player.
+    public func me() async throws -> MeUser {
+        try await authorizedSend(get("api/me"), as: MeUser.self)
+    }
+
     public func coverURL(itemID: String, width: Int, updatedAt: Int?) -> URL {
         var comps = URLComponents(url: baseURL.appending(path: "api/items/\(itemID)/cover"),
                                   resolvingAgainstBaseURL: false)!
