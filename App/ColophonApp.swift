@@ -40,17 +40,22 @@ struct ColophonApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                // Boot flow: any stored connection → the `ConnectionsView` hub (which auto-resumes
-                // the last-active one, cached-first, even with the server down); otherwise the
-                // first-run `ConnectView`. `ConnectionsView` owns its own `NavigationStack` and
-                // pushes `LibrariesView` on activation.
+                // Boot flow (unchanged): any stored connection → the `ConnectionsView` hub (which
+                // auto-resumes the last-active one, cached-first, even with the server down);
+                // otherwise the first-run `ConnectView`. Once a connection is active
+                // (`phase == .connected`), the connected-phase content becomes the per-platform
+                // `RootShell` — the native Liquid Glass navigation shell, which owns its own
+                // now-playing transport (so the legacy global `PlayerBarView` inset is gone). The
+                // shell exposes Connections/Settings via its account menu, and `ConnectionsView`
+                // stays the not-yet-connected hub.
                 if app.connections.isEmpty {
                     NavigationStack { ConnectView() }
+                } else if app.phase == .connected {
+                    RootShell()
                 } else {
                     ConnectionsView()
                 }
             }
-            .safeAreaInset(edge: .bottom) { PlayerBarView() }
             .alert("Something went wrong", isPresented: Binding(
                 get: { app.errorMessage != nil },
                 set: { if !$0 { app.errorMessage = nil } })
@@ -74,6 +79,11 @@ struct ColophonApp: App {
             #endif
             .fontDesign(typeface == "serif" ? .serif : .default)
         }
+        #if os(macOS)
+        // Mac keyboard transport: Space play/pause, ⌘←/⌘→ skip, speed submenu — wired to the same
+        // `PlaybackController` the shell's `TransportBar` drives. Guarded on an active session.
+        .commands { PlaybackCommands(app: app) }
+        #endif
         #if DEBUG && os(macOS)
         Window("Perf Spike", id: "perf-spike") { PerfSpikeView() }
         #endif

@@ -82,6 +82,11 @@ final class AppState {
     /// leaves this (and the player) untouched — only signing out / removing *this* connection
     /// retires the session first.
     private var playingConnectionID: String?
+    /// The item ID of the currently-playing session, surfaced so the navigation shell's
+    /// `MiniPlayerBar`/`TransportBar` can render the right cover artwork. Set alongside
+    /// `playingConnectionID` when `startPlayback` succeeds and cleared when the session is retired.
+    /// Read-only to the UI (private setter).
+    private(set) var nowPlayingItemID: String?
     /// Last library ID `refreshItems` was asked to page — recorded so a future first-run/
     /// offline flow (M1b) can resume browsing the last-viewed library without a live server.
     private(set) var activeLibraryID: String?
@@ -820,6 +825,7 @@ final class AppState {
         playback.unload()
         sessionHandle = nil
         playingConnectionID = nil
+        nowPlayingItemID = nil
     }
 
     func startPlayback(itemID: String) async {
@@ -844,6 +850,7 @@ final class AppState {
             // retires it first, while a mere connection *switch* leaves it playing (the handle
             // holds its own client, captured above — independent of `self.client`).
             playingConnectionID = owner
+            nowPlayingItemID = itemID
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }

@@ -8,6 +8,13 @@ import LibraryCache
 /// needs sign-in routes to a pre-filled `ConnectView` for re-auth.
 struct ConnectionsView: View {
     @Environment(AppState.self) private var app
+    @Environment(\.dismiss) private var dismiss
+
+    /// `true` when presented as a modal server switcher from inside the navigation shell (the
+    /// account menu): adds a Done button and suppresses the boot auto-resume so it lists the
+    /// connections instead of re-activating and pushing the current library. Defaults to `false`
+    /// — the root/boot usage is unchanged.
+    var isModal = false
 
     /// Programmatic navigation so auto-resume can push straight into the library browser and a
     /// needs-sign-in tap can push a pre-filled `ConnectView`.
@@ -48,13 +55,21 @@ struct ConnectionsView: View {
                 #if os(iOS)
                 // macOS gets its Settings access from the standard `Settings` scene (⌘,) added
                 // in `ColophonApp`; iOS/iPadOS have no such menu, so a gear button presents the
-                // same `SettingsView` as a sheet instead.
-                ToolbarItem(placement: .topBarLeading) {
-                    Button { showingSettings = true } label: {
-                        Label("Settings", systemImage: "gearshape")
+                // same `SettingsView` as a sheet instead. Suppressed in the modal switcher, whose
+                // host already offers Settings via the account menu.
+                if !isModal {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { showingSettings = true } label: {
+                            Label("Settings", systemImage: "gearshape")
+                        }
                     }
                 }
                 #endif
+                if isModal {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done") { dismiss() }
+                    }
+                }
                 ToolbarItem(placement: .primaryAction) {
                     Button { path.append(Route.addConnection) } label: {
                         Label("Add Connection", systemImage: "plus")
@@ -105,6 +120,10 @@ struct ConnectionsView: View {
             app.loadConnections()
             guard !didAutoResume else { return }
             didAutoResume = true
+            // Already connected (e.g. presented as the modal server switcher from within the
+            // shell): don't re-activate and push — just list the connections so the user can
+            // switch. At boot `activeConnectionID` is nil, so the auto-resume below still runs.
+            guard app.activeConnectionID == nil else { return }
             // Auto-resume the last-active connection into the library browser — cached-first, so
             // this lands the user in their library even with the server down.
             if let lastID = app.lastActiveConnectionID,
