@@ -619,7 +619,48 @@ struct AppStateTests {
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").isEmpty)
     }
 
-    // MARK: - Settings plumbing (Task 9)
+}
+
+// MARK: - Settings plumbing (Task 9 / Fix round 2)
+
+/// Both tests here mutate the process-global `UserDefaults.standard` keys
+/// `colophon.defaultRate`/`colophon.skipInterval` across `await` suspension points. Swift Testing
+/// runs `@Test`s within a suite concurrently by default, so two tests racing on the same global
+/// keys can interleave and flake (one test's `set` landing between another's `set` and its
+/// `startPlayback` read). `.serialized` forces this suite's tests to run one at a time, restoring
+/// the ordering the shared-mutable-global assumes. Kept as its own suite (rather than marking all
+/// of `AppStateTests` serialized) so the rest of the file keeps running concurrently.
+@MainActor
+@Suite(.serialized)
+struct SettingsPlumbingTests {
+    private let statusOK = #"{"isInit":true,"serverVersion":"2.35.1","authMethods":["local"]}"#
+    private let loginOK = #"{"user":{"id":"u1","username":"root","accessToken":"acc1","refreshToken":"ref1"}}"#
+    private let librariesOK = #"{"libraries":[{"id":"lib1","name":"Books","mediaType":"book","icon":null,"displayOrder":0}]}"#
+
+    /// The `PlaybackSession` shape `startPlayback` decodes — one track, no chapters. (Mirrors the
+    /// fixture in `AppStateTests`.)
+    private let playSessionJSON = #"""
+    {"id":"sess1","libraryItemId":"i1","episodeId":null,"displayTitle":"Book","displayAuthor":"Auth","duration":100,"startTime":0,"currentTime":0,"playMethod":0,"audioTracks":[{"index":1,"startOffset":0,"duration":100,"title":null,"contentUrl":"/x","mimeType":"audio/mpeg"}],"chapters":[]}
+    """#
+
+    private func makeTempDir() -> URL {
+        FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+    }
+
+    private func enqueueSuccessfulConnect(_ transport: MockTransport) async {
+        await transport.enqueue(status: 200, json: statusOK)
+        await transport.enqueue(status: 200, json: loginOK)
+        await transport.enqueue(status: 200, json: librariesOK)
+    }
+
+    private func makeApp(dir: URL, transport: Transport, tokenStore: any TokenStore) -> AppState {
+        AppState(
+            transportProvider: { transport },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: tokenStore,
+            oidcTransportProvider: { transport })
+    }
 
     /// Saves the current value (if any) of a `UserDefaults.standard` key and returns a restore
     /// closure — used so these tests can set `colophon.defaultRate`/`colophon.skipInterval`

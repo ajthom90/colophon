@@ -23,10 +23,12 @@ struct ColophonApp: App {
     @State private var app = AppState()
     @Environment(\.scenePhase) private var scenePhase
     /// Single source of truth for typography (Global Constraints: `colophon.typeface`, "serif"
-    /// default | "sans"). Applied ONCE here, outermost in the `WindowGroup` content's modifier
-    /// chain, so it reaches every view in the tree — including content injected by later
-    /// modifiers like `PlayerBarView`'s `safeAreaInset`. Per-view `.fontDesign(.serif)` modifiers
-    /// were removed everywhere else in `App/Views/*`; do not reintroduce them.
+    /// default | "sans"). Applied outermost in the `WindowGroup` content's modifier chain, so it
+    /// reaches every view in the tree — including content injected by later modifiers like
+    /// `PlayerBarView`'s `safeAreaInset` — AND again on the macOS `Settings` scene below, since a
+    /// `Settings` scene does not inherit modifiers from the `WindowGroup` scene. Per-view
+    /// `.fontDesign(.serif)` modifiers were removed everywhere else in `App/Views/*`; do not
+    /// reintroduce them.
     @AppStorage("colophon.typeface") private var typeface = "serif"
 
     init() {
@@ -78,8 +80,14 @@ struct ColophonApp: App {
         #if os(macOS)
         // iOS/iPadOS have no `Settings` scene (⌘, doesn't exist there); the same `SettingsView`
         // is reached from a gear button on `ConnectionsView` instead.
+        //
+        // `Settings` is a SEPARATE `Scene` from the `WindowGroup` above — it does NOT inherit the
+        // `.fontDesign` applied to the WindowGroup's content, even though both scenes live in the
+        // same `App` struct. So the same `@AppStorage("colophon.typeface")` key is applied again
+        // here, directly on `SettingsView`. Two call sites, one key: correct for two scenes.
         Settings {
             SettingsView()
+                .fontDesign(typeface == "serif" ? .serif : .default)
         }
         #endif
     }
