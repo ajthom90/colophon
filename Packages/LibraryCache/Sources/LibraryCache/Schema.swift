@@ -1,11 +1,23 @@
 import GRDB
 
 enum Schema {
+    // SCHEMA FREEZE (as of M1b): v1 below is FROZEN. Real databases now exist post-M1b —
+    // connections, tokens, and cached library/progress state are established on real devices —
+    // so v1 may NEVER be edited again. Any future schema change is a NEW "v2" (or later)
+    // `registerMigration` step appended after this one; GRDB then migrates existing v1
+    // databases forward in place instead of discarding them.
+    //
+    // The `#if DEBUG migrator.eraseDatabaseOnSchemaChange = true #endif` flag that used to sit
+    // here (GRDB's sanctioned pre-freeze dev convenience: edit v1, wipe and recreate) has been
+    // REMOVED, not merely left as a comment. With v1 frozen, the only way that flag could still
+    // fire is a stray future edit to this migration's body — and firing would silently wipe a
+    // real dev's local cache/connections. Removing the flag turns that mistake into a loud
+    // migration-mismatch failure instead of silent data loss. This is safe for existing
+    // pre-freeze dev databases: the flag never changed what v1 produces, only what happened on
+    // a MISMATCH, so a dev with an already-migrated v1 database is unaffected — GRDB sees the
+    // same schema and does nothing.
     static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
-        #if DEBUG
-        migrator.eraseDatabaseOnSchemaChange = true
-        #endif
         migrator.registerMigration("v1") { db in
             try db.create(table: "cachedConnection") { t in
                 t.primaryKey("id", .text)
