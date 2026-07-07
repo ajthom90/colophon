@@ -757,6 +757,73 @@ struct AppStateTests {
         #expect(!app.needsSignIn.contains("B"))              // B is online, not badged
     }
 
+    /// Asymmetry fix B, the case that genuinely EXERCISES the epoch guard (the sibling test above,
+    /// with two distinct connections, is already covered by the pre-existing `activeConnectionID == id`
+    /// check). Sign out A while it OWNS playback (retire parks on the gated `/close`), then re-activate
+    /// the SAME connection A — its probe brings A back online with a fresh socket/client. When the
+    /// gate opens, the stale signOut tail resumes: `activeConnectionID == id` is STILL true (it's A),
+    /// so ONLY the epoch guard stops the tail from tearing down the re-activation's live socket/client.
+    /// Asserts survival invariants only (the token-clear residual is a known follow-up and would
+    /// muddy token/badge assertions here).
+    ///
+    /// Strict RED→GREEN: deleting `connectionEpoch == myEpoch` from `performSignOut`'s tail guard
+    /// makes this FAIL (the tail stomps A) — confirmed during implementation.
+    @Test func signOutTailDoesNotStompSameIdReactivation() async throws {
+        final class SocketRecorder { private(set) var all: [FakeSocket] = []; func record(_ s: FakeSocket) { all.append(s) } }
+
+        let dir = makeTempDir()
+        let transport = GatedTransport(gatePath: "/close")   // park signOut's retire on the session close
+        await transport.enqueue(status: 200, json: statusOK)          // A connect: /status
+        await transport.enqueue(status: 200, json: loginOK)          // A connect: /login
+        await transport.enqueue(status: 200, json: librariesOK)      // A connect: /libraries
+        await transport.enqueue(status: 200, json: playSessionJSON)  // A: /play
+        // Four 200s covering, in removeFirst order: a possible flush /sync, A re-activation probe
+        // /api/authorize, its /libraries, and the gated /close (served last on gate open). The
+        // re-activation comes online right after its authorize, so plain "{}" bodies suffice.
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: "{}")
+        let tokenStore = InMemoryTokenStore()
+        let sockets = SocketRecorder()
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in let s = FakeSocket(); sockets.record(s); return s },
+            tokenStore: tokenStore,
+            oidcTransportProvider: { transport }
+        )
+        app.playback.muted = true
+
+        // Connect A (saves A's tokens, stands up socket #1) and start playback so signOut retires.
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        let aID = try #require(app.activeConnectionID)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+
+        // Sign out A (owns playback): its retire parks on the gated /close.
+        let signOutTask = Task { await app.signOut(connectionID: aID) }
+        while await transport.requestCount(pathContains: "/close") == 0 { await Task.yield() }
+
+        // While the signOut tail is parked, RE-ACTIVATE the same id A — bumps the epoch; its probe
+        // brings A back online with socket #2.
+        await app.activateConnection(aID)
+        #expect(app.activeConnectionID == aID)
+        while !app.isOnline { await Task.yield() }   // A's re-activation probe: authorize + startSocket
+        #expect(sockets.all.count == 2)              // connect socket + re-activation socket
+
+        // Release /close: the retire completes and the stale signOut tail resumes with
+        // `activeConnectionID == aID` STILL true — only the epoch guard saves the re-activation.
+        await transport.openGate()
+        await signOutTask.value
+
+        // Survival invariants: the re-activation's socket/client/online state are untouched.
+        #expect(sockets.all.last?.stopCount == 0)    // re-activation socket NOT torn down by the tail
+        #expect(app.isOnline == true)                // isOnline not flipped off
+        #expect(app.client != nil)                   // client not nilled
+        #expect(app.activeConnectionID == aID)       // still A
+    }
+
     // MARK: - OIDC
 
     /// A canned OIDC browser closure: ignores the authorize URL and returns a fixed
