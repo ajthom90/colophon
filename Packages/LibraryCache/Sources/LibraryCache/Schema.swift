@@ -1,23 +1,31 @@
 import GRDB
 
 enum Schema {
-    // SCHEMA FREEZE (as of M1b): v1 below is FROZEN. Real databases now exist post-M1b —
+    // SCHEMA FREEZE (as of M1b): v1 below is FROZEN. Production databases now exist —
     // connections, tokens, and cached library/progress state are established on real devices —
-    // so v1 may NEVER be edited again. Any future schema change is a NEW "v2" (or later)
-    // `registerMigration` step appended after this one; GRDB then migrates existing v1
-    // databases forward in place instead of discarding them.
+    // so v1's body may NEVER be edited again. Any future schema change is a NEW "v2" (or later)
+    // `registerMigration` step appended after v1; GRDB then migrates existing v1 databases
+    // forward in place instead of discarding them.
     //
-    // The `#if DEBUG migrator.eraseDatabaseOnSchemaChange = true #endif` flag that used to sit
-    // here (GRDB's sanctioned pre-freeze dev convenience: edit v1, wipe and recreate) has been
-    // REMOVED, not merely left as a comment. With v1 frozen, the only way that flag could still
-    // fire is a stray future edit to this migration's body — and firing would silently wipe a
-    // real dev's local cache/connections. Removing the flag turns that mistake into a loud
-    // migration-mismatch failure instead of silent data loss. This is safe for existing
-    // pre-freeze dev databases: the flag never changed what v1 produces, only what happened on
-    // a MISMATCH, so a dev with an already-migrated v1 database is unaffected — GRDB sees the
-    // same schema and does nothing.
+    // Why `eraseDatabaseOnSchemaChange` stays, and why it's DEBUG-only:
+    //
+    // - Production ships WITHOUT it (compiled out below), so production user data is never at
+    //   risk from this flag. And even if it were on, a legitimate future v1→v2 migration updates
+    //   the migrator's expected schema in lockstep, so properly-migrated databases would still
+    //   match and never be wiped — the flag only fires on a schema-shape MISMATCH.
+    // - DEBUG keeps it precisely because GRDB does NOT diff schema shape without it: the plain
+    //   migrator only checks the `grdb_migrations` bookkeeping table for the NAME "v1". A dev
+    //   whose local cache DB recorded "v1" under an OLDER v1 shape (v1 was amended during
+    //   M1a/M1b development, e.g. the composite-PK change) would open with no error and then hit
+    //   a latent `no such column`-style crash at query time — which the store's init recovery
+    //   does NOT catch (it only reacts to open/migrate-time throws). With the flag, that stale
+    //   dev DB is detected by shape comparison and cleanly recreated on next launch; the cache
+    //   is reconstructable from the server, so a DEBUG wipe costs nothing.
     static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
+        #if DEBUG
+        migrator.eraseDatabaseOnSchemaChange = true
+        #endif
         migrator.registerMigration("v1") { db in
             try db.create(table: "cachedConnection") { t in
                 t.primaryKey("id", .text)

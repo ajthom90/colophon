@@ -38,6 +38,8 @@ both the ABS container and the host/simulator browser resolve it identically
 — the host needs `host.docker.internal` mapped locally: check
 `grep host.docker.internal /etc/hosts` and, if absent, add it with
 `echo "127.0.0.1 host.docker.internal" | sudo tee -a /etc/hosts`.
+OIDC dev testing is simulator-only: physical devices can't resolve
+`host.docker.internal` and would need the Mac's LAN IP (see `devserver/README.md`).
 
 Contract tests (from `Packages/ABSKit`, after `make server-up && make seed`):
 
