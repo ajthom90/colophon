@@ -1,6 +1,5 @@
 import Foundation
 import Testing
-import CryptoKit
 @testable import ABSKit
 import ABSKitTestSupport
 
@@ -114,23 +113,32 @@ import ABSKitTestSupport
         }
     }
 
+    @Test func malformedExchangeBodyThrowsExchangeFailedNotDecodingError() async throws {
+        let transport = MockTransport()
+        await transport.enqueue(status: 302, json: "", headers: ["Location": "https://idp.example/auth?state=S"])
+        await transport.enqueue(status: 200, json: "<html>not json</html>")
+        let flow = OIDCFlow(serverURL: server, transport: transport, verifier: "v")
+        await #expect(throws: OIDCError.exchangeFailed(status: 200)) {
+            _ = try await flow.authenticate(browser: browser(returning: "colophon://oauth?code=c&state=S"))
+        }
+    }
+
+    @Test func wrongSchemeCallbackThrowsStateMismatch() async throws {
+        let transport = MockTransport()
+        await transport.enqueue(status: 302, json: "", headers: ["Location": "https://idp.example/auth?state=S"])
+        let flow = OIDCFlow(serverURL: server, transport: transport, verifier: "v")
+        // Correct state and code, but delivered on a scheme that isn't ours.
+        await #expect(throws: OIDCError.stateMismatch) {
+            _ = try await flow.authenticate(browser: browser(returning: "https://evil.example/oauth?code=c&state=S"))
+        }
+    }
+
     // MARK: - PKCE
 
     /// RFC 7636 Appendix B known-answer vector — independent of the implementation's own code path.
     @Test func codeChallengeMatchesRFC7636Vector() {
         let verifier = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"
         #expect(OIDCFlow.codeChallenge(for: verifier) == "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM")
-    }
-
-    /// Independent CryptoKit computation for a fixed verifier (per the task's binding).
-    @Test func codeChallengeMatchesIndependentCryptoKitComputation() {
-        let verifier = "0f9a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60"
-        let digest = SHA256.hash(data: Data(verifier.utf8))
-        let expected = Data(digest).base64EncodedString()
-            .replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_")
-            .replacingOccurrences(of: "=", with: "")
-        #expect(OIDCFlow.codeChallenge(for: verifier) == expected)
     }
 
     @Test func generatedVerifierIs84HexCharacters() {

@@ -83,6 +83,10 @@ public struct OIDCFlow: Sendable {
 
         // Step 2: hand the IdP authorize URL to the browser; it returns the app-scheme callback.
         let callback = try await browser(authorizeURL)
+        // Defensive: a callback that isn't on our scheme was never ours, whatever its query says.
+        // The plan-locked 5-case enum has no dedicated case; `.stateMismatch` is the same class of
+        // integrity failure (a response not bound to this request), so we report it as that.
+        guard callback.scheme == scheme else { throw OIDCError.stateMismatch }
         guard Self.queryValue("state", in: callback) == serverState else { throw OIDCError.stateMismatch }
         guard let code = Self.queryValue("code", in: callback) else { throw OIDCError.callbackMissingCode }
 
@@ -98,7 +102,14 @@ public struct OIDCFlow: Sendable {
         guard (200..<300).contains(step3.statusCode) else {
             throw OIDCError.exchangeFailed(status: step3.statusCode)
         }
-        let response = try ABSAPI.decoder.decode(LoginResponse.self, from: step3.data)
+        // A 2xx body that doesn't decode is still an exchange failure: every failure of this flow
+        // stays inside the OIDCError surface rather than leaking a raw DecodingError to callers.
+        let response: LoginResponse
+        do {
+            response = try ABSAPI.decoder.decode(LoginResponse.self, from: step3.data)
+        } catch {
+            throw OIDCError.exchangeFailed(status: step3.statusCode)
+        }
         guard response.user.accessToken != nil else { throw OIDCError.exchangeFailed(status: step3.statusCode) }
         return response
     }
