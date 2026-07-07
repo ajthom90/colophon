@@ -22,6 +22,24 @@ private func json(_ s: String) -> [String: Any] {
                                    payload: [[json(#"{"id":"a"}"#), json(#"{"id":"b"}"#)]]) == .itemsChanged(ids: ["a", "b"]))
     }
 
+    /// `items_added` (plural) is the array counterpart of the singular `item_added` above —
+    /// e.g. a batch scan that adds several items to a library in one push. Same array-of-objects
+    /// payload shape as `items_updated`, decoding to the same `.itemsChanged(ids:)` case.
+    @Test func decodesItemsAddedPlural() {
+        #expect(ServerEvent.decode(event: "items_added",
+                                   payload: [[json(#"{"id":"c"}"#), json(#"{"id":"d"}"#)]]) == .itemsChanged(ids: ["c", "d"]))
+    }
+
+    /// `decodesProgressUpdate` above only exercises a book-level update (`episodeId: null`);
+    /// this covers the podcast-episode path, where the server carries a non-nil `episodeId`
+    /// that must survive decoding into `ProgressUpdate.episodeID` rather than being dropped.
+    @Test func decodesProgressUpdateWithEpisodeID() {
+        let payload = json(#"{"id":"prog3","sessionId":"ses_2","data":{"libraryItemId":"li_3","episodeId":"ep_42","currentTime":12.0,"isFinished":false,"lastUpdate":1751790010000,"duration":30}}"#)
+        let event = ServerEvent.decode(event: "user_item_progress_updated", payload: [payload])
+        #expect(event == .progressUpdated(ProgressUpdate(
+            itemID: "li_3", episodeID: "ep_42", currentTime: 12.0, isFinished: false, lastUpdate: 1751790010000)))
+    }
+
     @Test func unknownOrMalformedYieldsNil() {
         #expect(ServerEvent.decode(event: "pong", payload: []) == nil)
         #expect(ServerEvent.decode(event: "user_item_progress_updated", payload: ["garbage"]) == nil)

@@ -50,6 +50,9 @@ struct LibraryItemsView: View {
             }
         }
         .task(id: library.id) {
+            // Reset before observing so a library switch never flashes the previous library's
+            // rows while the new observation spins up.
+            items = []
             do {
                 for try await value in app.cache.observeItems(connectionID: library.connectionID, libraryID: library.id) {
                     items = value

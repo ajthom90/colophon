@@ -1,5 +1,9 @@
 import Foundation
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
+import AuthenticationServices
 import ABSKit
 import ABSRealtime
 import PlayerEngine
@@ -249,6 +253,15 @@ final class AppState {
             stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
+            // A user-dismissed ASWebAuthenticationSession sheet is not a failure worth an alert —
+            // `session.authenticate(...)` throws `.canceledLogin` (NSError code 1, domain
+            // ASWebAuthenticationSessionErrorDomain) and, unwrapped, that surfaced as a raw
+            // "operation couldn't be completed (error 1)" alert. Treat it as a silent no-op: the
+            // guards above already reset phase/activeConnectionID, so the user just lands back on
+            // the connect step with no error message. Every other failure still surfaces normally.
+            if let authError = error as? ASWebAuthenticationSessionError, authError.code == .canceledLogin {
+                return
+            }
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
     }
@@ -662,9 +675,23 @@ final class AppState {
 
     /// Scene backgrounding: flush accumulated listened-time WITHOUT pausing — background
     /// audio must keep playing (server-side 36h reaping + 404-recovery cover full termination).
+    /// On iOS the flush runs inside a `UIBackgroundTaskIdentifier` assertion: without one, iOS is
+    /// free to suspend the process mid-POST (this `Task` is detached — `ColophonApp`'s
+    /// `scenePhase` observer doesn't/can't await it) and the tail of listened time never reaches
+    /// the server. macOS has no equivalent app-suspension model, so its path is unchanged.
+    #if os(iOS)
+    func flushForBackground() {
+        let taskID = UIApplication.shared.beginBackgroundTask(withName: "colophon.flush")
+        Task {
+            await playback.flushOnly()
+            if taskID != .invalid { UIApplication.shared.endBackgroundTask(taskID) }
+        }
+    }
+    #else
     func flushForBackground() {
         Task { await playback.flushOnly() }
     }
+    #endif
 
     /// Entry point for a future explicit "stop" affordance.
     func closeCurrentSession() async {
