@@ -24,12 +24,18 @@ final class AppState {
     private(set) var activeLibraryID: String?
 
     private var auth: AuthManager?
-    private let tokenStore = KeychainTokenStore()
+    private let tokenStore: any TokenStore
     private var sessionHandle: PlaybackSessionHandle?
+
+    /// Test seams (default args reproduce production exactly, so `ColophonApp`'s `AppState()`
+    /// is unchanged): `transport` stands in for a real `URLSessionTransport` (MockTransport in
+    /// tests), and `socketFactory` builds the realtime socket (a scripted `FakeSocket` in tests).
+    private let transport: Transport
+    private let socketFactory: (URL, @escaping @Sendable () async -> String?) -> any RealtimeSocketProtocol
 
     /// Real-time updates: one socket per active connection, one consumer task draining its
     /// event stream, one task forwarding `auth.tokenUpdates` into `socket.reauthenticate()`.
-    private var socket: SocketService?
+    private var socket: (any RealtimeSocketProtocol)?
     private var socketTask: Task<Void, Never>?
     private var reauthTask: Task<Void, Never>?
     /// Reentrancy guard for `startPlayback`: without it, two rapid taps both pass
@@ -37,14 +43,30 @@ final class AppState {
     /// lands after B, the user hears the wrong item and B's server session leaks open.
     private var isStartingPlayback = false
 
-    init() {
-        let supportDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    /// Every argument defaults to production behavior; tests override them to run entirely
+    /// offline (MockTransport, temp-dir cache, FakeSocket, `InMemoryTokenStore` — the Keychain
+    /// is host-app-entitlement-bound and must never be touched by unit tests).
+    init(
+        transportProvider: @escaping @Sendable () -> Transport = { URLSessionTransport() },
+        cacheDirectory: URL? = nil,
+        socketFactory: ((URL, @escaping @Sendable () async -> String?) -> any RealtimeSocketProtocol)? = nil,
+        tokenStore: (any TokenStore)? = nil
+    ) {
+        self.transport = transportProvider()
+        self.tokenStore = tokenStore ?? KeychainTokenStore()
+        self.socketFactory = socketFactory ?? { url, tokenProvider in
+            SocketService(serverURL: url, tokenProvider: tokenProvider)
+        }
+        let supportDir = cacheDirectory ?? FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appending(path: "Colophon")
         // LibraryCacheStore.init creates its parent directory itself. A broken cache DB is
         // unrecoverable dev-state — crash loudly rather than run split-brain.
         cache = try! LibraryCacheStore(databaseURL: supportDir.appending(path: "cache.sqlite"))
-        let cachesDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-        coverStore = CoverStore(directory: cachesDir.appending(path: "covers"))
+        // Isolate covers alongside an injected cache dir; otherwise keep the production Caches dir.
+        let coversDir = cacheDirectory?.appending(path: "covers")
+            ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appending(path: "covers")
+        coverStore = CoverStore(directory: coversDir)
     }
 
     var deviceInfo: DeviceInfo {
@@ -80,7 +102,7 @@ final class AppState {
         activeConnectionID = nil
         phase = .connecting
         do {
-            let transport = URLSessionTransport()
+            let transport = self.transport
             let status = try await ABSClient.status(baseURL: url, transport: transport)
             guard status.isInit else { throw ABSError.invalidResponse }
             guard let versionString = status.serverVersion,
@@ -107,9 +129,10 @@ final class AppState {
             }, connectionID: connection.id)
             // Real-time updates: one socket per active connection (the previous connection's
             // socket was torn down at the top of connect(), before any await).
-            let service = SocketService(serverURL: url) { [weak auth] in
+            let tokenProvider: @Sendable () async -> String? = { [weak auth] in
                 try? await auth?.currentAccessToken()
             }
+            let service = socketFactory(url, tokenProvider)
             socket = service
             socketTask = Task { [weak self] in
                 for await event in service.events() {
@@ -154,7 +177,9 @@ final class AppState {
     /// straight into the cache (last-write-wins by `lastUpdate`, enforced in
     /// `LibraryCacheStore.upsertProgress`); item lifecycle events do a coarse re-page of
     /// whatever library is currently open (M1a scope — per-item patch is M1c polish).
-    private func apply(_ event: ServerEvent) async {
+    /// `internal` (not `private`) so the state-machine tests can drive it deterministically
+    /// without waiting on the nondeterministic socket-consumer task.
+    func apply(_ event: ServerEvent) async {
         guard let connectionID = activeConnectionID else { return }
         switch event {
         case .progressUpdated(let update):

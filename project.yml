@@ -12,17 +12,29 @@ packages:
     path: Packages/PlayerEngine
   LibraryCache:
     path: Packages/LibraryCache
+  # GRDB is a transitive dependency of LibraryCache whose public `AsyncValueObservation` API
+  # leaks GRDB types into the app's own object files. The plain build action links it via
+  # eager-linking response files, but the test-host app link drops those transitive inputs and
+  # fails on undefined GRDB symbols — so the app must depend on GRDB explicitly.
+  GRDB:
+    url: https://github.com/groue/GRDB.swift
+    from: "7.0.0"
 targets:
   Colophon:
     type: application
     supportedDestinations: [iOS, macOS]
-    sources: [App]
+    sources:
+      - path: App
+        excludes:
+          - ColophonTests
     dependencies:
       - package: ABSKit
       - package: ABSKit
         product: ABSRealtime
       - package: PlayerEngine
       - package: LibraryCache
+      - package: GRDB
+        product: GRDB
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.andrewthom.colophon
@@ -47,7 +59,38 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: "Colophon connects to your Audiobookshelf server, which may be on your local network."
+  ColophonTests:
+    type: bundle.unit-test
+    # iOS-only: this hosted bundle runs on the iOS Simulator via `make test-app`. See the
+    # Task 3 report — a multi-destination test bundle is deferred (the state-machine coverage
+    # is platform-independent, so one simulator run is sufficient).
+    supportedDestinations: [iOS]
+    sources: [App/ColophonTests]
+    dependencies:
+      - target: Colophon
+      - package: ABSKit
+        product: ABSKit
+      - package: ABSKit
+        product: ABSKitTestSupport
+      - package: ABSKit
+        product: ABSRealtime
+      - package: LibraryCache
+      - package: PlayerEngine
+    settings:
+      base:
+        SWIFT_VERSION: "6.2"
+        SWIFT_STRICT_CONCURRENCY: complete
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/Colophon.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Colophon
+        BUNDLE_LOADER: $(TEST_HOST)
+        PRODUCT_BUNDLE_IDENTIFIER: com.andrewthom.colophonTests
+        DEVELOPMENT_TEAM: LL334G7KP2
+        CODE_SIGN_STYLE: Automatic
+        GENERATE_INFOPLIST_FILE: true
 schemes:
   Colophon:
     build:
       targets: { Colophon: all }
+    test:
+      targets:
+        - ColophonTests
