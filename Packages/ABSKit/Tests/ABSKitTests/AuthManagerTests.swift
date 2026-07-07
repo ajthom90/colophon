@@ -88,6 +88,25 @@ import ABSKitTestSupport
         #expect(await iterator.next() == "acc2")
     }
 
+    @Test func completeOIDCStoresPairAndYieldsTokenUpdate() async throws {
+        let (auth, _, store) = await makeSUT()
+        var iterator = await auth.tokenUpdates.makeAsyncIterator()
+        let response = try JSONDecoder().decode(LoginResponse.self, from: Data(loginJSON.utf8))  // acc1/ref1
+        try await auth.completeOIDC(loginResponse: response)
+        #expect(await store.tokens(for: "c1") == TokenPair(accessToken: "acc1", refreshToken: "ref1"))
+        #expect(await iterator.next() == "acc1")
+    }
+
+    @Test func completeOIDCThrowsWhenNoAccessToken() async throws {
+        let (auth, _, store) = await makeSUT()
+        let response = try JSONDecoder().decode(
+            LoginResponse.self, from: Data(#"{"user":{"id":"u1","username":"root"}}"#.utf8))
+        await #expect(throws: ABSError.invalidResponse) {
+            try await auth.completeOIDC(loginResponse: response)
+        }
+        #expect(await store.tokens(for: "c1") == nil)
+    }
+
     @Test func logoutPostsRefreshHeaderAndClears() async throws {
         let (auth, transport, store) = await makeSUT()
         try await store.save(TokenPair(accessToken: "acc1", refreshToken: "ref1"), for: "c1")

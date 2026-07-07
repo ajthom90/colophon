@@ -34,6 +34,16 @@ public actor AuthManager {
         return response
     }
 
+    /// Stores the token pair from a completed OIDC exchange and yields the access token to
+    /// `tokenUpdates`, mirroring `login(username:password:)` so downstream consumers can't tell the
+    /// two sign-in paths apart.
+    public func completeOIDC(loginResponse: LoginResponse) async throws {
+        guard let access = loginResponse.user.accessToken else { throw ABSError.invalidResponse }
+        try await store.save(TokenPair(accessToken: access, refreshToken: loginResponse.user.refreshToken),
+                             for: connectionID)
+        tokenContinuation.yield(access)
+    }
+
     public func currentAccessToken() async throws -> String {
         guard let pair = await store.tokens(for: connectionID) else { throw ABSError.notAuthenticated }
         return pair.accessToken
