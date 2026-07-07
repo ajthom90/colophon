@@ -84,6 +84,12 @@ final class AppState {
     /// `retireCurrentSession` (handle nil) and both await `client.startPlayback`; if response A
     /// lands after B, the user hears the wrong item and B's server session leaks open.
     private var isStartingPlayback = false
+    /// Reentrancy guard for `activateConnection`'s synchronous section — see its doc comment.
+    private var activatingConnectionID: String?
+    /// The background probe kicked off by the most recent `activateConnection` call — see its
+    /// doc comment. Not awaited by `activateConnection` itself; exists so a fresh activation can
+    /// cancel whatever probe preceded it.
+    private var probeTask: Task<Void, Never>?
 
     /// Every argument defaults to production behavior; tests override them to run entirely
     /// offline (MockTransport, temp-dir cache, FakeSocket, `InMemoryTokenStore` — the Keychain
@@ -111,6 +117,11 @@ final class AppState {
         let coversDir = cacheDirectory?.appending(path: "covers")
             ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appending(path: "covers")
         coverStore = CoverStore(directory: coversDir)
+        // Seed the observed connections array now, not just on the first `.task` after launch —
+        // otherwise `ColophonApp`'s `app.connections.isEmpty` check on first render sees an empty
+        // array and flashes `ConnectView` for one frame before `.task` runs `loadConnections()`,
+        // even when connections already exist on disk.
+        connections = (try? cache.connections()) ?? []
     }
 
     var deviceInfo: DeviceInfo {
@@ -257,10 +268,14 @@ final class AppState {
     }
 
     /// Stands up the realtime socket for `auth`/`url`: one socket, one consumer task draining its
-    /// event stream, one task forwarding `auth.tokenUpdates` into `socket.reauthenticate()`. The
-    /// caller must have already torn down any previous socket via `stopSocket()`. Shared by the
-    /// sign-in tail (`completeConnection`) and the online branch of `activateConnection`.
+    /// event stream, one task forwarding `auth.tokenUpdates` into `socket.reauthenticate()`. Tears
+    /// down any existing socket FIRST (defensive, not just the caller's responsibility): with
+    /// `activateConnection`'s probe now detached, two overlapping probes for the same connection
+    /// can both reach this method, and without this the second call's `socket = service` would
+    /// leak the first socket and its two tasks permanently. Shared by the sign-in tail
+    /// (`completeConnection`) and the online branch of `activateConnection`.
     private func startSocket(url: URL, auth: AuthManager) {
+        stopSocket()
         let tokenProvider: @Sendable () async -> String? = { [weak auth] in
             try? await auth?.currentAccessToken()
         }
@@ -295,11 +310,15 @@ final class AppState {
     }
 
     /// Activates a stored connection with CACHED-FIRST semantics — THE offline first-run fix.
-    /// Synchronously (before any `await`) it makes the connection's cached libraries browsable:
-    /// `activeConnectionID` + `phase = .connected` with `isOnline = false`, so the observing views
-    /// render cached rows the instant this yields the run loop. THEN, in the same call, it probes
-    /// the stored tokens:
-    ///   • no tokens stored          → mark `needsSignIn`, stay cached/offline (never probes).
+    /// Synchronously (before any network `await`) it makes the connection's cached libraries
+    /// browsable: `activeConnectionID` + `phase = .connected` with `isOnline = false`, then
+    /// RETURNS — a caller `await`ing this method resumes immediately, so `ConnectionsView`/
+    /// `LibrariesView` navigate without waiting on the network. The stored-token probe is kicked
+    /// off in a detached `probeTask` that this method does not await:
+    ///   • no tokens stored          → mark `needsSignIn`, stay cached/offline (never probes;
+    ///     this check IS still inline/synchronous, since it's an in-memory/Keychain lookup, not
+    ///     the network, and a caller checking `needsSignIn` right after `activateConnection`
+    ///     returns needs to see it).
     ///   • probe succeeds            → `isOnline = true`, socket up, library list refreshed.
     ///   • probe 401 → refresh fails → `reauthRequired` → mark `needsSignIn`, stay cached/offline.
     ///   • host down / transport err → stay cached/offline (isOnline false); the per-library
@@ -307,8 +326,21 @@ final class AppState {
     /// Playback is untouched throughout (only the previous socket is torn down; the player keeps
     /// running) — switching connections mid-listen keeps playing, per the Global Constraints.
     func activateConnection(_ id: String) async {
+        // Reentrancy guard for the SYNCHRONOUS section below: without it, two near-simultaneous
+        // activations of the SAME id (a double-tap) could both run it, each building its own
+        // `AuthManager`/`ABSClient` and kicking off its own probe. Cleared the moment this method
+        // returns, which is fast now that the probe no longer blocks it.
+        guard activatingConnectionID != id else { return }
+        activatingConnectionID = id
+        defer { activatingConnectionID = nil }
+
         guard let connection = try? cache.connections().first(where: { $0.id == id }),
               let url = URL(string: connection.address) else { return }
+        // A fresh activation supersedes whatever probe the last one kicked off. Cancellation is
+        // cooperative (an in-flight `authorize()` won't necessarily observe it right away), so
+        // this is a best-effort dedup — the authoritative guard is still each probe's own
+        // `activeConnectionID == id` check after every await, below.
+        probeTask?.cancel()
         // Deactivate the previous connection's socket before switching IDs (a stray old-server
         // event must never land under the new connection's ID). The player is deliberately left
         // running — see the playback policy above.
@@ -333,28 +365,37 @@ final class AppState {
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
         self.client = client
-        do {
-            try await client.authorize()
-            // A rapid re-activation may have superseded this probe mid-flight; don't clobber it.
-            guard activeConnectionID == id else { return }
-            needsSignIn.remove(id)
-            isOnline = true
-            startSocket(url: url, auth: auth)
-            if let libs = try? await client.libraries() {
-                try? cache.upsertLibraries(libs.enumerated().map { index, lib in
-                    CachedLibrary(id: lib.id, connectionID: id, name: lib.name,
-                                  mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
-                }, connectionID: id)
+
+        // The network probe: detached so `activateConnection` returns now, with cached browsing
+        // already live. Every branch re-checks `activeConnectionID == id` since a newer
+        // activation (of this id or a different one) may have superseded this probe by the time
+        // any await resumes.
+        probeTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await client.authorize()
+                guard self.activeConnectionID == id else { return }
+                self.needsSignIn.remove(id)
+                self.isOnline = true
+                self.startSocket(url: url, auth: auth)
+                if let libs = try? await client.libraries() {
+                    guard self.activeConnectionID == id else { return }
+                    try? self.cache.upsertLibraries(libs.enumerated().map { index, lib in
+                        CachedLibrary(id: lib.id, connectionID: id, name: lib.name,
+                                      mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
+                    }, connectionID: id)
+                }
+            } catch ABSError.reauthRequired, ABSError.notAuthenticated {
+                guard self.activeConnectionID == id else { return }
+                self.isOnline = false
+                self.needsSignIn.insert(id)
+            } catch {
+                // Host down / transport error: stay in cached-only offline mode. `isOnline ==
+                // false` drives the offline banner; no blocking error alert for an expected
+                // offline case.
+                guard self.activeConnectionID == id else { return }
+                self.isOnline = false
             }
-        } catch ABSError.reauthRequired, ABSError.notAuthenticated {
-            guard activeConnectionID == id else { return }
-            isOnline = false
-            needsSignIn.insert(id)
-        } catch {
-            // Host down / transport error: stay in cached-only offline mode. `isOnline == false`
-            // drives the offline banner; no blocking error alert for an expected offline case.
-            guard activeConnectionID == id else { return }
-            isOnline = false
         }
     }
 
@@ -563,6 +604,10 @@ final class AppState {
         isStartingPlayback = true
         defer { isStartingPlayback = false }
         guard let client else { return }
+        // Captured NOW, before any await below — a connection switch racing the awaits (e.g.
+        // during `retireCurrentSession`'s flush/close or `client.startPlayback`'s round trip)
+        // must not be misattributed as this session's owner.
+        let owner = activeConnectionID
         // Retire the old session completely before touching the new one.
         await retireCurrentSession()
         do {
@@ -572,7 +617,7 @@ final class AppState {
             // Record which connection owns this session so signOut/remove of that connection
             // retires it first, while a mere connection *switch* leaves it playing (the handle
             // holds its own client, captured above — independent of `self.client`).
-            playingConnectionID = activeConnectionID
+            playingConnectionID = owner
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }

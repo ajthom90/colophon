@@ -449,6 +449,76 @@ struct AppStateTests {
         #expect(await tokenStore.tokens(for: cid) == nil)
     }
 
+    // MARK: - Connections (Fix round 2)
+
+    /// A double-tap on the same connection row — two `activateConnection` calls for the SAME id
+    /// overlapping before the first's (now fast) synchronous section finishes — must not stand up
+    /// two live sockets. `GatedTokenStore` parks the first call's one real suspension point (the
+    /// actor-hop into `tokens(for:)`) so the second call deterministically lands on the
+    /// `activatingConnectionID` guard instead of racing on wall-clock timing.
+    @Test func activateConnectionReentrancyGuard() async throws {
+        final class SocketConstructionCounter { private(set) var count = 0; func record() { count += 1 } }
+
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await transport.enqueue(status: 200, json: "{}")   // the surviving call's /api/authorize
+        let tokenStore = GatedTokenStore()
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+        let sockets = SocketConstructionCounter()
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in sockets.record(); return FakeSocket() },
+            tokenStore: tokenStore,
+            oidcTransportProvider: { transport }
+        )
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+
+        let first = Task { await app.activateConnection("C1") }
+        // The first call is parked on the gated token lookup — its synchronous section (and the
+        // `activatingConnectionID` guard it holds) hasn't returned yet.
+        while await tokenStore.waitingCount == 0 { await Task.yield() }
+
+        await app.activateConnection("C1")   // must bail at the reentrancy guard — a same-id no-op
+
+        await tokenStore.openGate()
+        await first.value
+        // Let the surviving call's detached probe run to completion (it calls `startSocket`).
+        while !app.isOnline { await Task.yield() }
+
+        #expect(sockets.count == 1)          // exactly one socket ever constructed — no leak
+    }
+
+    /// `activateConnection` no longer blocks on the network: with `/api/authorize` hung on a
+    /// gate, the call still returns promptly with cached browsing already live — `isOnline` stays
+    /// false and the connection's cached libraries are observable — while the probe is still
+    /// pending in the background.
+    @Test func activateReturnsBeforeProbeCompletes() async throws {
+        let dir = makeTempDir()
+        let transport = GatedTransport(gatePath: "/api/authorize")
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: dir, transport: transport, tokenStore: tokenStore)
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try app.cache.upsertLibraries([CachedLibrary(id: "L1", connectionID: "C1", name: "Books",
+                                                     mediaType: "book", displayOrder: 0)], connectionID: "C1")
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+
+        await app.activateConnection("C1")   // returns even though the probe is parked on the gate
+
+        #expect(app.phase == .connected)
+        #expect(app.isOnline == false)                    // the probe hasn't resolved yet
+        var iterator = app.cache.observeLibraries(connectionID: "C1").makeAsyncIterator()
+        let libs = try await iterator.next()
+        #expect(libs?.map(\.id) == ["L1"])                // cached rows observable while it hangs
+
+        // Let the probe resolve so it doesn't leak a permanently-parked continuation past the test.
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.openGate()
+        while !app.isOnline { await Task.yield() }
+    }
+
     // MARK: - OIDC
 
     /// A canned OIDC browser closure: ignores the authorize URL and returns a fixed

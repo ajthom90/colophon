@@ -84,9 +84,16 @@ struct ConnectionsView: View {
             // Auto-resume the last-active connection into the library browser — cached-first, so
             // this lands the user in their library even with the server down.
             if let lastID = app.lastActiveConnectionID,
-               app.connections.contains(where: { $0.id == lastID }) {
+               let lastConnection = app.connections.first(where: { $0.id == lastID }) {
                 await app.activateConnection(lastID)
-                path.append(Route.libraries)
+                // A connection with no stored (or rejected) tokens has no re-auth path from
+                // inside `LibrariesView`'s offline banner — route straight to re-auth instead of
+                // a dead end, same as a manual tap on a needs-sign-in row (see `open` below).
+                if app.needsSignIn.contains(lastID) {
+                    path.append(Route.reauth(lastConnection))
+                } else {
+                    path.append(Route.libraries)
+                }
             }
         }
     }
