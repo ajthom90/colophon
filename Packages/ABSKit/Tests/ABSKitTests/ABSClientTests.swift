@@ -32,7 +32,21 @@ import ABSKitTestSupport
         let comps = URLComponents(url: url!, resolvingAgainstBaseURL: false)!
         #expect(comps.path == "/api/libraries/lib_1/items")
         let q: [String: String] = Dictionary(uniqueKeysWithValues: comps.queryItems!.map { ($0.name, $0.value ?? "") })
-        #expect(q == ["limit": "50", "page": "2", "minified": "1", "sort": "media.metadata.title"])
+        #expect(q == ["limit": "50", "page": "2", "minified": "1",
+                      "sort": "media.metadata.title", "desc": "0"])
+    }
+
+    @Test func itemsThreadsSortDescAndFilter() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: #"{"results":[],"total":0,"limit":50,"page":0}"#)
+        _ = try await client.items(libraryID: "lib_1", limit: 50, page: 0,
+                                   sort: "media.metadata.authorName", desc: true,
+                                   filter: "authors.U3VuIFR6dQ")
+        let url = await transport.recorded.first?.url
+        let comps = URLComponents(url: url!, resolvingAgainstBaseURL: false)!
+        let q: [String: String] = Dictionary(uniqueKeysWithValues: comps.queryItems!.map { ($0.name, $0.value ?? "") })
+        #expect(q == ["limit": "50", "page": "0", "minified": "1",
+                      "sort": "media.metadata.authorName", "desc": "1", "filter": "authors.U3VuIFR6dQ"])
     }
 
     @Test func retriesOnceAfter401ThenSucceeds() async throws {

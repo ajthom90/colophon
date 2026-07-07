@@ -7,16 +7,20 @@ import LibraryCache
 /// a thin determinate bar hugging the cover's bottom edge (the Apple Books "currently listening"
 /// idiom) plus a small tinted percentage pill. Progress is JOINED from `CachedProgress`
 /// (`me()`/socket), NOT the shelf entity — shelf entities carry no progress (verified live). The
-/// duration for the fraction comes from the shelf entity's `media.duration` (progress rows store
-/// `currentTime`, not duration). Tapping starts playback of the item (so the shelf is functional
-/// and the mini-bar/transport lights up); item detail is M1c-b.
+/// duration for the fraction is a caller-supplied duration source (progress rows store
+/// `currentTime`, not duration): a shelf card passes the shelf entity's `media.duration`, and the
+/// LIBRARY GRID passes `CachedItem.duration` (always present on the grid row) — the Task 7-review
+/// fix so grid pills render, since the shelf-entity duration isn't available there. Tapping starts
+/// playback of the item (so the shelf/grid is functional and the mini-bar/transport lights up);
+/// item detail is M1c-b.
 struct CoverCard: View {
     @Environment(AppState.self) private var app
     let itemID: String
     let updatedAt: Int?
     let title: String
     let author: String?
-    /// From the shelf entity's `media.duration` — needed to turn a `currentTime` into a fraction.
+    /// The duration source for the progress fraction — the shelf entity's `media.duration` (shelf
+    /// cards) or `CachedItem.duration` (library grid). Needed to turn a `currentTime` into a fraction.
     let duration: Double?
     /// Joined from the cache (nil when the server reports no progress for this item).
     let progress: CachedProgress?

@@ -18,10 +18,7 @@ struct PhoneShell: View {
                 }
             }
             Tab("Library", systemImage: "books.vertical") {
-                NavigationStack {
-                    LibrariesView()
-                        .navigationDestination(for: CachedLibrary.self) { LibraryItemsView(library: $0) }
-                }
+                NavigationStack { LibraryTabContent() }
             }
             Tab("Downloads", systemImage: "arrow.down.circle") {
                 NavigationStack { DownloadsPlaceholder() }
@@ -32,6 +29,50 @@ struct PhoneShell: View {
         }
         .phoneTabChrome { MiniPlayerBar { showingFullPlayer = true } }
         .sheet(isPresented: $showingFullPlayer) { FullPlayerSheet() }
+    }
+}
+
+/// The iPhone Library tab's content: shows the active (first) library's `LibraryGridView`, with a
+/// toolbar library picker when the connection has more than one library (the plan's "keep it
+/// simple: Library shows the active/first library's grid, with a library picker if >1"). Observes
+/// the connection's cached library list so it tracks connection switches and resets cleanly.
+private struct LibraryTabContent: View {
+    @Environment(AppState.self) private var app
+    @State private var libraries: [CachedLibrary] = []
+    @State private var selectedID: String?
+
+    private var selected: CachedLibrary? {
+        libraries.first { $0.id == selectedID } ?? libraries.first
+    }
+
+    var body: some View {
+        Group {
+            if let library = selected {
+                LibraryGridView(
+                    library: library,
+                    siblings: libraries,
+                    onSelectLibrary: { selectedID = $0.id })
+            } else {
+                ContentUnavailableView {
+                    Label("No Libraries", systemImage: "books.vertical")
+                } description: {
+                    Text("This connection has no libraries yet.")
+                }
+                .navigationTitle("Library")
+            }
+        }
+        .task(id: app.activeConnectionID) {
+            libraries = []
+            selectedID = nil
+            guard let connectionID = app.activeConnectionID else { return }
+            do {
+                for try await value in app.cache.observeLibraries(connectionID: connectionID) {
+                    libraries = value
+                }
+            } catch {
+                app.errorMessage = "Library list unavailable: \(error.localizedDescription)"
+            }
+        }
     }
 }
 

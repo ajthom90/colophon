@@ -9,6 +9,67 @@ import ABSRealtime
 import PlayerEngine
 import LibraryCache
 
+/// The library-browse sort options surfaced in `LibraryGridView`'s toolbar, each mapped to a
+/// verified ABS `items?sort=` key (see the plan's endpoint reference). Plain `Sendable` value type
+/// (not MainActor-isolated) so it can travel into the client request off the main actor.
+nonisolated enum LibrarySort: String, CaseIterable, Identifiable, Sendable {
+    case title, author, added, published, progress
+
+    var id: String { rawValue }
+
+    /// The exact `sort=` value ABS expects for this choice.
+    var serverKey: String {
+        switch self {
+        case .title: return "media.metadata.title"
+        case .author: return "media.metadata.authorName"
+        case .added: return "addedAt"
+        case .published: return "media.metadata.publishedYear"
+        case .progress: return "progress"
+        }
+    }
+
+    /// The human-facing menu label.
+    var label: String {
+        switch self {
+        case .title: return "Title"
+        case .author: return "Author"
+        case .added: return "Date Added"
+        case .published: return "Published Year"
+        case .progress: return "Progress"
+        }
+    }
+}
+
+/// One active library filter, built from a `filterdata` facet selection. ABS wants the request
+/// param `filter=<group>.<base64url(value)>` where — verified against the ABS filter convention —
+/// the encoded value is the author/series *ID* for the `authors`/`series` groups and the plain
+/// string for `genres`/`tags`/`narrators`/`languages`/`publishedDecades`. `displayValue` is what
+/// the UI shows; `rawValue` is what gets base64url-encoded.
+nonisolated struct LibraryFilter: Equatable, Hashable, Sendable {
+    var group: String
+    var displayValue: String
+    var rawValue: String
+
+    init(group: String, displayValue: String, rawValue: String) {
+        self.group = group
+        self.displayValue = displayValue
+        self.rawValue = rawValue
+    }
+
+    /// The `<group>.<base64url(value)>` string threaded into `ABSClient.items(filter:)`.
+    var queryValue: String { group + "." + Self.base64URLEncode(rawValue) }
+
+    /// ABS filter convention: `Buffer.from(value).toString('base64')` made URL-safe — `+`→`-`,
+    /// `/`→`_`, and `=` padding stripped. Node's `Buffer.from(x,'base64')` decodes this url-safe,
+    /// unpadded form, so the server round-trips the original value.
+    static func base64URLEncode(_ value: String) -> String {
+        Data(value.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
+
 @Observable
 final class AppState {
     enum Phase { case disconnected, connecting, connected }
@@ -90,6 +151,25 @@ final class AppState {
     /// Last library ID `refreshItems` was asked to page — recorded so a future first-run/
     /// offline flow (M1b) can resume browsing the last-viewed library without a live server.
     private(set) var activeLibraryID: String?
+
+    // MARK: - Library browse (Task 8) — sort/filter state feeding refreshItems + the items request.
+
+    /// The active grid sort key. Mutated by `LibraryGridView`'s toolbar; read by `refreshItems`
+    /// to drive the server `items?sort=` query. Persists while browsing so a library re-visit
+    /// keeps the user's chosen order.
+    var librarySort: LibrarySort = .title
+    /// Ascending (`false`) vs descending (`true`) for `librarySort` — the toolbar order toggle.
+    var sortDescending = false
+    /// The active facet filter (nil = unfiltered). Set from `FilterSheet`; drives `items?filter=`.
+    /// Reset per-library on a library switch (a different library's facet IDs won't match).
+    var libraryFilter: LibraryFilter?
+
+    /// The server-authoritative item ORDER captured by the most recent successful `refreshItems`,
+    /// keyed by libraryID. The cache's `observeItems` only knows title order, so the grid renders
+    /// in THIS order (falling back to the cache's title order before the first refresh completes,
+    /// for instant offline paint). When a filter is active this holds ONLY the matching item IDs,
+    /// so the grid shows exactly the filtered set without the cache ever deleting non-matching rows.
+    private(set) var libraryItemOrder: [String: [String]] = [:]
 
     private var auth: AuthManager?
     private let tokenStore: any TokenStore
@@ -740,13 +820,20 @@ final class AppState {
             throw ABSError.notAuthenticated
         }
         activeLibraryID = libraryID
+        // Snapshot the browse state once so a mid-refresh toolbar change can't split the query
+        // (page 0 filtered, page 1 not) — the next task-driven refresh picks up the new state.
+        let sort = librarySort
+        let desc = sortDescending
+        let activeFilter = libraryFilter
         let limit = 50
         var accumulated: [CachedItem] = []
         var lastTotal = 0
         var completed = false
         do {
             for page in 0..<Self.refreshPageSafetyBound {
-                let result = try await client.items(libraryID: libraryID, limit: limit, page: page)
+                let result = try await client.items(
+                    libraryID: libraryID, limit: limit, page: page,
+                    sort: sort.serverKey, desc: desc, filter: activeFilter?.queryValue)
                 lastTotal = result.total
                 accumulated += result.results.map { item in
                     CachedItem(id: item.id, connectionID: connectionID, libraryID: libraryID,
@@ -768,18 +855,30 @@ final class AppState {
             }
             throw error
         }
+        // A server "lie": a non-zero total but zero items handed back — never reconcile/wipe on it.
+        let isLyingEmpty = (lastTotal > 0 && accumulated.isEmpty)
         if !completed {
             // Safety bound hit before the total was satisfied — a pathological (>~10k-item)
             // library. Note it and degrade to a plain upsert of what we DID page: never
             // `replaceItems`, which would delete every row past the bound we simply never fetched.
             NSLog("[Colophon] refreshItems: library \(libraryID) exceeded the \(Self.refreshPageSafetyBound)-page safety bound (total \(lastTotal)); upserting \(accumulated.count) paged items without reconciliation.")
             try cache.upsertItemsPage(accumulated, connectionID: connectionID, libraryID: libraryID)
-        } else if !(lastTotal > 0 && accumulated.isEmpty) {
-            // Completed page-through: reconcile. `replaceItems` with [] wipes the library's cache
-            // — reached only for a genuinely empty library (total 0); the guard above skips it for
-            // a lying/failed response that reports a non-zero total but hands back zero items, so
-            // that can never nuke a good cache.
+        } else if activeFilter != nil {
+            // Filtered page-through: the server returned ONLY matching items. `replaceItems` would
+            // delete every non-matching cached row (destroying the offline browse set for a
+            // transient filter); upsert instead so the matches are fresh, and let `libraryItemOrder`
+            // below scope the grid's visible set to exactly these IDs.
+            try cache.upsertItemsPage(accumulated, connectionID: connectionID, libraryID: libraryID)
+        } else if !isLyingEmpty {
+            // Completed, UNFILTERED page-through: reconcile. `replaceItems` with [] wipes the
+            // library's cache — reached only for a genuinely empty library (total 0); the guard
+            // above skips it for a lying/failed response, so that can never nuke a good cache.
             try cache.replaceItems(accumulated, connectionID: connectionID, libraryID: libraryID)
+        }
+        // Capture the server-authoritative order (full set unfiltered, matching set filtered) for
+        // the grid — but never clobber a good order with a lying-empty response's zero IDs.
+        if !isLyingEmpty {
+            libraryItemOrder[libraryID] = accumulated.map(\.id)
         }
         // Success clears only this library's banner — another library's failure stays visible
         // on its own screen until *it* refreshes successfully.

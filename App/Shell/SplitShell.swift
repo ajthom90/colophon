@@ -62,13 +62,14 @@ struct SplitShell: View {
     @ViewBuilder
     private var detailColumn: some View {
         // Each case owns its own `NavigationStack` so the detail column shows a title bar and
-        // resets cleanly on selection change. LibraryItemsView plays a tapped book directly (no
-        // push), so no `navigationDestination` is needed here.
+        // resets cleanly on selection change. `LibraryGridView` plays a tapped book directly (no
+        // push), so no `navigationDestination` is needed here. The sidebar already lists every
+        // library, so the grid is given no in-tab picker (`siblings` defaults empty).
         switch selection {
         case .search:
             NavigationStack { SearchPlaceholder() }
         case .library(let library):
-            NavigationStack { LibraryItemsView(library: library) }
+            NavigationStack { LibraryGridView(library: library) }
         case .home, .none:
             NavigationStack { HomeView() }
         }

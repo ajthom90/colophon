@@ -28,15 +28,32 @@ public final class ABSClient: Sendable {
         _ = try await authorizedData(req)
     }
 
-    public func items(libraryID: String, limit: Int, page: Int) async throws -> ItemsPage {
+    /// `GET /api/libraries/:id/items` (minified) with the browse sort/order/filter the grid drives.
+    /// `sort` is a verified ABS sort key (`media.metadata.title` | `media.metadata.authorName` |
+    /// `addedAt` | `media.metadata.publishedYear` | `progress`); `desc` maps to `desc=1|0`; `filter`,
+    /// when present, is the pre-built `<group>.<base64url(value)>` string (the caller owns the
+    /// base64url encoding — see `AppState.LibraryFilter`). Defaults reproduce the previous
+    /// title-ascending, unfiltered behavior so existing callers (the `refreshItems` pager and the
+    /// debug auto-connect hook) are unchanged.
+    public func items(
+        libraryID: String,
+        limit: Int,
+        page: Int,
+        sort: String = "media.metadata.title",
+        desc: Bool = false,
+        filter: String? = nil
+    ) async throws -> ItemsPage {
         var comps = URLComponents(url: baseURL.appending(path: "api/libraries/\(libraryID)/items"),
                                   resolvingAgainstBaseURL: false)!
-        comps.queryItems = [
+        var query: [URLQueryItem] = [
             .init(name: "limit", value: String(limit)),
             .init(name: "page", value: String(page)),
             .init(name: "minified", value: "1"),
-            .init(name: "sort", value: "media.metadata.title"),
+            .init(name: "sort", value: sort),
+            .init(name: "desc", value: desc ? "1" : "0"),
         ]
+        if let filter { query.append(.init(name: "filter", value: filter)) }
+        comps.queryItems = query
         return try await authorizedSend(URLRequest(url: comps.url!), as: ItemsPage.self)
     }
 
