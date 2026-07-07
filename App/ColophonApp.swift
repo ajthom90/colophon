@@ -22,6 +22,12 @@ private struct PerfSpikeAutoOpener: View {
 struct ColophonApp: App {
     @State private var app = AppState()
     @Environment(\.scenePhase) private var scenePhase
+    /// Single source of truth for typography (Global Constraints: `colophon.typeface`, "serif"
+    /// default | "sans"). Applied ONCE here, outermost in the `WindowGroup` content's modifier
+    /// chain, so it reaches every view in the tree — including content injected by later
+    /// modifiers like `PlayerBarView`'s `safeAreaInset`. Per-view `.fontDesign(.serif)` modifiers
+    /// were removed everywhere else in `App/Views/*`; do not reintroduce them.
+    @AppStorage("colophon.typeface") private var typeface = "serif"
 
     init() {
         #if DEBUG && os(macOS)
@@ -64,9 +70,17 @@ struct ColophonApp: App {
             #if DEBUG && os(macOS)
             .background(PerfSpikeAutoOpener())
             #endif
+            .fontDesign(typeface == "serif" ? .serif : .default)
         }
         #if DEBUG && os(macOS)
         Window("Perf Spike", id: "perf-spike") { PerfSpikeView() }
+        #endif
+        #if os(macOS)
+        // iOS/iPadOS have no `Settings` scene (⌘, doesn't exist there); the same `SettingsView`
+        // is reached from a gear button on `ConnectionsView` instead.
+        Settings {
+            SettingsView()
+        }
         #endif
     }
 }

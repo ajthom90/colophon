@@ -82,7 +82,6 @@ struct ConnectView: View {
         }
         .formStyle(.grouped)
         .navigationTitle(reauthConnection == nil ? "Colophon" : "Sign In")
-        .fontDesign(.serif)
         .frame(maxWidth: 480)
         .task {
             // Re-auth: skip straight to the credential form for the known server.

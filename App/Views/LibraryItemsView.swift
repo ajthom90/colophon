@@ -42,7 +42,6 @@ struct LibraryItemsView: View {
                 }
             }
         }
-        .fontDesign(.serif)
         .navigationTitle(library.name)
         .overlay(alignment: .top) {
             // Only this library's failure — a banner for some other library never shows here.

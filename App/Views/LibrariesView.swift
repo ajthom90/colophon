@@ -11,7 +11,6 @@ struct LibrariesView: View {
             NavigationLink(library.name, value: library)
         }
         .navigationTitle("Libraries")
-        .fontDesign(.serif)
         // The `CachedLibrary` navigationDestination is declared at the NavigationStack root in
         // `ConnectionsView` (a destination registered from within another destination doesn't
         // resolve); this view only emits the `NavigationLink(value:)` above.

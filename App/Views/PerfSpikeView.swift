@@ -100,7 +100,6 @@ struct PerfSpikeView: View {
                 }
                 .padding()
             }
-            .fontDesign(.serif)
             .navigationTitle("Perf Spike — 10k items")
             .onAppear {
                 guard ProcessInfo.processInfo.environment["COLOPHON_PERF_AUTOSCROLL"] == "1" else { return }

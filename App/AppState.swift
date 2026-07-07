@@ -30,6 +30,29 @@ final class AppState {
     /// fix (a relaunch with a dead server still lands the user in their cached library).
     static let lastActiveConnectionIDKey = "colophon.lastActiveConnectionID"
 
+    /// Settings keys (Global Constraints — exact strings, `@AppStorage`-compatible so
+    /// `SettingsView`'s property wrappers and these plain `UserDefaults` reads always agree).
+    /// `AppState` isn't a `View`, so it can't use `@AppStorage` itself; it reads the same
+    /// `UserDefaults.standard` keys directly instead.
+    static let defaultRateKey = "colophon.defaultRate"
+    static let skipIntervalKey = "colophon.skipInterval"
+
+    /// The user's default playback rate (Settings), applied to every freshly opened book in
+    /// `startPlayback` — per-book overrides are M2/CloudSync scope. `UserDefaults.double` returns
+    /// 0 for an absent key (nothing set yet, or `SettingsView` never opened), which reads as the
+    /// documented default of 1.0×.
+    private static func storedDefaultRate() -> Double {
+        let stored = UserDefaults.standard.double(forKey: defaultRateKey)
+        return stored == 0 ? 1.0 : stored
+    }
+
+    /// The user's skip-interval preference (Settings), seconds — one of 10/15/30/45. Same
+    /// unset-reads-as-default treatment as `storedDefaultRate`: an absent key reads as 15.
+    private static func storedSkipInterval() -> Int {
+        let stored = UserDefaults.standard.integer(forKey: skipIntervalKey)
+        return stored == 0 ? 15 : stored
+    }
+
     /// UUID of the `CachedConnection` row for whatever server/user is currently signed in —
     /// the key views use to scope their `cache.observe*` calls, and the Keychain lookup key.
     private(set) var activeConnectionID: String?
@@ -623,7 +646,14 @@ final class AppState {
             }
             let ordered = envelope.session.audioTracks.sorted { $0.startOffset < $1.startOffset }
             let urls = ordered.map { client.publicTrackURL(sessionID: envelope.session.id, trackIndex: $0.index) }
+            // Set BEFORE `load()`: `load()` calls `NowPlayingUpdater.configure`, which reads
+            // `playback.skipInterval` to advertise the lock-screen/remote-command skip intervals
+            // — it must already hold this playback's value when that happens.
+            playback.skipInterval = Self.storedSkipInterval()
             playback.load(session: envelope.session, trackURLs: urls)
+            // Set AFTER `load()` (which resets the controller's session state) and BEFORE
+            // `play()`: a freshly opened book starts at the user's default rate.
+            playback.rate = Float(Self.storedDefaultRate())
             playback.play()
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription

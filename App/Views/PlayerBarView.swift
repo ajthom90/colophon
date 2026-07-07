@@ -14,11 +14,17 @@ struct PlayerBarView: View {
                         Text(playback.author).font(.caption).foregroundStyle(.secondary).lineLimit(1)
                     }
                     Spacer()
-                    Button { playback.skip(-15) } label: { Image(systemName: "gobackward.15") }
+                    // `skipInterval` is one of 10/15/30/45 (Settings), each of which has an exact
+                    // SF Symbol variant — no text-overlay fallback needed.
+                    Button { playback.skip(-Double(playback.skipInterval)) } label: {
+                        Image(systemName: "gobackward.\(playback.skipInterval)")
+                    }
                     Button { playback.togglePlayPause() } label: {
                         Image(systemName: playback.isPlaying ? "pause.fill" : "play.fill").font(.title2)
                     }
-                    Button { playback.skip(15) } label: { Image(systemName: "goforward.15") }
+                    Button { playback.skip(Double(playback.skipInterval)) } label: {
+                        Image(systemName: "goforward.\(playback.skipInterval)")
+                    }
                     Menu(String(format: "%g×", playback.rate)) {
                         ForEach(rates, id: \.self) { rate in
                             Button(String(format: "%g×", rate)) { playback.setRate(rate) }
@@ -37,7 +43,6 @@ struct PlayerBarView: View {
                 }
             }
             .buttonStyle(.borderless)
-            .fontDesign(.serif)
             .padding(12)
             .background(.bar)
         }

@@ -618,4 +618,63 @@ struct AppStateTests {
 
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").isEmpty)
     }
+
+    // MARK: - Settings plumbing (Task 9)
+
+    /// Saves the current value (if any) of a `UserDefaults.standard` key and returns a restore
+    /// closure — used so these tests can set `colophon.defaultRate`/`colophon.skipInterval`
+    /// (real `AppStorage`-compatible keys, not test-injected) without leaking state into other
+    /// tests that share the same process-wide `UserDefaults.standard`.
+    private func snapshotDefault(_ key: String) -> () -> Void {
+        let previous = UserDefaults.standard.object(forKey: key)
+        return {
+            if let previous { UserDefaults.standard.set(previous, forKey: key) }
+            else { UserDefaults.standard.removeObject(forKey: key) }
+        }
+    }
+
+    /// `AppState.startPlayback` reads the Settings-stored default rate and skip interval — the
+    /// same `UserDefaults.standard` keys `SettingsView`'s `@AppStorage` Pickers write into — and
+    /// lands them on `playback` before a freshly opened book starts playing.
+    @Test func defaultRateAndSkipIntervalLandOnPlaybackLoad() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        let restoreSkip = snapshotDefault(AppState.skipIntervalKey)
+        defer { restoreRate(); restoreSkip() }
+        UserDefaults.standard.set(1.75, forKey: AppState.defaultRateKey)
+        UserDefaults.standard.set(30, forKey: AppState.skipIntervalKey)
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+
+        #expect(app.playback.rate == 1.75)
+        #expect(app.playback.skipInterval == 30)
+    }
+
+    /// Unset Settings keys (fresh install, `SettingsView` never opened) read as the documented
+    /// defaults — 1.0× and 15s — not `UserDefaults`' bare-key zero value.
+    @Test func unsetSettingsKeysReadAsDocumentedDefaults() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        let restoreSkip = snapshotDefault(AppState.skipIntervalKey)
+        defer { restoreRate(); restoreSkip() }
+        UserDefaults.standard.removeObject(forKey: AppState.defaultRateKey)
+        UserDefaults.standard.removeObject(forKey: AppState.skipIntervalKey)
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+
+        #expect(app.playback.rate == 1.0)
+        #expect(app.playback.skipInterval == 15)
+    }
 }

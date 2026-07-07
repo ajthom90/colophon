@@ -23,13 +23,18 @@ final class NowPlayingUpdater {
         center.togglePlayPauseCommand.addTarget { [weak controller] _ in
             Task { @MainActor in controller?.togglePlayPause() }; return .success
         }
-        center.skipForwardCommand.preferredIntervals = [15]
+        // Read once, up front: `controller.skipInterval` is set by `AppState.startPlayback`
+        // BEFORE `PlaybackController.load()` calls this method, so both the advertised
+        // interval and the handler's jump distance always agree with the Settings preference
+        // (10/15/30/45) in effect for this playback session.
+        let skipInterval = controller.skipInterval
+        center.skipForwardCommand.preferredIntervals = [NSNumber(value: skipInterval)]
         center.skipForwardCommand.addTarget { [weak controller] _ in
-            Task { @MainActor in controller?.skip(15) }; return .success
+            Task { @MainActor in controller?.skip(Double(skipInterval)) }; return .success
         }
-        center.skipBackwardCommand.preferredIntervals = [15]
+        center.skipBackwardCommand.preferredIntervals = [NSNumber(value: skipInterval)]
         center.skipBackwardCommand.addTarget { [weak controller] _ in
-            Task { @MainActor in controller?.skip(-15) }; return .success
+            Task { @MainActor in controller?.skip(-Double(skipInterval)) }; return .success
         }
         center.changePlaybackPositionCommand.addTarget { [weak controller] event in
             guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }

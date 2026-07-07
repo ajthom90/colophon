@@ -22,6 +22,9 @@ struct ConnectionsView: View {
     @State private var path = NavigationPath()
     @State private var didAutoResume = false
     @State private var confirmingRemoval: CachedConnection?
+    #if os(iOS)
+    @State private var showingSettings = false
+    #endif
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -41,8 +44,17 @@ struct ConnectionsView: View {
                 }
             }
             .navigationTitle("Connections")
-            .fontDesign(.serif)
             .toolbar {
+                #if os(iOS)
+                // macOS gets its Settings access from the standard `Settings` scene (⌘,) added
+                // in `ColophonApp`; iOS/iPadOS have no such menu, so a gear button presents the
+                // same `SettingsView` as a sheet instead.
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showingSettings = true } label: {
+                        Label("Settings", systemImage: "gearshape")
+                    }
+                }
+                #endif
                 ToolbarItem(placement: .primaryAction) {
                     Button { path.append(Route.addConnection) } label: {
                         Label("Add Connection", systemImage: "plus")
@@ -77,6 +89,18 @@ struct ConnectionsView: View {
                 Text("Deletes the offline cache for \(connection.name). Your account on the server is unaffected.")
             }
         }
+        #if os(iOS)
+        .sheet(isPresented: $showingSettings) {
+            NavigationStack {
+                SettingsView()
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Done") { showingSettings = false }
+                        }
+                    }
+            }
+        }
+        #endif
         .task {
             app.loadConnections()
             guard !didAutoResume else { return }
