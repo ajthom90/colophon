@@ -70,7 +70,7 @@ struct SplitShell: View {
         case .library(let library):
             NavigationStack { LibraryItemsView(library: library) }
         case .home, .none:
-            NavigationStack { HomePlaceholder() }
+            NavigationStack { HomeView() }
         }
     }
 }

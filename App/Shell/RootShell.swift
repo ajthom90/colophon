@@ -32,18 +32,6 @@ struct RootShell: View {
 
 // MARK: - Placeholders (filled by later M1c-a tasks)
 
-/// Home surface placeholder — personalized shelves land in Task 7.
-struct HomePlaceholder: View {
-    var body: some View {
-        ContentUnavailableView {
-            Label("Home shelves — M1c-a Task 7", systemImage: "house")
-        } description: {
-            Text("Personalized shelves (Continue Listening, Recently Added, …) arrive in the next task.")
-        }
-        .navigationTitle("Home")
-    }
-}
-
 /// Search surface placeholder — the FTS5 ⨯ server blend lands in Task 10.
 struct SearchPlaceholder: View {
     var body: some View {

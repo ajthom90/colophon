@@ -811,6 +811,38 @@ final class AppState {
         Task { try? await refreshItems(libraryID: libraryID) }
     }
 
+    /// Joins `GET /api/me`'s `mediaProgress[]` into the cache's `CachedProgress` — THE source of
+    /// the home shelves' progress pills, since personalized-shelf entities carry NO progress field
+    /// (verified live). `HomeView` calls this on appear and on pull-to-refresh; from the connected
+    /// shell's perspective that is "on connect/activate" (Home is the initial surface) plus every
+    /// manual refresh. Deliberately NOT wired into `completeConnection`/`activateConnection`: those
+    /// flows are covered by a FIFO-ordered `MockTransport` test suite that asserts exact request
+    /// sequences, and a background `me()` there would perturb every connect-based test — so the
+    /// join is driven from the UI lifecycle instead, which is where the pill is actually consumed.
+    ///
+    /// Best-effort: an absent/failed `me()` leaves existing progress untouched. The upsert is
+    /// last-write-wins by `lastUpdate` (`upsertProgressBatch`), so a socket `progressUpdated` that
+    /// lands before or after this join never regresses the newer value; `me()` entries carry the
+    /// server's own `lastUpdate`, falling back to wall-clock only when the server omits it.
+    func refreshProgress() async {
+        guard let client, let connectionID = activeConnectionID else { return }
+        guard let me = try? await client.me() else { return }
+        // A connection switch during the me() round-trip must never write server-A progress under
+        // server-B's ID.
+        guard connectionID == activeConnectionID else { return }
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        let batch = (me.mediaProgress ?? []).map { entry in
+            CachedProgress(
+                connectionID: connectionID,
+                itemID: entry.libraryItemId,
+                episodeID: entry.episodeId,           // nil → "" per the 3-part PK
+                currentTime: entry.currentTime ?? 0,
+                isFinished: entry.isFinished ?? false,
+                lastUpdate: entry.lastUpdate ?? now)
+        }
+        try? cache.upsertProgressBatch(batch)
+    }
+
     /// Retire the current session completely (ordering matters: flush → detach sync callback →
     /// close server-side → tear down local playback). pause() also flushes, but via a
     /// fire-and-forget Task with no ordering guarantee against the next line — so flush

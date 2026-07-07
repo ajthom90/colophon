@@ -233,6 +233,34 @@ struct AppStateTests {
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 1)
     }
 
+    /// The progress-join (Task 7): `refreshProgress()` calls `GET /api/me` and upserts each
+    /// `mediaProgress` entry into `CachedProgress` (the source of the home shelves' pills, since
+    /// shelf entities carry no progress). Asserts the entry lands under the active connection's ID,
+    /// with `episodeId: null → ""` per the 3-part PK, and that the server's `lastUpdate` is used.
+    @Test func mediaProgressFromMeLandsInCache() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        await transport.enqueue(status: 200, json: #"""
+        {"id":"root","username":"root","mediaProgress":[
+          {"libraryItemId":"li_art","episodeId":null,"progress":0.0277,"currentTime":120.5,"duration":4337.26,"isFinished":false,"lastUpdate":1783453076895}
+        ]}
+        """#)
+
+        await app.refreshProgress()
+
+        let joined = try #require(try app.cache.progress(connectionID: cid, itemID: "li_art"))
+        #expect(joined.currentTime == 120.5)
+        #expect(joined.isFinished == false)
+        #expect(joined.episodeID == "")             // null episodeId → "" per the 3-part PK
+        #expect(joined.lastUpdate == 1783453076895) // server timestamp, not wall-clock
+        let mePaths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(mePaths.contains("/api/me"))
+    }
+
     /// The banner is tagged with the library that actually failed: fail library B's refresh and
     /// the banner's `libraryID` is B — a `LibraryItemsView` for library A (which matches on
     /// `banner.libraryID == library.id`) would not show it.

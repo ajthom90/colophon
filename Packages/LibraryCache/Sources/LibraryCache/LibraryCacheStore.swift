@@ -153,6 +153,17 @@ public struct LibraryCacheStore: Sendable {
         }.values(in: pool)
     }
 
+    /// Observes ALL progress rows for a connection as a live stream. The home shelves subscribe so
+    /// their per-item progress pills update the instant a socket `progressUpdated`/`progressBatch`
+    /// event — or the `me()` join — upserts `cachedProgress`, with no shelf refetch. Connection-
+    /// scoped (not per-item) because a shelf spans arbitrarily many items; the view indexes the
+    /// result by `itemID` client-side.
+    public func observeProgress(connectionID: String) -> AsyncValueObservation<[CachedProgress]> {
+        ValueObservation.tracking { db in
+            try CachedProgress.filter(Column("connectionID") == connectionID).fetchAll(db)
+        }.values(in: pool)
+    }
+
     public func searchItems(connectionID: String, query: String) throws -> [CachedItem] {
         try pool.read { db in
             guard let pattern = FTS5Pattern(matchingAllPrefixesIn: query) else { return [] }

@@ -13,7 +13,7 @@ struct PhoneShell: View {
         TabView {
             Tab("Home", systemImage: "house") {
                 NavigationStack {
-                    HomePlaceholder()
+                    HomeView()
                         .accountMenu()
                 }
             }

@@ -372,6 +372,11 @@ public struct MediaProgressEntry: Decodable, Sendable, Hashable {
     public let currentTime: Double?
     public let duration: Double?
     public let isFinished: Bool?
+    /// Server-side last-modified timestamp (ms since epoch). Optional so an older/variant server
+    /// response still decodes; the progress-join uses it for last-write-wins reconciliation
+    /// against socket `progressUpdated` events (which carry the same server timestamp), falling
+    /// back to wall-clock time only when absent.
+    public let lastUpdate: Int?
 }
 
 /// Source-verified shape (`User.createBookmark`, ABS 2.35.1): `{libraryItemId, time, title,
