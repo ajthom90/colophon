@@ -628,10 +628,18 @@ final class AppState {
         reauthTask = nil
     }
 
+    /// Upper bound on how many ids one `items_updated`/`items_added` batch will patch one-by-one
+    /// before falling back to a single full-library `refreshItems`: past this, N single-item
+    /// round trips cost more than one paged reconcile (and a mass edit is exactly the case a
+    /// reconcile handles cleanly).
+    private static let itemsChangedPatchBound = 50
+
     /// Applies a decoded server event to local state. `progressUpdated`/`progressBatch` upsert
     /// straight into the cache (last-write-wins by `lastUpdate`, enforced in
-    /// `LibraryCacheStore.upsertProgress`); item lifecycle events do a coarse re-page of
-    /// whatever library is currently open (M1a scope — per-item patch is M1c polish).
+    /// `LibraryCacheStore.upsertProgress`). `itemChanged`/`itemsChanged` do a TARGETED per-item
+    /// patch (`patchItem` → one-row upsert) rather than a coarse full-library re-page — a large
+    /// `itemsChanged` batch (> `itemsChangedPatchBound`) is the one case that still falls back to
+    /// a single `refreshItems`. `itemRemoved` stays the precise-delete deletion path.
     /// `internal` (not `private`) so the state-machine tests can drive it deterministically
     /// without waiting on the nondeterministic socket-consumer task.
     func apply(_ event: ServerEvent) async {
@@ -648,8 +656,16 @@ final class AppState {
                     currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate)
             }
             try? cache.upsertProgressBatch(batch)
-        case .itemChanged, .itemsChanged:
-            if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
+        case .itemChanged(let id):
+            try? await patchItem(id: id, connectionID: connectionID)
+        case .itemsChanged(let ids):
+            // A huge batch (a bulk metadata edit / mass import) is cheaper — and more correct —
+            // to reconcile in one paged pass than to fire N single-item fetches.
+            if ids.count > Self.itemsChangedPatchBound {
+                if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
+            } else {
+                for id in ids { try? await patchItem(id: id, connectionID: connectionID) }
+            }
         case .itemRemoved(let id):
             // Precise deletion first (instant, no round trip) — the coarse re-page below is a
             // safety net for anything else the same event batch implies, not the primary path.
@@ -689,13 +705,26 @@ final class AppState {
         return fresh
     }
 
-    /// Pages `client.items` (50/page) into the cache until the server-reported total is
-    /// satisfied or a 20-page (1000-item) cap is hit — a deliberate M1a limit; full unbounded
-    /// paging is out of scope until it's needed.
+    /// Generous upper bound on how many pages `refreshItems` will fetch before it gives up on
+    /// completing a full page-through: 200 pages × 50/page ≈ 10 000 items. The M1a hard 20-page
+    /// (1000-item) cap is GONE — a capped page-through never called `replaceItems`, so any
+    /// library over 1000 items accreted ghost rows forever (deleted items were never reconciled
+    /// away). This bound only exists so a pathological giant library degrades gracefully
+    /// (per-page upsert, no reconcile) rather than paging without end; a normal library of any
+    /// realistic size pages to completion and reconciles.
+    private static let refreshPageSafetyBound = 200
+
+    /// Pages `client.items` (50/page) into the cache until the server-reported total is satisfied
+    /// (`accumulated.count >= total`) — the ghost-accretion hazard is closed: a COMPLETED
+    /// page-through reconciles via `replaceItems`, so items the server no longer reports
+    /// (deleted/moved) disappear from the cache for a library of ANY size.
     ///
-    /// A completed page-through (every item seen, uncapped) reconciles via `replaceItems` so
-    /// items the server no longer reports (deleted/moved libraries) disappear from the cache —
-    /// otherwise a capped/interrupted page-through only upserts what it saw, exactly like before.
+    /// The only ceiling is `refreshPageSafetyBound` (≈10k items): if a library is so large the
+    /// loop hits it WITHOUT completing, we degrade to a plain per-page `upsertItemsPage` and skip
+    /// `replaceItems` — a giant library keeps its rows (no accidental wipe from an incomplete
+    /// view) rather than paging forever. The lying-response guard (`total > 0` but zero items
+    /// accumulated → skip `replaceItems`) still protects a completed-but-empty response from
+    /// nuking a good cache.
     ///
     /// On outright failure (network/server error), a library the cache already has content for
     /// gets a non-blocking `refreshBanner` instead of throwing — the existing (possibly stale)
@@ -711,7 +740,7 @@ final class AppState {
         var lastTotal = 0
         var completed = false
         do {
-            for page in 0..<20 {
+            for page in 0..<Self.refreshPageSafetyBound {
                 let result = try await client.items(libraryID: libraryID, limit: limit, page: page)
                 lastTotal = result.total
                 accumulated += result.results.map { item in
@@ -734,19 +763,41 @@ final class AppState {
             }
             throw error
         }
-        if completed {
-            // replaceItems with [] wipes the library's cache — only reached after a completed
-            // page-through; guarded below so a lying/failed response that reports a non-zero
-            // total but hands back zero items can never nuke a good cache.
-            if !(lastTotal > 0 && accumulated.isEmpty) {
-                try cache.replaceItems(accumulated, connectionID: connectionID, libraryID: libraryID)
-            }
-        } else {
+        if !completed {
+            // Safety bound hit before the total was satisfied — a pathological (>~10k-item)
+            // library. Note it and degrade to a plain upsert of what we DID page: never
+            // `replaceItems`, which would delete every row past the bound we simply never fetched.
+            NSLog("[Colophon] refreshItems: library \(libraryID) exceeded the \(Self.refreshPageSafetyBound)-page safety bound (total \(lastTotal)); upserting \(accumulated.count) paged items without reconciliation.")
             try cache.upsertItemsPage(accumulated, connectionID: connectionID, libraryID: libraryID)
+        } else if !(lastTotal > 0 && accumulated.isEmpty) {
+            // Completed page-through: reconcile. `replaceItems` with [] wipes the library's cache
+            // — reached only for a genuinely empty library (total 0); the guard above skips it for
+            // a lying/failed response that reports a non-zero total but hands back zero items, so
+            // that can never nuke a good cache.
+            try cache.replaceItems(accumulated, connectionID: connectionID, libraryID: libraryID)
         }
         // Success clears only this library's banner — another library's failure stays visible
         // on its own screen until *it* refreshes successfully.
         if refreshBanner?.libraryID == libraryID { refreshBanner = nil }
+    }
+
+    /// Targeted single-item patch for `item_updated`/`item_added` socket events: fetches just
+    /// that item (`GET /api/items/:id?expanded=1`), maps it to a `CachedItem`, and upserts the
+    /// ONE row — no coarse full-library re-page. The item's own `libraryId` from the response
+    /// scopes the upsert; a malformed/absent one falls back to `activeLibraryID` (the library the
+    /// user is currently browsing — the only other context we have). If neither is available
+    /// there's no library to scope the row to, so it's dropped (the next full `refreshItems`
+    /// picks it up). Best-effort: a fetch/map failure is swallowed by the `try?` at the call site.
+    private func patchItem(id: String, connectionID: String) async throws {
+        guard let client else { return }
+        let detail = try await client.item(id: id)
+        guard let libraryID = detail.libraryId ?? activeLibraryID else { return }
+        let item = CachedItem(
+            id: detail.id, connectionID: connectionID, libraryID: libraryID,
+            title: detail.media.metadata.title ?? "Untitled",
+            authorName: detail.media.metadata.authorName,
+            duration: detail.media.duration, updatedAt: detail.updatedAt)
+        try cache.upsertItemsPage([item], connectionID: connectionID, libraryID: libraryID)
     }
 
     /// Retry hook for the `RefreshBanner`'s button — re-runs `refreshItems` for the library the

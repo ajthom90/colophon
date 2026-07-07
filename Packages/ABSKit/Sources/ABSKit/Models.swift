@@ -60,6 +60,36 @@ public struct MinifiedMetadata: Decodable, Sendable, Hashable {
     public let authorName: String?
 }
 
+/// Full single-item detail from `GET /api/items/:id?expanded=1` — the per-item counterpart to
+/// the minified `/items` list page. Used by `ABSClient.item(id:)` for `AppState`'s targeted
+/// per-item socket patch (M1c-a Task 3, replacing a coarse full-library `refreshItems` for
+/// `item_updated`/`item_added` events) and, in M1c-b, item-detail views. Decodes tolerantly:
+/// only the fields Task 3 needs today are modeled here; unknown/future fields (chapters, full
+/// relational metadata, progress) are simply ignored by `Decodable`'s default behavior and can
+/// be added later without breaking this decode.
+public struct LibraryItemDetail: Decodable, Sendable, Identifiable {
+    public let id: String
+    /// The item's owning library — present on every live server response; optional here only
+    /// so a malformed/future response degrades to `AppState`'s `activeLibraryID` fallback
+    /// instead of failing the whole decode.
+    public let libraryId: String?
+    public let updatedAt: Int?
+    public let media: ExpandedItemMedia
+}
+
+public struct ExpandedItemMedia: Decodable, Sendable {
+    public let duration: Double?
+    public let metadata: ExpandedItemMetadata
+}
+
+/// Mirrors `MinifiedMetadata`'s `title`/`authorName` — `authorName` is a server-computed
+/// convenience string (not the raw `authors` relational array), present in both the minified
+/// and expanded metadata shapes.
+public struct ExpandedItemMetadata: Decodable, Sendable {
+    public let title: String?
+    public let authorName: String?
+}
+
 public struct PlaybackSession: Decodable, Sendable {
     public let id: String
     public let libraryItemId: String

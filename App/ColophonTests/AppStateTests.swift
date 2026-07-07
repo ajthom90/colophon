@@ -953,6 +953,77 @@ struct AppStateTests {
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").isEmpty)
     }
 
+    // MARK: - Per-item socket patch + uncapped reconciliation (M1c-a Task 3)
+
+    /// `apply(.itemChanged(id:))` patches exactly ONE row via `ABSClient.item(id:)` — no coarse
+    /// full-library re-page. Cache seeded with two items in the same library; a socket
+    /// `item_updated` for item "a" fetches `/api/items/a`, upserts just that row (with the
+    /// fresh title/author/duration from the patch response), and leaves item "b" untouched.
+    /// Critically, no `/api/libraries/:id/items` request is made at all — the old coarse
+    /// `refreshItems` path is gone for this event.
+    @Test func itemChangedPatchesSingleRowNotFullRefresh() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "a", connectionID: cid, libraryID: "lib1", title: "Old A",
+                        authorName: "Old Author A", duration: 1, updatedAt: 1),
+             CachedItem(id: "b", connectionID: cid, libraryID: "lib1", title: "Old B",
+                        authorName: "Old Author B", duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        await transport.enqueue(status: 200, json: #"""
+            {"id":"a","libraryId":"lib1","updatedAt":42,"media":{"duration":99,"metadata":{"title":"Patched A","authorName":"New Author A"}}}
+            """#)
+
+        await app.apply(.itemChanged(id: "a"))
+
+        let items = try app.cache.items(connectionID: cid, libraryID: "lib1")
+        let a = items.first { $0.id == "a" }
+        let b = items.first { $0.id == "b" }
+        #expect(a?.title == "Patched A")
+        #expect(a?.authorName == "New Author A")
+        #expect(a?.duration == 99)
+        #expect(b?.title == "Old B")                // untouched
+        #expect(b?.authorName == "Old Author B")    // untouched
+
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.filter { $0 == "/api/items/a" }.count == 1)          // exactly one patch fetch
+        #expect(!paths.contains { $0.contains("/libraries/") && $0.contains("/items") })  // NO full re-page
+    }
+
+    /// A completed MULTI-page fetch (not just the single-page case `completedRefreshReconciles`
+    /// already covers) still reconciles via `replaceItems` — the accumulate-across-pages loop
+    /// isn't capped short of completion. Three pages, total spanning all of them; a
+    /// previously-cached stale row (absent from every fresh page) is gone afterward, and every
+    /// fresh row from all three pages is present.
+    @Test func largeLibraryReconcilesWithoutCap() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "stale", connectionID: cid, libraryID: "lib1", title: "Stale",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        // Three pages, total = 3 (one fresh item per page) — none of them is "stale".
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 3, results: ["i0"]))
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 3, results: ["i1"]))
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 3, results: ["i2"]))
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        let items = try app.cache.items(connectionID: cid, libraryID: "lib1")
+        #expect(Set(items.map(\.id)) == Set(["i0", "i1", "i2"]))   // every fresh page's item present
+        #expect(!items.contains { $0.id == "stale" })              // stale row reconciled away
+        let itemsRequests = await transport.recorded.filter { ($0.url?.path ?? "").contains("/items") }
+        #expect(itemsRequests.count == 3)                          // all three pages actually fetched
+    }
+
 }
 
 // MARK: - Settings plumbing (Task 9 / Fix round 2)
