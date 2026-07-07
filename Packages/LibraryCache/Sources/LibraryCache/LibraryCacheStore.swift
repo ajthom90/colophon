@@ -156,4 +156,44 @@ public struct LibraryCacheStore: Sendable {
             return try CachedItem.fetchAll(db, sql: sql, arguments: [pattern, connectionID])
         }
     }
+
+    // MARK: - v2: item detail + podcast episodes
+
+    /// Upserts the 1:1 heavy detail row for an item (on-demand, from `?expanded=1`).
+    public func upsertItemDetail(_ detail: CachedItemDetail) throws {
+        try pool.write { try detail.upsert($0) }
+    }
+
+    public func itemDetail(connectionID: String, itemID: String) throws -> CachedItemDetail? {
+        try pool.read {
+            try CachedItemDetail.fetchOne($0, key: ["connectionID": connectionID, "itemID": itemID])
+        }
+    }
+
+    /// Reconciles one item's full episode list against the cache, scoped to `(connectionID,
+    /// itemID)`: deletes that item's episodes absent from `episodes`, then upserts the rest — in
+    /// ONE transaction, the same replace-semantics `replaceItems` uses for library items. Other
+    /// items' episodes are untouched.
+    public func upsertEpisodes(_ episodes: [CachedEpisode], connectionID: String, itemID: String) throws {
+        try pool.write { db in
+            let ids = episodes.map(\.episodeID)
+            try CachedEpisode.filter(Column("connectionID") == connectionID
+                                      && Column("itemID") == itemID
+                                      && !ids.contains(Column("episodeID"))).deleteAll(db)
+            for episode in episodes {
+                var episode = episode
+                episode.connectionID = connectionID
+                episode.itemID = itemID
+                try episode.upsert(db)
+            }
+        }
+    }
+
+    public func episodes(connectionID: String, itemID: String) throws -> [CachedEpisode] {
+        try pool.read {
+            try CachedEpisode.filter(Column("connectionID") == connectionID && Column("itemID") == itemID)
+                .order(Column("publishedAt").desc)
+                .fetchAll($0)
+        }
+    }
 }

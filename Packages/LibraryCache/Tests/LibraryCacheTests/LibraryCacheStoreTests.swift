@@ -173,4 +173,107 @@ import Testing
         let store = try LibraryCacheStore(databaseURL: dbURL)   // must not throw: delete-and-recreate
         #expect(try store.connections().isEmpty)
     }
+
+    // MARK: - v2: item detail columns + podcast episodes
+
+    /// The migrator registers v1 THEN v2 on every open, so a fresh store already carries both —
+    /// this is really "rows written via the v1-shape constructor survive, and the v2 columns
+    /// added by `ALTER TABLE` default to nil/empty for them," which is the forward-migration
+    /// guarantee the plan requires (a real pre-existing v1-only DB file migrates identically).
+    @Test func v2AddsDetailColumnsPreservingV1Rows() throws {
+        let store = try makeStore()
+        try store.upsertConnection(CachedConnection(id: "C1", address: "a", name: "n",
+                                                    username: "u", authMethod: "local", sortIndex: 0))
+        try store.upsertLibraries([CachedLibrary(id: "L1", connectionID: "C1", name: "Books",
+                                                 mediaType: "book", displayOrder: 0)], connectionID: "C1")
+        let item = CachedItem(id: "i1", connectionID: "C1", libraryID: "L1",
+                              title: "Dracula", authorName: "Bram Stoker", duration: 100, updatedAt: 1)
+        try store.upsertItemsPage([item], connectionID: "C1", libraryID: "L1")
+
+        let fetched = try store.items(connectionID: "C1", libraryID: "L1").first
+        #expect(fetched?.title == "Dracula")           // v1 row intact
+        #expect(fetched?.authorName == "Bram Stoker")
+        #expect(fetched?.subtitle == nil)               // v2 columns default nil
+        #expect(fetched?.narratorName == nil)
+        #expect(fetched?.seriesName == nil)
+        #expect(fetched?.genres == [])
+        #expect(fetched?.publishedYear == nil)
+        #expect(fetched?.descriptionSnippet == nil)
+    }
+
+    @Test func itemDetailRoundTrips() throws {
+        let store = try makeStore()
+        let detail = CachedItemDetail(connectionID: "C1", itemID: "i1",
+                                      description: "Full description", publisher: "Acme Pub",
+                                      isbn: "isbn1", asin: "asin1", language: "en",
+                                      explicit: false, abridged: true, publishedDate: "2020-01-01",
+                                      chapters: [CachedChapter(id: 1, start: 0, end: 120, title: "Ch1"),
+                                                 CachedChapter(id: 2, start: 120, end: 240, title: "Ch2")])
+        try store.upsertItemDetail(detail)
+
+        let fetched = try store.itemDetail(connectionID: "C1", itemID: "i1")
+        #expect(fetched?.description == "Full description")
+        #expect(fetched?.publisher == "Acme Pub")
+        #expect(fetched?.isbn == "isbn1")
+        #expect(fetched?.asin == "asin1")
+        #expect(fetched?.language == "en")
+        #expect(fetched?.explicit == false)
+        #expect(fetched?.abridged == true)
+        #expect(fetched?.publishedDate == "2020-01-01")
+        #expect(fetched?.chapters == [CachedChapter(id: 1, start: 0, end: 120, title: "Ch1"),
+                                       CachedChapter(id: 2, start: 120, end: 240, title: "Ch2")])
+
+        // upsert replaces in place (1:1 with item — no accretion of duplicate rows).
+        var updated = detail
+        updated.publisher = "Second Pub"
+        try store.upsertItemDetail(updated)
+        #expect(try store.itemDetail(connectionID: "C1", itemID: "i1")?.publisher == "Second Pub")
+
+        #expect(try store.itemDetail(connectionID: "C1", itemID: "missing") == nil)
+    }
+
+    @Test func episodesRoundTripSortedByPublishedAtDesc() throws {
+        let store = try makeStore()
+        let e1 = CachedEpisode(connectionID: "C1", itemID: "i1", episodeID: "e1",
+                               title: "First", publishedAt: 100)
+        let e2 = CachedEpisode(connectionID: "C1", itemID: "i1", episodeID: "e2",
+                               title: "Second", publishedAt: 300)
+        let e3 = CachedEpisode(connectionID: "C1", itemID: "i1", episodeID: "e3",
+                               title: "Third", publishedAt: 200)
+        try store.upsertEpisodes([e1, e2, e3], connectionID: "C1", itemID: "i1")   // inserted out of order
+
+        let fetched = try store.episodes(connectionID: "C1", itemID: "i1")
+        #expect(fetched.map(\.episodeID) == ["e2", "e3", "e1"])   // 300, 200, 100 -> DESC
+    }
+
+    @Test func upsertEpisodesReplacesScopedToItem() throws {
+        let store = try makeStore()
+        let aKeep = CachedEpisode(connectionID: "C1", itemID: "A", episodeID: "a1", publishedAt: 1)
+        let aGone = CachedEpisode(connectionID: "C1", itemID: "A", episodeID: "a2", publishedAt: 2)
+        let bItem = CachedEpisode(connectionID: "C1", itemID: "B", episodeID: "b1", publishedAt: 1)
+        try store.upsertEpisodes([aKeep, aGone], connectionID: "C1", itemID: "A")
+        try store.upsertEpisodes([bItem], connectionID: "C1", itemID: "B")
+
+        try store.upsertEpisodes([aKeep], connectionID: "C1", itemID: "A")   // replace: aGone dropped
+
+        #expect(try store.episodes(connectionID: "C1", itemID: "A").map(\.episodeID) == ["a1"])
+        #expect(try store.episodes(connectionID: "C1", itemID: "B").map(\.episodeID) == ["b1"])   // untouched
+    }
+
+    /// Sanity that adding `cachedEpisode` didn't disturb the M1b `cachedProgress` 3-part PK —
+    /// two episodes of the same item still track independent progress.
+    @Test func episodeProgressStillKeyedPerEpisode() throws {
+        let store = try makeStore()
+        try store.upsertEpisodes([
+            CachedEpisode(connectionID: "C1", itemID: "i1", episodeID: "e1", publishedAt: 1),
+            CachedEpisode(connectionID: "C1", itemID: "i1", episodeID: "e2", publishedAt: 2),
+        ], connectionID: "C1", itemID: "i1")
+        try store.upsertProgress(CachedProgress(connectionID: "C1", itemID: "i1", episodeID: "e1",
+                                                currentTime: 10, isFinished: false, lastUpdate: 100))
+        try store.upsertProgress(CachedProgress(connectionID: "C1", itemID: "i1", episodeID: "e2",
+                                                currentTime: 20, isFinished: true, lastUpdate: 200))
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e1")?.currentTime == 10)
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.currentTime == 20)
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.isFinished == true)
+    }
 }

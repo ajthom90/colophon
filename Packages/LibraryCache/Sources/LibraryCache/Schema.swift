@@ -69,6 +69,56 @@ enum Schema {
                 t.column("authorName")
             }
         }
+        // v2 (M1c-a): ALTER-only + CREATE. Never edit v1's body above — a v1 database (existing
+        // connections/tokens/progress on real devices) migrates forward in place: new columns are
+        // all nullable with no default, so ADD COLUMN back-fills existing rows with NULL and they
+        // round-trip unchanged. `cachedItemDetail` and `cachedEpisode` are net-new tables (no data
+        // to preserve). `cachedProgress`'s 3-part (connectionID, itemID, episodeID) PK — already
+        // correct for per-episode progress — is untouched.
+        migrator.registerMigration("v2") { db in
+            try db.alter(table: "cachedItem") { t in
+                // Browse-facing columns populated from the minified /items list payload; kept
+                // lean here so the grid query stays cheap. Full detail lives in cachedItemDetail.
+                t.add(column: "subtitle", .text)
+                t.add(column: "narratorName", .text)
+                t.add(column: "seriesName", .text)
+                t.add(column: "genresJSON", .text)          // JSON-encoded [String]
+                t.add(column: "publishedYear", .text)
+                t.add(column: "descriptionSnippet", .text)  // short/plain, for the grid
+            }
+            try db.create(table: "cachedItemDetail") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("description", .text)
+                t.column("publisher", .text)
+                t.column("isbn", .text)
+                t.column("asin", .text)
+                t.column("language", .text)
+                t.column("explicit", .boolean)
+                t.column("abridged", .boolean)
+                t.column("publishedDate", .text)
+                t.column("chaptersJSON", .text)   // JSON-encoded [{id,start,end,title}]
+                t.primaryKey(["connectionID", "itemID"])
+            }
+            try db.create(table: "cachedEpisode") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull()
+                t.column("idx", .integer)                // avoid reserved word "index"
+                t.column("season", .text)
+                t.column("episode", .text)
+                t.column("episodeType", .text)
+                t.column("title", .text)
+                t.column("subtitle", .text)
+                t.column("episodeDescription", .text)    // avoid clash with "description"
+                t.column("pubDate", .text)
+                t.column("publishedAt", .integer)
+                t.column("durationSeconds", .double)
+                t.column("sizeBytes", .integer)
+                t.column("guid", .text)
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+        }
         return migrator
     }
 }
