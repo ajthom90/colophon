@@ -30,4 +30,11 @@ public actor CoverStore {
         }
         return data
     }
+
+    /// Removes every cached cover for a connection by deleting its `<directory>/<connectionID>`
+    /// folder. Called by `AppState.removeConnection` alongside the SQLite cache purge so a
+    /// forgotten server leaves no cover art on disk. A missing folder is a no-op.
+    public func deleteConnection(connectionID: String) {
+        try? FileManager.default.removeItem(at: directory.appending(path: connectionID))
+    }
 }

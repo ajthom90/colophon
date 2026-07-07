@@ -300,6 +300,155 @@ struct AppStateTests {
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 1)
     }
 
+    // MARK: - Connections (Task 8)
+
+    /// The `PlaybackSession` shape `startPlayback` decodes — one track, no chapters.
+    private let playSessionJSON = #"""
+    {"id":"sess1","libraryItemId":"i1","episodeId":null,"displayTitle":"Book","displayAuthor":"Auth","duration":100,"startTime":0,"currentTime":0,"playMethod":0,"audioTracks":[{"index":1,"startOffset":0,"duration":100,"title":null,"contentUrl":"/x","mimeType":"audio/mpeg"}],"chapters":[]}
+    """#
+
+    private func makeApp(dir: URL, transport: Transport, tokenStore: any TokenStore) -> AppState {
+        AppState(
+            transportProvider: { transport },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: tokenStore,
+            oidcTransportProvider: { transport })
+    }
+
+    /// THE offline first-run fix: activating a connection whose server is unreachable (transport
+    /// has nothing queued, so the `POST /api/authorize` probe throws like a dead host) still lands
+    /// `phase == .connected` with `isOnline == false`, and the connection's cached libraries stay
+    /// observable straight from the temp store. It's offline, not a re-auth prompt.
+    @Test func activateServesCachedRowsOffline() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()           // nothing queued → probe fails like a dead host
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: dir, transport: transport, tokenStore: tokenStore)
+        // Seed a connection + cached library + stored tokens directly, simulating a prior session.
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try app.cache.upsertLibraries([CachedLibrary(id: "L1", connectionID: "C1", name: "Books",
+                                                     mediaType: "book", displayOrder: 0)], connectionID: "C1")
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+
+        await app.activateConnection("C1")
+
+        #expect(app.phase == .connected)
+        #expect(app.isOnline == false)
+        #expect(app.activeConnectionID == "C1")
+        #expect(!app.needsSignIn.contains("C1"))          // offline, not a rejected credential
+        #expect(app.lastActiveConnectionID == "C1")       // persisted for next launch's auto-resume
+        var iterator = app.cache.observeLibraries(connectionID: "C1").makeAsyncIterator()
+        let libs = try await iterator.next()
+        #expect(libs?.map(\.id) == ["L1"])                // cached libraries observable, server or not
+    }
+
+    /// Activating a connection with NO stored tokens skips the probe entirely and marks it
+    /// `needsSignIn` — the row `ConnectionsView` badges and routes to re-auth — while still
+    /// exposing its cached rows (phase connected, offline).
+    @Test func activateWithoutTokensNeedsSignIn() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+
+        await app.activateConnection("C1")
+
+        #expect(app.phase == .connected)
+        #expect(app.isOnline == false)
+        #expect(app.needsSignIn.contains("C1"))
+        // No token means no probe: not a single request was made.
+        #expect(await transport.recorded.isEmpty)
+    }
+
+    /// Playback policy (Global Constraints): switching the active connection mid-listen does NOT
+    /// touch the player. Connect A + play, switch to B, and playback keeps running — the session's
+    /// `PlaybackSessionHandle` owns its own client, independent of the now-swapped `self.client`.
+    @Test func switchingConnectionKeepsPlayback() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play for A
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+        let ownerID = try #require(app.activeConnectionID)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+
+        // A second connection exists in the cache; switch to it (no tokens → offline, no probe).
+        try app.cache.upsertConnection(CachedConnection(id: "B", address: "http://b:13378", name: "B",
+                                                        username: "root", authMethod: "local", sortIndex: 1))
+        await app.activateConnection("B")
+
+        #expect(app.activeConnectionID == "B")
+        #expect(ownerID != "B")
+        #expect(app.playback.isPlaying == true)           // the switch left the player alone
+    }
+
+    /// Signing out of the connection that OWNS the playing session retires it first: the `/play`
+    /// that opened the session is followed by a `/close` that tears it down server-side.
+    @Test func signOutOfOwnerRetiresSession() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play
+        await transport.enqueue(status: 200, json: "{}")              // possible flush /sync
+        await transport.enqueue(status: 200, json: "{}")              // /close
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: dir, transport: transport, tokenStore: tokenStore)
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+
+        await app.signOut(connectionID: cid)
+
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        let playIdx = paths.firstIndex { $0.contains("/play") }
+        let closeIdx = paths.firstIndex { $0.contains("/close") }
+        #expect(playIdx != nil)
+        #expect(closeIdx != nil)
+        if let p = playIdx, let c = closeIdx { #expect(p < c) }       // retired: play, then close
+        #expect(app.needsSignIn.contains(cid))
+        #expect(app.isOnline == false)
+        #expect(await tokenStore.tokens(for: cid) == nil)             // tokens cleared
+        #expect(try app.cache.connections().count == 1)               // but the row + cache stay
+    }
+
+    /// Removing a connection purges every trace: its cache rows (connection/library/item/progress)
+    /// and its keychain tokens are gone, and the active state drops to disconnected.
+    @Test func removePurgesCacheAndTokens() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: dir, transport: transport, tokenStore: tokenStore)
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "i1", connectionID: cid, libraryID: "lib1", title: "Doomed",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        #expect(await tokenStore.tokens(for: cid) != nil)
+
+        await app.removeConnection(cid)
+
+        #expect(try app.cache.connections().isEmpty)
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").isEmpty)
+        #expect(app.connections.isEmpty)
+        #expect(app.activeConnectionID == nil)
+        #expect(app.phase == .disconnected)
+        #expect(await tokenStore.tokens(for: cid) == nil)
+    }
+
     // MARK: - OIDC
 
     /// A canned OIDC browser closure: ignores the authorize URL and returns a fixed

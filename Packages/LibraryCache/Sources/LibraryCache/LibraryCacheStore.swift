@@ -33,6 +33,19 @@ public struct LibraryCacheStore: Sendable {
         try pool.read { try CachedConnection.order(Column("sortIndex")).fetchAll($0) }
     }
 
+    /// Removes a connection and every row scoped to it — the `cachedConnection` row plus its
+    /// `cachedLibrary`, `cachedItem` (and, via the FTS5 `synchronize` trigger, its search-index
+    /// rows), and `cachedProgress` rows — in ONE transaction. Used by `AppState.removeConnection`
+    /// so a "forget this server" leaves no orphaned cache behind. Other connections are untouched.
+    public func deleteConnection(connectionID: String) throws {
+        try pool.write { db in
+            _ = try CachedItem.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedProgress.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedLibrary.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedConnection.filter(Column("id") == connectionID).deleteAll(db)
+        }
+    }
+
     public func upsertLibraries(_ libs: [CachedLibrary], connectionID: String) throws {
         try pool.write { db in
             try CachedLibrary.filter(Column("connectionID") == connectionID

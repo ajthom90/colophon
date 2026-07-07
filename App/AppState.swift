@@ -25,9 +25,36 @@ final class AppState {
     let cache: LibraryCacheStore
     let coverStore: CoverStore
 
+    /// UserDefaults key persisting the last connection the user activated, so `ConnectionsView`
+    /// can auto-resume it on the next launch — the load-bearing half of the offline first-run
+    /// fix (a relaunch with a dead server still lands the user in their cached library).
+    static let lastActiveConnectionIDKey = "colophon.lastActiveConnectionID"
+
     /// UUID of the `CachedConnection` row for whatever server/user is currently signed in —
     /// the key views use to scope their `cache.observe*` calls, and the Keychain lookup key.
     private(set) var activeConnectionID: String?
+    /// Whether the active connection currently has a *live* server behind it. `false` after a
+    /// cached-first `activateConnection` until (and unless) the background `POST /api/authorize`
+    /// probe succeeds; distinguishes "browsing cached rows offline" from "connected and syncing".
+    private(set) var isOnline = false
+    /// Connection IDs whose stored tokens are missing or rejected (a failed probe / signed-out
+    /// row). Surfaced as a badge in `ConnectionsView`; tapping such a row routes to re-auth.
+    /// Cleared the moment a (re)connect or a successful probe proves the credentials good.
+    private(set) var needsSignIn: Set<String> = []
+    /// The observed connection list `ConnectionsView` renders. Refreshed from the cache by
+    /// `loadConnections()` at boot and after every connection mutation (activate/connect/
+    /// signOut/remove) — a simple observed array rather than a live `ValueObservation`, which
+    /// is more than this rarely-changing, user-driven list needs.
+    private(set) var connections: [CachedConnection] = []
+    /// The last connection the user activated (mirrors `lastActiveConnectionIDKey`). Read by
+    /// `ConnectionsView` to auto-resume on launch.
+    private(set) var lastActiveConnectionID: String? =
+        UserDefaults.standard.string(forKey: AppState.lastActiveConnectionIDKey)
+    /// Which connection OWNS the currently-playing session. Set when `startPlayback` succeeds,
+    /// cleared when the session is retired. Playback policy: switching the active connection
+    /// leaves this (and the player) untouched — only signing out / removing *this* connection
+    /// retires the session first.
+    private var playingConnectionID: String?
     /// Last library ID `refreshItems` was asked to page — recorded so a future first-run/
     /// offline flow (M1b) can resume browsing the last-viewed library without a live server.
     private(set) var activeLibraryID: String?
@@ -219,8 +246,21 @@ final class AppState {
             CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
                           mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
         }, connectionID: connection.id)
-        // Real-time updates: one socket per active connection (the previous connection's
-        // socket was torn down at the top of connect()/connectWithOIDC(), before any await).
+        startSocket(url: url, auth: auth)
+        // A fresh login/OIDC exchange proves the credentials — this connection no longer
+        // needs sign-in, and it's live.
+        needsSignIn.remove(connection.id)
+        isOnline = true
+        persistLastActive(connection.id)
+        loadConnections()
+        phase = .connected
+    }
+
+    /// Stands up the realtime socket for `auth`/`url`: one socket, one consumer task draining its
+    /// event stream, one task forwarding `auth.tokenUpdates` into `socket.reauthenticate()`. The
+    /// caller must have already torn down any previous socket via `stopSocket()`. Shared by the
+    /// sign-in tail (`completeConnection`) and the online branch of `activateConnection`.
+    private func startSocket(url: URL, auth: AuthManager) {
         let tokenProvider: @Sendable () async -> String? = { [weak auth] in
             try? await auth?.currentAccessToken()
         }
@@ -239,7 +279,125 @@ final class AppState {
                 await self?.socket?.reauthenticate()
             }
         }
-        phase = .connected
+    }
+
+    // MARK: - Connections
+
+    /// Refreshes the observed `connections` array from the cache. Cheap and synchronous; called
+    /// at boot and after every connection mutation so `ConnectionsView` always mirrors the store.
+    func loadConnections() {
+        connections = (try? cache.connections()) ?? []
+    }
+
+    private func persistLastActive(_ id: String) {
+        lastActiveConnectionID = id
+        UserDefaults.standard.set(id, forKey: Self.lastActiveConnectionIDKey)
+    }
+
+    /// Activates a stored connection with CACHED-FIRST semantics — THE offline first-run fix.
+    /// Synchronously (before any `await`) it makes the connection's cached libraries browsable:
+    /// `activeConnectionID` + `phase = .connected` with `isOnline = false`, so the observing views
+    /// render cached rows the instant this yields the run loop. THEN, in the same call, it probes
+    /// the stored tokens:
+    ///   • no tokens stored          → mark `needsSignIn`, stay cached/offline (never probes).
+    ///   • probe succeeds            → `isOnline = true`, socket up, library list refreshed.
+    ///   • probe 401 → refresh fails → `reauthRequired` → mark `needsSignIn`, stay cached/offline.
+    ///   • host down / transport err → stay cached/offline (isOnline false); the per-library
+    ///     `refreshBanner` and the `LibrariesView` offline banner drive the retry affordance.
+    /// Playback is untouched throughout (only the previous socket is torn down; the player keeps
+    /// running) — switching connections mid-listen keeps playing, per the Global Constraints.
+    func activateConnection(_ id: String) async {
+        guard let connection = try? cache.connections().first(where: { $0.id == id }),
+              let url = URL(string: connection.address) else { return }
+        // Deactivate the previous connection's socket before switching IDs (a stray old-server
+        // event must never land under the new connection's ID). The player is deliberately left
+        // running — see the playback policy above.
+        stopSocket()
+        errorMessage = nil
+        refreshBanner = nil
+        isOnline = false
+        activeLibraryID = nil
+        activeConnectionID = id
+        persistLastActive(id)
+        loadConnections()
+        phase = .connected   // cached browsing is live from here — server up or not.
+
+        // No stored credentials: surface re-auth, don't probe (nothing to probe with).
+        guard await tokenStore.tokens(for: id) != nil else {
+            client = nil
+            auth = nil
+            needsSignIn.insert(id)
+            return
+        }
+        let auth = AuthManager(baseURL: url, connectionID: id, transport: transport, store: tokenStore)
+        let client = ABSClient(baseURL: url, transport: transport, auth: auth)
+        self.auth = auth
+        self.client = client
+        do {
+            try await client.authorize()
+            // A rapid re-activation may have superseded this probe mid-flight; don't clobber it.
+            guard activeConnectionID == id else { return }
+            needsSignIn.remove(id)
+            isOnline = true
+            startSocket(url: url, auth: auth)
+            if let libs = try? await client.libraries() {
+                try? cache.upsertLibraries(libs.enumerated().map { index, lib in
+                    CachedLibrary(id: lib.id, connectionID: id, name: lib.name,
+                                  mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
+                }, connectionID: id)
+            }
+        } catch ABSError.reauthRequired, ABSError.notAuthenticated {
+            guard activeConnectionID == id else { return }
+            isOnline = false
+            needsSignIn.insert(id)
+        } catch {
+            // Host down / transport error: stay in cached-only offline mode. `isOnline == false`
+            // drives the offline banner; no blocking error alert for an expected offline case.
+            guard activeConnectionID == id else { return }
+            isOnline = false
+        }
+    }
+
+    /// Signs out of a connection: retires the session if this connection OWNS it, tears down its
+    /// socket if it's active, and clears its stored tokens — but KEEPS the connection row and all
+    /// cached rows so the user can still browse offline and sign back in later. Marks it
+    /// `needsSignIn` so `ConnectionsView` badges it and routes a tap to re-auth.
+    func signOut(connectionID id: String) async {
+        if playingConnectionID == id {
+            await retireCurrentSession()
+        }
+        if activeConnectionID == id {
+            stopSocket()
+            isOnline = false
+            client = nil
+            auth = nil
+        }
+        await tokenStore.clear(for: id)
+        needsSignIn.insert(id)
+        loadConnections()
+    }
+
+    /// Forgets a connection entirely: sign-out semantics first (retire if it owns playback, stop
+    /// the socket if active, clear the keychain entry), then purge every trace — the SQLite cache
+    /// rows (connection + libraries + items + progress) in one transaction and the on-disk cover
+    /// folder. If it was the active connection, drops back to a disconnected state so the boot
+    /// flow re-routes to `ConnectionsView` (or `ConnectView` when none remain).
+    func removeConnection(_ id: String) async {
+        await signOut(connectionID: id)
+        if activeConnectionID == id {
+            activeConnectionID = nil
+            client = nil
+            auth = nil
+            phase = .disconnected
+        }
+        if lastActiveConnectionID == id {
+            lastActiveConnectionID = nil
+            UserDefaults.standard.removeObject(forKey: Self.lastActiveConnectionIDKey)
+        }
+        needsSignIn.remove(id)
+        try? cache.deleteConnection(connectionID: id)
+        await coverStore.deleteConnection(connectionID: id)
+        loadConnections()
     }
 
     /// Tears down the live socket and both of its driving tasks. Called at the top of
@@ -394,6 +552,7 @@ final class AppState {
         await handle.close(currentTime: playback.globalTime, timeListened: 0)
         playback.unload()
         sessionHandle = nil
+        playingConnectionID = nil
     }
 
     func startPlayback(itemID: String) async {
@@ -410,6 +569,10 @@ final class AppState {
             let envelope = try await client.startPlayback(itemID: itemID, deviceInfo: deviceInfo)
             let handle = PlaybackSessionHandle(client: client, envelope: envelope)
             sessionHandle = handle
+            // Record which connection owns this session so signOut/remove of that connection
+            // retires it first, while a mere connection *switch* leaves it playing (the handle
+            // holds its own client, captured above — independent of `self.client`).
+            playingConnectionID = activeConnectionID
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }

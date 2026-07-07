@@ -137,6 +137,34 @@ import Testing
         #expect(try store.progress(connectionID: "C1", itemID: "i2")?.currentTime == 7)
     }
 
+    @Test func deleteConnectionCascadesButLeavesOthersIntact() throws {
+        let store = try makeStore()
+        // Seed two connections, each with a library, an item, and a progress row.
+        for c in ["C1", "C2"] {
+            try store.upsertConnection(CachedConnection(id: c, address: "http://\(c)", name: c,
+                                                        username: "u", authMethod: "local", sortIndex: 0))
+            try store.upsertLibraries([CachedLibrary(id: "L1", connectionID: c, name: "Books",
+                                                     mediaType: "book", displayOrder: 0)], connectionID: c)
+            try store.upsertItemsPage([CachedItem(id: "i1", connectionID: c, libraryID: "L1",
+                                                  title: "Dracula-\(c)", authorName: nil, duration: 1, updatedAt: 1)],
+                                      connectionID: c, libraryID: "L1")
+            try store.upsertProgress(CachedProgress(connectionID: c, itemID: "i1", episodeID: nil,
+                                                    currentTime: 5, isFinished: false, lastUpdate: 10))
+        }
+
+        try store.deleteConnection(connectionID: "C1")
+
+        // C1: every row (connection, library, item, FTS, progress) gone.
+        #expect(try store.connections().map(\.id) == ["C2"])
+        #expect(try store.items(connectionID: "C1", libraryID: "L1").isEmpty)
+        #expect(try store.searchItems(connectionID: "C1", query: "drac").isEmpty)
+        #expect(try store.progress(connectionID: "C1", itemID: "i1") == nil)
+        // C2: fully intact.
+        #expect(try store.items(connectionID: "C2", libraryID: "L1").map(\.id) == ["i1"])
+        #expect(try store.searchItems(connectionID: "C2", query: "drac").map(\.id) == ["i1"])
+        #expect(try store.progress(connectionID: "C2", itemID: "i1")?.currentTime == 5)
+    }
+
     @Test func corruptDatabaseFileRecoversFresh() throws {
         let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

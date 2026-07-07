@@ -1,22 +1,37 @@
 import SwiftUI
 import AuthenticationServices
 import ABSKit
+import LibraryCache
 
 /// Two-step sign-in: (1) the user enters a server URL and the app probes `/status`; (2) once the
 /// server's advertised auth methods are known, render a password form (if `"local"` is active),
 /// an OIDC button (if `"openid"` is active, labeled from `authFormData.authOpenIDButtonText`), or
 /// both. `authOpenIDAutoLaunch` skips straight past the button and opens the sign-in sheet.
+///
+/// Doubles as the re-auth screen: when handed a `reauthConnection` (a connection whose stored
+/// tokens went stale), it pre-fills that server's URL + username, probes `/status` immediately,
+/// and dismisses itself back to `ConnectionsView` once the sign-in succeeds.
 struct ConnectView: View {
     @Environment(AppState.self) private var app
     @Environment(\.webAuthenticationSession) private var webAuthSession
+    @Environment(\.dismiss) private var dismiss
 
-    @State private var serverURL = "http://localhost:13378"
-    @State private var username = "root"
+    /// Non-nil when this view is re-authenticating an existing connection (see the type doc).
+    let reauthConnection: CachedConnection?
+
+    @State private var serverURL: String
+    @State private var username: String
     @State private var password = ""
 
     @State private var status: ServerStatus?
     @State private var isCheckingStatus = false
     @State private var statusError: String?
+
+    init(reauthConnection: CachedConnection? = nil) {
+        self.reauthConnection = reauthConnection
+        _serverURL = State(initialValue: reauthConnection?.address ?? "http://localhost:13378")
+        _username = State(initialValue: reauthConnection?.username ?? "root")
+    }
 
     private var supportsLocal: Bool { status?.authMethods?.contains("local") ?? false }
     private var supportsOpenID: Bool { status?.authMethods?.contains("openid") ?? false }
@@ -66,9 +81,18 @@ struct ConnectView: View {
             }
         }
         .formStyle(.grouped)
-        .navigationTitle("Colophon")
+        .navigationTitle(reauthConnection == nil ? "Colophon" : "Sign In")
         .fontDesign(.serif)
         .frame(maxWidth: 480)
+        .task {
+            // Re-auth: skip straight to the credential form for the known server.
+            if reauthConnection != nil, status == nil { checkStatus() }
+        }
+        .onChange(of: app.phase) { _, phase in
+            // A successful (re)connect pops this pushed screen back to `ConnectionsView`; on the
+            // first-run root instance there's nothing to pop, so this is a harmless no-op there.
+            if phase == .connected { dismiss() }
+        }
     }
 
     private func checkStatus() {

@@ -32,23 +32,28 @@ struct ColophonApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                if app.phase == .connected {
-                    NavigationStack { LibrariesView() }
-                        .safeAreaInset(edge: .bottom) { PlayerBarView() }
-                        .alert("Something went wrong", isPresented: Binding(
-                            get: { app.errorMessage != nil },
-                            set: { if !$0 { app.errorMessage = nil } })
-                        ) {
-                            Button("OK", role: .cancel) {}
-                        } message: {
-                            Text(app.errorMessage ?? "")
-                        }
-                } else {
+                // Boot flow: any stored connection → the `ConnectionsView` hub (which auto-resumes
+                // the last-active one, cached-first, even with the server down); otherwise the
+                // first-run `ConnectView`. `ConnectionsView` owns its own `NavigationStack` and
+                // pushes `LibrariesView` on activation.
+                if app.connections.isEmpty {
                     NavigationStack { ConnectView() }
+                } else {
+                    ConnectionsView()
                 }
+            }
+            .safeAreaInset(edge: .bottom) { PlayerBarView() }
+            .alert("Something went wrong", isPresented: Binding(
+                get: { app.errorMessage != nil },
+                set: { if !$0 { app.errorMessage = nil } })
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(app.errorMessage ?? "")
             }
             .environment(app)
             .task {
+                app.loadConnections()
                 #if DEBUG
                 await app.runAutoConnectIfRequested()
                 #endif

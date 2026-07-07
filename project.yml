@@ -79,6 +79,11 @@ targets:
         product: ABSRealtime
       - package: LibraryCache
       - package: PlayerEngine
+      # Same transitive-symbol leak the Colophon target hits: `observeLibraries` returns GRDB's
+      # `AsyncValueObservation`, whose iterator symbols surface in this bundle's object files when
+      # a test drives the observation directly. Link GRDB explicitly so they resolve.
+      - package: GRDB
+        product: GRDB
     settings:
       base:
         SWIFT_VERSION: "6.2"

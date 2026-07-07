@@ -17,6 +17,17 @@ public final class ABSClient: Sendable {
         try await authorizedSend(get("api/libraries"), as: LibrariesResponse.self).libraries
     }
 
+    /// Probes the stored credentials against `POST /api/authorize` (Bearer). Returns normally
+    /// when the token is valid — or was silently refreshed by `authorizedData`'s 401 machinery.
+    /// A 401 whose refresh also fails surfaces as `ABSError.reauthRequired`; a dead host throws
+    /// the transport's underlying error. Used by `AppState.activateConnection` to decide between
+    /// online mode, a "needs sign-in" re-auth prompt, and staying in cached-only offline mode.
+    public func authorize() async throws {
+        var req = get("api/authorize")
+        req.httpMethod = "POST"
+        _ = try await authorizedData(req)
+    }
+
     public func items(libraryID: String, limit: Int, page: Int) async throws -> ItemsPage {
         var comps = URLComponents(url: baseURL.appending(path: "api/libraries/\(libraryID)/items"),
                                   resolvingAgainstBaseURL: false)!
