@@ -59,6 +59,9 @@ targets:
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: "Colophon connects to your Audiobookshelf server, which may be on your local network."
+        CFBundleURLTypes:
+          - CFBundleURLName: com.andrewthom.colophon.oauth
+            CFBundleURLSchemes: [colophon]
   ColophonTests:
     type: bundle.unit-test
     # iOS-only: this hosted bundle runs on the iOS Simulator via `make test-app`. See the

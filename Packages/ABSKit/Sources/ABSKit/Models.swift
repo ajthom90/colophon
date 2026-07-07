@@ -4,6 +4,15 @@ public struct ServerStatus: Decodable, Sendable {
     public let isInit: Bool
     public let serverVersion: String?
     public let authMethods: [String]?
+    public let authFormData: AuthFormData?
+}
+
+/// The subset of `/status`'s `authFormData` object the sign-in UI needs to decide what to
+/// render: an OIDC button's label, and whether to launch it automatically without waiting for
+/// a tap. Server sends more fields (e.g. `authLoginCustomMessage`); unmodeled ones are ignored.
+public struct AuthFormData: Decodable, Sendable {
+    public let authOpenIDButtonText: String?
+    public let authOpenIDAutoLaunch: Bool?
 }
 
 public struct LoginResponse: Decodable, Sendable {

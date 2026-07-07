@@ -40,6 +40,12 @@ final class AppState {
     /// is unchanged): `transport` stands in for a real `URLSessionTransport` (MockTransport in
     /// tests), and `socketFactory` builds the realtime socket (a scripted `FakeSocket` in tests).
     private let transport: Transport
+    /// `OIDCFlow` needs a DEDICATED no-redirect, cookie-jar transport (it reads the 302 to the IdP
+    /// itself; a redirect-following transport like `transport` above would silently follow that
+    /// 302 and hand OIDCFlow the IdP's eventual 200 page instead, misreporting `.serverRejected`).
+    /// `nil` in production lets `OIDCFlow` build its own; tests inject the SAME `MockTransport`
+    /// used for `/status`/`/libraries` so one FIFO queue can script the whole `connectWithOIDC` call.
+    private let oidcTransport: Transport?
     private let socketFactory: (URL, @escaping @Sendable () async -> String?) -> any RealtimeSocketProtocol
 
     /// Real-time updates: one socket per active connection, one consumer task draining its
@@ -59,9 +65,11 @@ final class AppState {
         transportProvider: @escaping @Sendable () -> Transport = { URLSessionTransport() },
         cacheDirectory: URL? = nil,
         socketFactory: ((URL, @escaping @Sendable () async -> String?) -> any RealtimeSocketProtocol)? = nil,
-        tokenStore: (any TokenStore)? = nil
+        tokenStore: (any TokenStore)? = nil,
+        oidcTransportProvider: (@Sendable () -> Transport)? = nil
     ) {
         self.transport = transportProvider()
+        self.oidcTransport = oidcTransportProvider?()
         self.tokenStore = tokenStore ?? KeychainTokenStore()
         self.socketFactory = socketFactory ?? { url, tokenProvider in
             SocketService(serverURL: url, tokenProvider: tokenProvider)
@@ -116,12 +124,7 @@ final class AppState {
         do {
             let transport = self.transport
             let status = try await ABSClient.status(baseURL: url, transport: transport)
-            guard status.isInit else { throw ABSError.invalidResponse }
-            guard let versionString = status.serverVersion,
-                  let version = ServerVersion(versionString),
-                  !(version < ABSKit.minimumServerVersion) else {
-                throw ABSError.serverTooOld(found: status.serverVersion ?? "unknown")
-            }
+            try checkVersionGate(status)
             let connection = try findOrCreateConnection(address: url.absoluteString, username: username)
             // Awaited (not fire-and-forget) so migration can never race a fresh login's token
             // save — it must finish moving any legacy entry before `auth.login` writes new ones.
@@ -130,36 +133,7 @@ final class AppState {
             let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             _ = try await auth.login(username: username, password: password)
-            let client = ABSClient(baseURL: url, transport: transport, auth: auth)
-            self.auth = auth
-            self.client = client
-            self.activeConnectionID = connection.id
-            let libs = try await client.libraries()
-            try cache.upsertLibraries(libs.enumerated().map { index, lib in
-                CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
-                              mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
-            }, connectionID: connection.id)
-            // Real-time updates: one socket per active connection (the previous connection's
-            // socket was torn down at the top of connect(), before any await).
-            let tokenProvider: @Sendable () async -> String? = { [weak auth] in
-                try? await auth?.currentAccessToken()
-            }
-            let service = socketFactory(url, tokenProvider)
-            socket = service
-            socketTask = Task { [weak self] in
-                for await event in service.events() {
-                    await self?.apply(event)
-                }
-            }
-            reauthTask = Task { [weak self] in
-                // `auth` is an actor: reading its `tokenUpdates` stream (a Sendable value)
-                // requires an isolation hop, but the stream itself can then be iterated freely.
-                guard let updates = await self?.auth?.tokenUpdates else { return }
-                for await _ in updates {
-                    await self?.socket?.reauthenticate()
-                }
-            }
-            phase = .connected
+            try await completeConnection(connection: connection, auth: auth, url: url)
         } catch ABSError.http(status: 401) {
             stopSocket()
             phase = .disconnected
@@ -171,6 +145,101 @@ final class AppState {
             activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    /// Probes `/status` for a not-yet-connected server, normalizing the URL the same way
+    /// `connect()`/`connectWithOIDC()` do. Read-only — never touches `phase`/`activeConnectionID`
+    /// — so `ConnectView` can call it freely while the user is still choosing a sign-in method.
+    func fetchStatus(serverURL: String) async throws -> ServerStatus {
+        guard let url = normalizedServerURL(serverURL) else { throw ABSError.invalidResponse }
+        return try await ABSClient.status(baseURL: url, transport: transport)
+    }
+
+    /// OIDC counterpart to `connect(serverURL:username:password:)`: same reentrancy guard and
+    /// stopSocket/ID-nil/refreshBanner prefix, the same `/status` version gate, then the OIDC
+    /// authorization-code flow (via the injected `browser`, which the view supplies from
+    /// `@Environment(\.webAuthenticationSession)`) in place of a password login. The connection's
+    /// username is only known once `OIDCFlow.authenticate` returns the IdP-issued identity, so
+    /// find-or-create necessarily happens after that — unlike the password path, where the user
+    /// supplies the username up front.
+    func connectWithOIDC(serverURL: String, browser: @Sendable (URL) async throws -> URL) async {
+        guard phase != .connecting else { return }
+        errorMessage = nil
+        guard let url = normalizedServerURL(serverURL) else {
+            errorMessage = "Invalid server URL"; return
+        }
+        stopSocket()
+        activeConnectionID = nil
+        refreshBanner = nil
+        phase = .connecting
+        do {
+            let transport = self.transport
+            let status = try await ABSClient.status(baseURL: url, transport: transport)
+            try checkVersionGate(status)
+            let flow = OIDCFlow(serverURL: url, transport: oidcTransport)
+            let loginResponse = try await flow.authenticate(browser: browser)
+            let connection = try findOrCreateConnection(
+                address: url.absoluteString, username: loginResponse.user.username, authMethod: "openid")
+            let auth = AuthManager(baseURL: url, connectionID: connection.id,
+                                   transport: transport, store: tokenStore)
+            try await auth.completeOIDC(loginResponse: loginResponse)
+            try await completeConnection(connection: connection, auth: auth, url: url)
+        } catch {
+            stopSocket()
+            phase = .disconnected
+            activeConnectionID = nil   // no stale ID while disconnected
+            errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// The version gate shared by both sign-in paths: the server must be initialized and at or
+    /// above `ABSKit.minimumServerVersion`, checked BEFORE either password login or the OIDC
+    /// browser hop — so an old/uninitialized server is rejected without prompting for credentials
+    /// or opening a sign-in sheet.
+    private func checkVersionGate(_ status: ServerStatus) throws {
+        guard status.isInit else { throw ABSError.invalidResponse }
+        guard let versionString = status.serverVersion,
+              let version = ServerVersion(versionString),
+              !(version < ABSKit.minimumServerVersion) else {
+            throw ABSError.serverTooOld(found: status.serverVersion ?? "unknown")
+        }
+    }
+
+    /// The tail both sign-in paths share once they hold an authenticated `AuthManager`: build the
+    /// client, publish connection state, fetch+cache the library list, and stand up the realtime
+    /// socket. Only reached after a successful login/OIDC exchange, so `phase` ends `.connected`.
+    private func completeConnection(connection: CachedConnection, auth: AuthManager, url: URL) async throws {
+        let transport = self.transport
+        let client = ABSClient(baseURL: url, transport: transport, auth: auth)
+        self.auth = auth
+        self.client = client
+        self.activeConnectionID = connection.id
+        let libs = try await client.libraries()
+        try cache.upsertLibraries(libs.enumerated().map { index, lib in
+            CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
+                          mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
+        }, connectionID: connection.id)
+        // Real-time updates: one socket per active connection (the previous connection's
+        // socket was torn down at the top of connect()/connectWithOIDC(), before any await).
+        let tokenProvider: @Sendable () async -> String? = { [weak auth] in
+            try? await auth?.currentAccessToken()
+        }
+        let service = socketFactory(url, tokenProvider)
+        socket = service
+        socketTask = Task { [weak self] in
+            for await event in service.events() {
+                await self?.apply(event)
+            }
+        }
+        reauthTask = Task { [weak self] in
+            // `auth` is an actor: reading its `tokenUpdates` stream (a Sendable value)
+            // requires an isolation hop, but the stream itself can then be iterated freely.
+            guard let updates = await self?.auth?.tokenUpdates else { return }
+            for await _ in updates {
+                await self?.socket?.reauthenticate()
+            }
+        }
+        phase = .connected
     }
 
     /// Tears down the live socket and both of its driving tasks. Called at the top of
@@ -230,7 +299,9 @@ final class AppState {
         return comps.url
     }
 
-    private func findOrCreateConnection(address: String, username: String) throws -> CachedConnection {
+    private func findOrCreateConnection(
+        address: String, username: String, authMethod: String = "local"
+    ) throws -> CachedConnection {
         if let existing = try cache.connections().first(where: {
             $0.address == address && $0.username == username
         }) {
@@ -238,7 +309,7 @@ final class AppState {
         }
         let fresh = CachedConnection(id: UUID().uuidString, address: address,
                                      name: URL(string: address)?.host() ?? address,
-                                     username: username, authMethod: "local",
+                                     username: username, authMethod: authMethod,
                                      sortIndex: try cache.connections().count)
         try cache.upsertConnection(fresh)
         return fresh

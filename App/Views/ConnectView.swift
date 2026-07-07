@@ -1,10 +1,26 @@
 import SwiftUI
+import AuthenticationServices
+import ABSKit
 
+/// Two-step sign-in: (1) the user enters a server URL and the app probes `/status`; (2) once the
+/// server's advertised auth methods are known, render a password form (if `"local"` is active),
+/// an OIDC button (if `"openid"` is active, labeled from `authFormData.authOpenIDButtonText`), or
+/// both. `authOpenIDAutoLaunch` skips straight past the button and opens the sign-in sheet.
 struct ConnectView: View {
     @Environment(AppState.self) private var app
+    @Environment(\.webAuthenticationSession) private var webAuthSession
+
     @State private var serverURL = "http://localhost:13378"
     @State private var username = "root"
     @State private var password = ""
+
+    @State private var status: ServerStatus?
+    @State private var isCheckingStatus = false
+    @State private var statusError: String?
+
+    private var supportsLocal: Bool { status?.authMethods?.contains("local") ?? false }
+    private var supportsOpenID: Bool { status?.authMethods?.contains("openid") ?? false }
+    private var openIDButtonText: String { status?.authFormData?.authOpenIDButtonText ?? "Sign in with SSO" }
 
     var body: some View {
         Form {
@@ -15,20 +31,76 @@ struct ConnectView: View {
                     .keyboardType(.URL)
                     .textInputAutocapitalization(.never)
                     #endif
-                TextField("Username", text: $username)
-                SecureField("Password", text: $password)
+                    .disabled(status != nil)
+                if status == nil {
+                    if let statusError {
+                        Text(statusError).foregroundStyle(.red)
+                    }
+                    Button(isCheckingStatus ? "Checking…" : "Continue") { checkStatus() }
+                        .disabled(isCheckingStatus || serverURL.isEmpty)
+                } else {
+                    Button("Change Server") { resetStatus() }
+                }
             }
-            if let error = app.errorMessage {
-                Text(error).foregroundStyle(.red)
+
+            if status != nil {
+                if supportsLocal {
+                    Section("Password") {
+                        TextField("Username", text: $username)
+                        SecureField("Password", text: $password)
+                        Button(app.phase == .connecting ? "Connecting…" : "Sign In") {
+                            Task { await app.connect(serverURL: serverURL, username: username, password: password) }
+                        }
+                        .disabled(app.phase == .connecting)
+                    }
+                }
+                if supportsOpenID {
+                    Section {
+                        Button(app.phase == .connecting ? "Connecting…" : openIDButtonText) { startOIDC() }
+                            .disabled(app.phase == .connecting)
+                    }
+                }
+                if let error = app.errorMessage {
+                    Text(error).foregroundStyle(.red)
+                }
             }
-            Button(app.phase == .connecting ? "Connecting…" : "Connect") {
-                Task { await app.connect(serverURL: serverURL, username: username, password: password) }
-            }
-            .disabled(app.phase == .connecting)
         }
         .formStyle(.grouped)
         .navigationTitle("Colophon")
         .fontDesign(.serif)
         .frame(maxWidth: 480)
+    }
+
+    private func checkStatus() {
+        Task {
+            isCheckingStatus = true
+            statusError = nil
+            defer { isCheckingStatus = false }
+            do {
+                let result = try await app.fetchStatus(serverURL: serverURL)
+                status = result
+                // Auto-launch skips the button entirely — the server wants the OIDC sheet to
+                // appear the moment its auth methods are known, with no extra tap.
+                if result.authFormData?.authOpenIDAutoLaunch == true {
+                    startOIDC()
+                }
+            } catch {
+                statusError = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        }
+    }
+
+    private func resetStatus() {
+        status = nil
+        statusError = nil
+        app.errorMessage = nil
+    }
+
+    private func startOIDC() {
+        Task {
+            await app.connectWithOIDC(serverURL: serverURL) { authorizeURL in
+                try await webAuthSession.authenticate(using: authorizeURL, callbackURLScheme: "colophon")
+            }
+        }
     }
 }

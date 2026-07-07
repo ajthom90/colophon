@@ -17,6 +17,15 @@ private func fixture(_ name: String) throws -> Data {
         #expect(s.authMethods == ["local"])
     }
 
+    /// Captured from the Task 5 dev stack's real `/status` once Dex/OIDC is seeded — exercises
+    /// `authFormData`'s OIDC fields, which `ConnectView` needs to render/auto-launch the SSO button.
+    @Test func decodesServerStatusWithOpenIDAuthFormData() throws {
+        let s = try decoder.decode(ServerStatus.self, from: fixture("status_openid"))
+        #expect(s.authMethods == ["local", "openid"])
+        #expect(s.authFormData?.authOpenIDButtonText == "Sign in with Dex")
+        #expect(s.authFormData?.authOpenIDAutoLaunch == false)
+    }
+
     @Test func decodesLoginResponseWithTokens() throws {
         let r = try decoder.decode(LoginResponse.self, from: fixture("login"))
         #expect(r.user.accessToken == "eyJ.access.1")

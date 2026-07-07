@@ -36,7 +36,10 @@ struct AppStateTests {
             transportProvider: transportProvider,
             cacheDirectory: dir,
             socketFactory: { _, _ in FakeSocket() },
-            tokenStore: InMemoryTokenStore()
+            tokenStore: InMemoryTokenStore(),
+            // Same transport instance as `/status`/`/libraries` — lets a single MockTransport/
+            // GatedTransport FIFO queue script an entire `connectWithOIDC` call in test order.
+            oidcTransportProvider: transportProvider
         )
     }
 
@@ -295,6 +298,85 @@ struct AppStateTests {
         try await app.refreshItems(libraryID: "lib1")
 
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 1)
+    }
+
+    // MARK: - OIDC
+
+    /// A canned OIDC browser closure: ignores the authorize URL and returns a fixed
+    /// `colophon://oauth?code&state` callback — the "fake browser" the plan requires in place of
+    /// a real `ASWebAuthenticationSession` in unit tests.
+    private func fakeBrowser(state: String = "STATE1", code: String = "CODE1") -> @Sendable (URL) async throws -> URL {
+        { _ in URL(string: "colophon://oauth?code=\(code)&state=\(state)")! }
+    }
+
+    /// Full `connectWithOIDC` happy path: `/status` (advertising openid) → OIDCFlow's step-1
+    /// redirect + step-3 exchange (through the SAME `MockTransport` the app's `/status`/`/libraries`
+    /// calls use) → `completeOIDC` → the shared tail. Asserts a `CachedConnection` was found-or-created
+    /// with `authMethod == "openid"` and the IdP-issued username, `phase == .connected`, the tail's
+    /// `/libraries` request actually fired, and the socket started (its `reauthenticateCount` picks
+    /// up the token `completeOIDC` already yielded, since `tokenUpdates` buffers the newest value).
+    @Test func connectWithOIDCFindsOrCreatesAndRunsTail() async throws {
+        let transport = MockTransport()
+        await transport.enqueue(status: 200, json: #"{"isInit":true,"serverVersion":"2.35.1","authMethods":["local","openid"]}"#)
+        // OIDCFlow step 1: /auth/openid → 302 carrying the IdP authorize URL + server state.
+        await transport.enqueue(status: 302, json: "",
+            headers: ["Location": "https://idp.example/auth?state=STATE1"])
+        // OIDCFlow step 3: /auth/openid/callback → 200 LoginResponse.
+        await transport.enqueue(status: 200, json: #"{"user":{"id":"u1","username":"oidcuser","accessToken":"acc-oidc","refreshToken":"ref-oidc"}}"#)
+        await transport.enqueue(status: 200, json: librariesOK)
+        let fakeSocket = FakeSocket()
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: makeTempDir(),
+            socketFactory: { _, _ in fakeSocket },
+            tokenStore: InMemoryTokenStore(),
+            oidcTransportProvider: { transport }
+        )
+
+        await app.connectWithOIDC(serverURL: "http://s:13378", browser: fakeBrowser())
+
+        #expect(app.phase == .connected)
+        let connections = try app.cache.connections()
+        #expect(connections.count == 1)
+        #expect(connections.first?.authMethod == "openid")
+        #expect(connections.first?.username == "oidcuser")
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.contains("/libraries") })
+        while fakeSocket.reauthenticateCount == 0 { await Task.yield() }
+        #expect(fakeSocket.reauthenticateCount == 1)
+    }
+
+    /// The version gate binds on the OIDC path exactly like the password path: an old server is
+    /// rejected at `/status`, before the browser closure is ever invoked (no `/auth/openid` hit).
+    @Test func oldServerIsGatedOnOIDCPath() async throws {
+        let transport = MockTransport()
+        await transport.enqueue(status: 200, json: #"{"isInit":true,"serverVersion":"2.20.0","authMethods":["openid"]}"#)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connectWithOIDC(serverURL: "http://s:13378", browser: fakeBrowser())
+
+        #expect(app.phase == .disconnected)
+        #expect(app.errorMessage?.contains("2.26.0") == true)
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.contains("/status") })
+        #expect(!paths.contains { $0.contains("/auth/openid") })
+    }
+
+    /// A second `connectWithOIDC()` fired while the first is still `.connecting` bails at the same
+    /// reentrancy guard `connect()` uses — the first `/status` stays the only one recorded.
+    @Test func connectWithOIDCReentrancyGuard() async throws {
+        let transport = GatedTransport(gatePath: "/status")
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        let first = Task { await app.connectWithOIDC(serverURL: "http://s:13378", browser: fakeBrowser()) }
+        while await transport.requestCount(pathContains: "/status") == 0 { await Task.yield() }
+
+        await app.connectWithOIDC(serverURL: "http://s:13378", browser: fakeBrowser())
+        #expect(await transport.requestCount(pathContains: "/status") == 1)
+
+        await transport.openGate()
+        await first.value
+        #expect(await transport.requestCount(pathContains: "/status") == 1)
     }
 
     /// The complementary guard case: a genuinely empty library (`total == 0`, `results == []`)
