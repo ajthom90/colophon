@@ -35,11 +35,14 @@ public struct LibraryCacheStore: Sendable {
 
     /// Removes a connection and every row scoped to it — the `cachedConnection` row plus its
     /// `cachedLibrary`, `cachedItem` (and, via the FTS5 `synchronize` trigger, its search-index
-    /// rows), and `cachedProgress` rows — in ONE transaction. Used by `AppState.removeConnection`
-    /// so a "forget this server" leaves no orphaned cache behind. Other connections are untouched.
+    /// rows), `cachedItemDetail`, `cachedEpisode`, and `cachedProgress` rows — in ONE
+    /// transaction. Used by `AppState.removeConnection` so a "forget this server" leaves no
+    /// orphaned cache behind. Other connections are untouched.
     public func deleteConnection(connectionID: String) throws {
         try pool.write { db in
             _ = try CachedItem.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedItemDetail.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedEpisode.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedProgress.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedLibrary.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedConnection.filter(Column("id") == connectionID).deleteAll(db)
@@ -89,11 +92,17 @@ public struct LibraryCacheStore: Sendable {
         }
     }
 
-    /// Removes a single item (and, via the FTS5 `synchronize` trigger, its search index row).
+    /// Removes a single item (and, via the FTS5 `synchronize` trigger, its search index row),
+    /// plus its `cachedItemDetail` and `cachedEpisode` rows — all in ONE transaction so no
+    /// orphaned detail/episode cache survives the item.
     public func deleteItem(connectionID: String, itemID: String) throws {
         try pool.write { db in
             _ = try CachedItem.filter(Column("connectionID") == connectionID
                                        && Column("id") == itemID).deleteAll(db)
+            _ = try CachedItemDetail.filter(Column("connectionID") == connectionID
+                                             && Column("itemID") == itemID).deleteAll(db)
+            _ = try CachedEpisode.filter(Column("connectionID") == connectionID
+                                          && Column("itemID") == itemID).deleteAll(db)
         }
     }
 
@@ -189,6 +198,9 @@ public struct LibraryCacheStore: Sendable {
         }
     }
 
+    /// Episodes for one item, newest first. NULL `publishedAt` sorts LAST here (SQLite's default
+    /// for `ORDER BY … DESC` places NULLs at the end), so episodes missing a publish date fall
+    /// below dated ones rather than jumping to the top.
     public func episodes(connectionID: String, itemID: String) throws -> [CachedEpisode] {
         try pool.read {
             try CachedEpisode.filter(Column("connectionID") == connectionID && Column("itemID") == itemID)
