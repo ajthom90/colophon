@@ -620,6 +620,50 @@ struct AppStateTests {
         #expect(sockets.count == 1)                   // NEWER's socket never torn down or rebuilt
     }
 
+    /// The generation bump must never strand `phase == .connecting`. A signOut fired while a
+    /// `connect()` is parked mid-login makes every one of that connect's subsequent guards bail —
+    /// including the catch blocks that normally reset `phase` — so without `signOut`'s
+    /// `.connecting → .disconnected` normalization, `phase` would stay `.connecting` forever and
+    /// both connect entry guards would refuse every future sign-in (a dead sign-in surface until
+    /// relaunch). Asserts the phase is normalized immediately, stays normalized after the stale
+    /// connect completes (its login SUCCEEDS and is discarded), and — the load-bearing recovery
+    /// check — a subsequent fresh `connect()` is not refused and runs all the way to `.connected`.
+    @Test func signOutDuringConnectDoesNotStrandPhase() async throws {
+        let dir = makeTempDir()
+        let transport = GatedTransport(gatePath: "/login")   // park the connect mid-login
+        // FIFO, consumed in the deterministic order the barriers below enforce:
+        await transport.enqueue(status: 200, json: statusOK)      // stale connect: /status
+        await transport.enqueue(status: 200, json: loginOK)       // stale connect: /login (on gate open)
+        await transport.enqueue(status: 200, json: statusOK)      // recovery connect: /status
+        await transport.enqueue(status: 200, json: loginOK)       // recovery connect: /login (gate now open)
+        await transport.enqueue(status: 200, json: librariesOK)   // recovery connect: /libraries
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        // An unrelated stored row to sign out of while the connect is in flight.
+        try app.cache.upsertConnection(CachedConnection(id: "R1", address: "http://other:13378", name: "Other",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+
+        let stale = Task { await app.connect(serverURL: "http://s:13378", username: "root", password: "pw") }
+        while await transport.requestCount(pathContains: "/login") == 0 { await Task.yield() }
+        #expect(app.phase == .connecting)
+
+        await app.signOut(connectionID: "R1")
+        #expect(app.phase == .disconnected)          // normalized by signOut, not left .connecting
+
+        // Release the gate: the stale connect's login lands 200, but its generation is stale — it
+        // must discard itself without re-entering .connecting or publishing any state.
+        await transport.openGate()
+        await stale.value
+        #expect(app.phase == .disconnected)          // still not stranded
+        #expect(app.activeConnectionID == nil)       // no stale publication while disconnected
+        #expect(app.errorMessage == nil)             // discarded silently, no bogus alert
+
+        // THE recovery assertion: the sign-in surface is alive — a fresh connect is accepted by
+        // the `phase != .connecting` entry guard and completes normally.
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+        #expect(app.errorMessage == nil)
+    }
+
     // MARK: - OIDC
 
     /// A canned OIDC browser closure: ignores the authorize URL and returns a fixed

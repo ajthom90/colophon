@@ -221,14 +221,22 @@ final class AppState {
             try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
         } catch ABSError.http(status: 401) {
             // Only surface the error / reset state if we're still the current intent — a stale
-            // connect must not stopSocket a newer connection nor bounce the user out.
-            guard connectionGeneration == myGeneration else { return }
+            // connect must not stopSocket a newer connection nor bounce the user out. If the
+            // superseder was a signOut and `completeConnection` had already published (then threw),
+            // the bail still clears the stranded publication.
+            guard connectionGeneration == myGeneration else {
+                clearStalePublicationIfDisconnected()
+                return
+            }
             stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = "Wrong username or password"
         } catch {
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionGeneration == myGeneration else {
+                clearStalePublicationIfDisconnected()
+                return
+            }
             stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
@@ -281,8 +289,12 @@ final class AppState {
             guard connectionGeneration == myGeneration else { return }
             try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
         } catch {
-            // A stale OIDC connect must not tear down or reset a newer connection's state.
-            guard connectionGeneration == myGeneration else { return }
+            // A stale OIDC connect must not tear down or reset a newer connection's state — but
+            // it does clear its own stranded publication if a signOut superseded it mid-tail.
+            guard connectionGeneration == myGeneration else {
+                clearStalePublicationIfDisconnected()
+                return
+            }
             stopSocket()
             phase = .disconnected
             activeConnectionID = nil   // no stale ID while disconnected
@@ -322,10 +334,20 @@ final class AppState {
         self.client = client
         self.activeConnectionID = connection.id
         let libs = try await client.libraries()
-        // A newer flow superseded this connect while the library list was in flight — it already
-        // owns `activeConnectionID`/socket/phase, so bail without stomping any of it (in particular
-        // without `startSocket`, which would tear down the newer connection's live socket).
-        guard connectionGeneration == generation else { return }
+        // A newer flow superseded this connect while the library list was in flight — it owns
+        // `activeConnectionID`/socket/phase now, so bail without stomping any of it (in particular
+        // without `startSocket`, which would tear down the newer connection's live socket). One
+        // cleanup IS ours to do: this method published `activeConnectionID`/`client`/`auth` above,
+        // BEFORE the await. If the superseder was a signOut/removeConnection (which normalizes a
+        // stranded `.connecting` to `.disconnected` but can't know this flow had already published),
+        // those fields still point at the stale connection while disconnected — clear them so the
+        // "no stale ID while disconnected" invariant holds. Scoped tightly to `.disconnected`
+        // (see the helper's doc): a newer activation (`.connected`) or a newer in-flight connect
+        // (`.connecting`, which republishes these fields itself) is left untouched.
+        guard connectionGeneration == generation else {
+            clearStalePublicationIfDisconnected()
+            return
+        }
         try cache.upsertLibraries(libs.enumerated().map { index, lib in
             CachedLibrary(id: lib.id, connectionID: connection.id, name: lib.name,
                           mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
@@ -338,6 +360,23 @@ final class AppState {
         persistLastActive(connection.id)
         loadConnections()
         phase = .connected
+    }
+
+    /// Cleanup for a superseded (stale-generation) connect flow's bail paths. `completeConnection`
+    /// publishes `activeConnectionID`/`client`/`auth` BEFORE its `libraries()` await; if a
+    /// signOut/removeConnection supersedes during that await (normalizing a stranded `.connecting`
+    /// to `.disconnected` — it can't know this flow had already published), the stale bail — the
+    /// in-method guard on a 200, or the caller's catch guard on a throw — would otherwise leave
+    /// those fields pointing at the stale connection while disconnected. Scoped tightly to
+    /// `.disconnected`: a newer activation (`.connected`) or a newer in-flight connect
+    /// (`.connecting`, which republishes these fields itself) owns them and is left untouched;
+    /// `.disconnected` provably never coexists with another flow's live publication (every path
+    /// that sets it nils `activeConnectionID`, except this stranding).
+    private func clearStalePublicationIfDisconnected() {
+        guard phase == .disconnected else { return }
+        activeConnectionID = nil
+        client = nil
+        auth = nil
     }
 
     /// Stands up the realtime socket for `auth`/`url`: one socket, one consumer task draining its
@@ -493,6 +532,14 @@ final class AppState {
         // immediately makes it stale — when it resumes it will no-op instead of resurrecting the
         // connection we're signing out (needsSignIn.remove + isOnline + socket for a dead session).
         connectionGeneration += 1
+        // The bump also makes any in-flight connect/connectWithOIDC bail at its generation guards
+        // — INCLUDING the catch blocks that normally reset `phase` — so a connect mid-flight right
+        // now would otherwise strand `phase == .connecting` forever, and both connect entry guards
+        // (`guard phase != .connecting`) would refuse every future sign-in. Normalize it here: the
+        // superseded connect then bails harmlessly against an already-reset phase. Conditional so
+        // signing out an inactive row while CONNECTED leaves the current browsing session alone.
+        // `removeConnection` inherits this uniformly — its first step is this method.
+        if phase == .connecting { phase = .disconnected }
         if playingConnectionID == id {
             await retireCurrentSession()
         }
@@ -513,6 +560,10 @@ final class AppState {
     /// folder. If it was the active connection, drops back to a disconnected state so the boot
     /// flow re-routes to `ConnectionsView` (or `ConnectView` when none remain).
     func removeConnection(_ id: String) async {
+        // Generation bump AND `.connecting`-phase normalization both happen inside `signOut`
+        // (unconditionally, before its first await), so every removeConnection path — active or
+        // inactive row — leaves `phase` definite; the branch below only additionally drops a
+        // previously-CONNECTED active row to `.disconnected`.
         await signOut(connectionID: id)
         if activeConnectionID == id {
             activeConnectionID = nil
