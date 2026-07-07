@@ -678,14 +678,39 @@ final class AppState {
     /// On iOS the flush runs inside a `UIBackgroundTaskIdentifier` assertion: without one, iOS is
     /// free to suspend the process mid-POST (this `Task` is detached — `ColophonApp`'s
     /// `scenePhase` observer doesn't/can't await it) and the tail of listened time never reaches
-    /// the server. macOS has no equivalent app-suspension model, so its path is unchanged.
+    /// the server. The expiration handler matters as much as the assertion itself: a background
+    /// task that overruns the OS budget (~30s) WITHOUT one is terminated ungracefully, whereas
+    /// ending it in the handler is a clean early release (the stalled POST is lost either way,
+    /// but the process isn't killed for it). macOS has no app-suspension model; path unchanged.
     #if os(iOS)
+    /// The live background-flush assertion, `.invalid` when none is held. An instance property
+    /// rather than a captured local `var` because BOTH closures that must end it — the
+    /// expiration handler and the flush `Task` — need shared mutable state, which strict
+    /// concurrency forbids for a captured `var`; this property's MainActor isolation is the
+    /// synchronization that makes the end-exactly-once guard sound.
+    private var backgroundFlushTaskID: UIBackgroundTaskIdentifier = .invalid
+
     func flushForBackground() {
-        let taskID = UIApplication.shared.beginBackgroundTask(withName: "colophon.flush")
+        // A fresh backgrounding supersedes any assertion still pending from the previous one.
+        endBackgroundFlushTask()
+        let taskID = UIApplication.shared.beginBackgroundTask(withName: "colophon.flush") { [weak self] in
+            // Budget expired before the flush finished: release the assertion gracefully.
+            self?.endBackgroundFlushTask()
+        }
+        backgroundFlushTaskID = taskID
         Task {
             await playback.flushOnly()
-            if taskID != .invalid { UIApplication.shared.endBackgroundTask(taskID) }
+            // End only the assertion THIS flush owns: if expiration (or a newer backgrounding)
+            // already released it, `backgroundFlushTaskID` no longer matches and this is a no-op
+            // — never a double-end, never ending a successor's assertion.
+            if backgroundFlushTaskID == taskID { endBackgroundFlushTask() }
         }
+    }
+
+    private func endBackgroundFlushTask() {
+        guard backgroundFlushTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundFlushTaskID)
+        backgroundFlushTaskID = .invalid
     }
     #else
     func flushForBackground() {

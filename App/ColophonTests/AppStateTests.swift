@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AuthenticationServices
 import ABSKit
 import ABSKitTestSupport
 import ABSRealtime
@@ -563,6 +564,35 @@ struct AppStateTests {
         #expect(paths.contains { $0.contains("/libraries") })
         while fakeSocket.reauthenticateCount == 0 { await Task.yield() }
         #expect(fakeSocket.reauthenticateCount == 1)
+    }
+
+    /// A user-cancelled ASWebAuthenticationSession (the browser closure throwing
+    /// `.canceledLogin`) is a silent no-op: `.disconnected` with guards reset and NO error
+    /// alert. The thrown error is deliberately a RAW `NSError` (domain + code 1) — the exact
+    /// form the ObjC ASWebAuthenticationSession machinery produces at runtime — proving the
+    /// production `error as? ASWebAuthenticationSessionError` match bridges from it (verified:
+    /// it does; `_BridgedStoredNSError` casts succeed on a matching-domain NSError).
+    @Test func oidcUserCancelIsSilent() async throws {
+        let transport = MockTransport()
+        await transport.enqueue(status: 200, json: #"{"isInit":true,"serverVersion":"2.35.1","authMethods":["openid"]}"#)
+        // OIDCFlow step 1 — consumed before the browser closure is invoked.
+        await transport.enqueue(status: 302, json: "",
+            headers: ["Location": "https://idp.example/auth?state=STATE1"])
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connectWithOIDC(serverURL: "http://s:13378") { _ in
+            throw NSError(domain: ASWebAuthenticationSessionErrorDomain,
+                          code: ASWebAuthenticationSessionError.canceledLogin.rawValue)
+        }
+
+        #expect(app.phase == .disconnected)
+        #expect(app.errorMessage == nil)          // silent — no alert for a user cancel
+        #expect(app.activeConnectionID == nil)
+        // The flow really reached the browser hop (status + step-1 both consumed) — the cancel
+        // was thrown from inside the session, not short-circuited earlier. Any non-cancel
+        // failure here would have set `errorMessage`, so the nil above is discriminating.
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.contains("/auth/openid") })
     }
 
     /// The version gate binds on the OIDC path exactly like the password path: an old server is
