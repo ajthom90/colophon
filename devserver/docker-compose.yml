@@ -9,3 +9,14 @@ services:
       - ./data/audiobooks:/audiobooks
       - ./data/config:/config
       - ./data/metadata:/metadata
+
+  dex:
+    # Pinned: current stable release as of 2026-07 (v2.45.1, released 2026-03-03).
+    image: ghcr.io/dexidp/dex:v2.45.1
+    restart: unless-stopped
+    container_name: colophon-dex
+    command: ["dex", "serve", "/etc/dex/config.yaml"]
+    ports:
+      - "5556:5556"
+    volumes:
+      - ./dex/config.yaml:/etc/dex/config.yaml:ro

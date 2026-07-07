@@ -61,4 +61,45 @@ LIB_ID=$(curl -fsS "$BASE/api/libraries" -H "Authorization: Bearer $TOKEN" \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["libraries"][0]["id"])')
 echo "→ scanning library $LIB_ID"
 curl -fsS -X POST "$BASE/api/libraries/$LIB_ID/scan" -H "Authorization: Bearer $TOKEN" >/dev/null || true
-echo "✓ seeded. Web UI: $BASE ($USER / $PASS)"
+
+# --- OIDC (Dex) --------------------------------------------------------------
+# Idempotent: PATCH /api/auth-settings compares each key server-side and
+# reports {"updated": false} when nothing changed; re-runs are no-ops.
+# Payload discovered empirically against ABS v2.35.1 — see
+# docs/superpowers/spikes/2026-07-oidc-cookies.md for endpoint/field notes
+# (notably: ABS does NOT run issuer discovery, so every endpoint URL must be
+# set explicitly, and authOpenIDSubfolderForRedirectURLs must be "" or the
+# server builds redirect URIs with a literal "/undefined/" path segment).
+echo "→ configuring OIDC (Dex issuer)"
+DEX_ISSUER="http://host.docker.internal:5556/dex"
+curl -fsS -X PATCH "$BASE/api/auth-settings" -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' -d @- >/dev/null <<EOF
+{
+  "authActiveAuthMethods": ["local", "openid"],
+  "authOpenIDIssuerURL": "$DEX_ISSUER",
+  "authOpenIDAuthorizationURL": "$DEX_ISSUER/auth",
+  "authOpenIDTokenURL": "$DEX_ISSUER/token",
+  "authOpenIDUserInfoURL": "$DEX_ISSUER/userinfo",
+  "authOpenIDJwksURL": "$DEX_ISSUER/keys",
+  "authOpenIDClientID": "audiobookshelf",
+  "authOpenIDClientSecret": "colophon-dex-secret",
+  "authOpenIDTokenSigningAlgorithm": "RS256",
+  "authOpenIDButtonText": "Sign in with Dex",
+  "authOpenIDAutoLaunch": false,
+  "authOpenIDAutoRegister": true,
+  "authOpenIDSubfolderForRedirectURLs": "",
+  "authOpenIDMobileRedirectURIs": ["colophon://oauth"]
+}
+EOF
+
+echo "→ verifying auth methods"
+curl -fsS "$BASE/status" | python3 -c '
+import json, sys
+s = json.load(sys.stdin)
+methods = s.get("authMethods", [])
+button = s.get("authFormData", {}).get("authOpenIDButtonText")
+assert "local" in methods and "openid" in methods, f"authMethods wrong: {methods}"
+assert button == "Sign in with Dex", f"button text wrong: {button}"
+print(f"  authMethods={methods} button={button!r}")
+'
+echo "✓ seeded. Web UI: $BASE ($USER / $PASS). OIDC: oidc@colophon.dev / colophon-oidc"

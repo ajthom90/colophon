@@ -1,0 +1,35 @@
+# Dex IdP config for the Colophon dev stack (M1b Task 5).
+#
+# Issuer uses host.docker.internal so the SAME URL validates from:
+#   - the ABS container (Docker Desktop resolves host.docker.internal natively)
+#   - the host browser / iOS simulator (requires "127.0.0.1 host.docker.internal"
+#     in the host's /etc/hosts — see devserver/README.md)
+issuer: http://host.docker.internal:5556/dex
+
+storage:
+  type: memory
+
+# Skip the "Grant Access" consent page — first-party dev IdP; without this the
+# code flow parks on an interactive approval screen after login.
+oauth2:
+  skipApprovalScreen: true
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+  - id: audiobookshelf
+    secret: colophon-dex-secret
+    name: Audiobookshelf
+    redirectURIs:
+      - http://localhost:13378/auth/openid/callback
+      - http://localhost:13378/auth/openid/mobile-redirect
+
+enablePasswordDB: true
+
+staticPasswords:
+  # password: colophon-oidc (bcrypt via `htpasswd -bnBC 10 "" colophon-oidc | tr -d ':\n'`)
+  - email: oidc@colophon.dev
+    hash: "$2y$10$jphZMH27SPFDEIt/lWZwHOifwKWdWQinBAc2BE5iruNUruOod2P.e"
+    username: oidc
+    userID: 1d1c1e0a-0000-4000-8000-000000000001
