@@ -5,14 +5,13 @@ import Testing
 /// Live OIDC code-flow contract test against the dev stack (Dex + ABS).
 ///
 /// Gated two ways, matching the plan:
-///  1. Suite-level: only enabled when `ABS_CONTRACT_URL` is set. In CI / the current
-///     environment (Task 5's Dex stack not yet landed) the var is unset, so the suite
-///     SKIPS cleanly and never touches the network.
+///  1. Suite-level: only enabled when `ABS_CONTRACT_URL` is set, so CI and offline runs
+///     SKIP cleanly and never touch the network.
 ///  2. Runtime: even when enabled, the single test first checks `GET /status` and no-ops
 ///     unless `openid` is an active auth method — so pointing `ABS_CONTRACT_URL` at a
 ///     password-only server doesn't spuriously fail.
 ///
-/// Run (after Task 5 lands `make server-up && make seed` with Dex active):
+/// Run (`make server-up && make seed` first, Dex active):
 ///   ABS_CONTRACT_URL=http://localhost:13378 swift test --filter OIDCContractTests
 @Suite(.enabled(if: ProcessInfo.processInfo.environment["ABS_CONTRACT_URL"] != nil))
 struct OIDCContractTests {
@@ -28,28 +27,36 @@ struct OIDCContractTests {
         #expect(response.user.accessToken?.isEmpty == false)
     }
 
-    /// A curl-equivalent "browser": walks the Dex hosted-login form headlessly using its own
-    /// cookie jar, per the Task 5 spike transcript. Receives the ABS-issued authorize URL and
-    /// must return the `colophon://oauth?code=...&state=...` callback URL.
+    /// A curl-equivalent "browser": walks the Dex hosted-login form headlessly, following the
+    /// Task 5 spike transcript (docs/superpowers/spikes/2026-07-oidc-cookies.md). Receives the
+    /// ABS-issued authorize URL and returns the `colophon://oauth?code&state` callback URL.
     ///
-    /// NOTE: unverified until Task 5's Dex stack lands — the selectors/redirect chain below are
-    /// derived from the plan's spike description and will be validated during that task's live run.
+    /// One ephemeral session ≙ one browser: its cookie jar persists across every hop, and the
+    /// delegate follows every redirect EXCEPT the final app-scheme one (URLSession can't open
+    /// `colophon://`), which it surfaces as the mobile-redirect 302's `Location` header. The
+    /// browser deliberately shares NO cookies with OIDCFlow's transport — the spike proved the
+    /// browser-side hops (Dex pages, /auth/openid/mobile-redirect) are session-independent.
     @Sendable static func scriptedDexBrowser(_ authorizeURL: URL) async throws -> URL {
         let config = URLSessionConfiguration.ephemeral
         config.httpCookieAcceptPolicy = .always
-        let session = URLSession(configuration: config)
+        let session = URLSession(configuration: config,
+                                 delegate: CallbackCaptureDelegate(scheme: "colophon"),
+                                 delegateQueue: nil)
 
-        // 1. GET the Dex authorize page (follows Dex's internal redirect to the login form).
-        let (page, _) = try await session.data(from: authorizeURL)
+        // Transcript steps 2–3: GET the Dex authorize URL; Dex 302s through its `local`
+        // connector to the login form. The final 200 is the form page.
+        let (page, pageResponse) = try await session.data(from: authorizeURL)
         let html = String(decoding: page, as: UTF8.self)
+        let formBase = pageResponse.url ?? authorizeURL
 
-        // 2. Extract the login form action (Dex renders `<form ... action="/dex/auth/local/login?...">`).
-        guard let action = firstMatch(in: html, pattern: #"action="([^"]*/login[^"]*)""#),
-              let formURL = URL(string: action, relativeTo: authorizeURL) else {
+        // Transcript step 4: the form is
+        //   <form method="post" action="/dex/auth/local/login?back=&amp;state=...">
+        // — the action is HTML-escaped in the page source and relative to the Dex host.
+        guard let rawAction = firstMatch(in: html, pattern: #"action="([^"]*/login[^"]*)""#),
+              let formURL = URL(string: rawAction.replacingOccurrences(of: "&amp;", with: "&"),
+                                relativeTo: formBase) else {
             throw OIDCError.missingAuthorizeURL
         }
-
-        // 3. POST the static test-user credentials.
         var post = URLRequest(url: formURL.absoluteURL)
         post.httpMethod = "POST"
         post.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
@@ -58,10 +65,10 @@ struct OIDCContractTests {
                            .init(name: "password", value: "colophon-oidc")]
         post.httpBody = body.percentEncodedQuery.map { Data($0.utf8) }
 
-        // 4. Follow the approval/redirect chain until Dex bounces back to ABS, which in turn
-        //    302s to `colophon://oauth?...`. A no-redirect transport surfaces that final hop.
-        let noRedirect = URLSession(configuration: config, delegate: CallbackCaptureDelegate(scheme: "colophon"), delegateQueue: nil)
-        let (_, response) = try await noRedirect.data(for: post)
+        // Transcript steps 4–5: dex (skipApprovalScreen: true) 303s straight to ABS's
+        // /auth/openid/mobile-redirect, which 302s to colophon://oauth?code&state — the
+        // delegate stops there, so that 302 is the response we see.
+        let (_, response) = try await session.data(for: post)
         if let http = response as? HTTPURLResponse,
            let location = http.value(forHTTPHeaderField: "Location"),
            location.hasPrefix("colophon://"),
