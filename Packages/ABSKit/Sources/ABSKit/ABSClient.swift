@@ -65,7 +65,10 @@ public final class ABSClient: Sendable {
         try await authorizedSend(get("api/libraries/\(libraryID)/filterdata"), as: FilterData.self)
     }
 
-    /// `GET /api/libraries/:id/series?limit=` — `limit` is REQUIRED by the server (verified live).
+    /// `GET /api/libraries/:id/series?limit=`. The server accepts an omitted `limit` (returns
+    /// HTTP 200 with `limit:0` and no results — verified live, NOT a 400), so `limit` is a
+    /// required *parameter here* purely because a call is only useful with an explicit positive
+    /// value: `limit:0` yields an empty `results`. Pass the page size you actually want.
     public func series(libraryID: String, limit: Int) async throws -> [SeriesSummary] {
         var comps = URLComponents(url: baseURL.appending(path: "api/libraries/\(libraryID)/series"),
                                   resolvingAgainstBaseURL: false)!

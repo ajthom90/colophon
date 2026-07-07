@@ -91,6 +91,18 @@ private func fixture(_ name: String) throws -> Data {
         #expect(authorEntity.numBooks == 1)
     }
 
+    /// A shelf entity with none of the discriminating keys (`media`/`recentEpisode`/
+    /// `name`+`numBooks`) must decode as `.unknown` — NOT silently misclassify as an all-nil
+    /// `.episode` (regression guard for the tolerant-but-not-lax discrimination).
+    @Test func unknownShelfEntityShapeFallsBackToUnknown() throws {
+        let json = #"{"id":"x","weirdField":1}"#
+        let entity = try decoder.decode(ShelfEntity.self, from: Data(json.utf8))
+        guard case .unknown = entity else {
+            Issue.record("expected .unknown, got \(entity)")
+            return
+        }
+    }
+
     @Test func decodesFilterData() throws {
         let f = try decoder.decode(FilterData.self, from: fixture("filterdata"))
         #expect(f.authors.map(\.name) == ["Sun Tzu"])

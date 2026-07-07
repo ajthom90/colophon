@@ -135,11 +135,14 @@ public struct Shelf: Decodable, Sendable, Identifiable {
 }
 
 /// Tolerant sum type over the three live/source-verified personalized-shelf entity shapes.
-/// Discriminated structurally (the entity itself carries no explicit `type` tag): a
-/// `recentEpisode` key marks a podcast episode entity, a `media` key (with no `recentEpisode`)
-/// marks a book/library-item entity, and a `name`+`numBooks` pair (no `media`) marks an author
-/// entity. Anything that still fails to decode falls back to `.unknown` rather than throwing, so
-/// one unrecognized/future shelf entity never breaks the whole personalized response.
+/// Discriminated structurally (the entity itself carries no explicit `type` tag) by requiring a
+/// DISTINGUISHING key per variant — the episode/author/book structs all have permissive
+/// (mostly-optional) fields, so a `try?`-cascade over them would misclassify any bare object;
+/// the discriminator check below is what makes classification meaningful:
+/// - `recentEpisode` present → podcast-episode entity (its one distinguishing key per source).
+/// - else `media` present → book/library-item entity (book entities nest `media.metadata`).
+/// - else `name` AND `numBooks` present → author entity.
+/// - else → `.unknown` (a genuinely unrecognized/future shape never throws or misdecodes).
 public enum ShelfEntity: Decodable, Sendable {
     case book(ShelfBookEntity)
     case author(ShelfAuthorEntity)
@@ -150,14 +153,12 @@ public enum ShelfEntity: Decodable, Sendable {
 
     public init(from decoder: Decoder) throws {
         let probe = try decoder.container(keyedBy: DiscriminatorKeys.self)
-        if probe.contains(.recentEpisode), let episode = try? ShelfEpisodeEntity(from: decoder) {
-            self = .episode(episode)
-        } else if probe.contains(.media), let book = try? ShelfBookEntity(from: decoder) {
-            self = .book(book)
-        } else if probe.contains(.name), probe.contains(.numBooks), let author = try? ShelfAuthorEntity(from: decoder) {
-            self = .author(author)
-        } else if let episode = try? ShelfEpisodeEntity(from: decoder) {
-            self = .episode(episode)
+        if probe.contains(.recentEpisode) {
+            self = .episode(try ShelfEpisodeEntity(from: decoder))
+        } else if probe.contains(.media) {
+            self = .book(try ShelfBookEntity(from: decoder))
+        } else if probe.contains(.name), probe.contains(.numBooks) {
+            self = .author(try ShelfAuthorEntity(from: decoder))
         } else {
             self = .unknown
         }
@@ -241,9 +242,11 @@ public struct FilterSeries: Decodable, Sendable, Identifiable, Hashable {
     public let name: String
 }
 
-/// One row from `GET /api/libraries/:id/series?limit=` (`limit` is REQUIRED by the server —
-/// verified live). This dev fixture's library has zero series (`series.json` captures the empty
-/// `{results:[],total:0,...}` envelope) — `books` is source-verified only, not live-captured:
+/// One row from `GET /api/libraries/:id/series?limit=`. The server ACCEPTS an omitted `limit`
+/// (verified live: `GET .../series` with no `limit` returns HTTP 200 `{results:[],total:0,
+/// limit:0,...}`, NOT a 400) — but `limit:0` yields zero results, so the app must pass an
+/// explicit `limit` to get rows back. This dev fixture's library has zero series (`series.json`
+/// captures the empty envelope) — `books` is source-verified only, not live-captured:
 /// `seriesFilters.getFilteredSeries` maps each series' books via `LibraryItem.toOldJSONMinified()`,
 /// the same minified shape as `LibraryItemSummary`. A richer seed (M1c-c) would strengthen this
 /// to a live-captured non-empty fixture.
@@ -334,6 +337,11 @@ public struct SearchNamedCount: Decodable, Sendable {
     public let numItems: Int?
 }
 
+/// A `series` search bucket hit. Source-verified only, not live-captured: both search fixtures
+/// (`search-art.json`/`search-sun.json`) have an empty `series:[]` because the seeded library
+/// has no series. `libraryItemsBookFilters.search` maps each hit to `{series, books[]}` where
+/// `books` are `LibraryItem.toOldJSON()` rows. M1c-c should tighten this against a live series
+/// fixture.
 public struct SearchSeriesHit: Decodable, Sendable {
     public let series: SeriesSummary
     public let books: [LibraryItemSummary]?
