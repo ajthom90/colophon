@@ -12,6 +12,13 @@ final class AppState {
     var phase: Phase = .disconnected
     var errorMessage: String?
     var client: ABSClient?
+    /// Non-blocking "couldn't refresh" banner for `LibraryItemsView`, distinct from
+    /// `errorMessage` (which drives the blocking playback/connect alert). Set by `refreshItems`
+    /// only when the refresh failed AND the cache already had rows for that library (so there's
+    /// a still-usable screen worth keeping up); cleared on the next successful refresh. When the
+    /// cache is empty, `refreshItems` rethrows instead and the existing
+    /// loadError/ContentUnavailableView path in `LibraryItemsView` handles it.
+    private(set) var refreshBanner: String?
     let playback = PlaybackController(backend: AVQueuePlayerBackend())
     let cache: LibraryCacheStore
     let coverStore: CoverStore
@@ -187,12 +194,18 @@ final class AppState {
                 connectionID: connectionID, itemID: update.itemID, episodeID: update.episodeID,
                 currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate))
         case .progressBatch(let updates):
-            for update in updates {
-                try? cache.upsertProgress(CachedProgress(
+            let batch = updates.map { update in
+                CachedProgress(
                     connectionID: connectionID, itemID: update.itemID, episodeID: update.episodeID,
-                    currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate))
+                    currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate)
             }
-        case .itemChanged, .itemsChanged, .itemRemoved:
+            try? cache.upsertProgressBatch(batch)
+        case .itemChanged, .itemsChanged:
+            if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
+        case .itemRemoved(let id):
+            // Precise deletion first (instant, no round trip) — the coarse re-page below is a
+            // safety net for anything else the same event batch implies, not the primary path.
+            try? cache.deleteItem(connectionID: connectionID, itemID: id)
             if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
         }
     }
@@ -229,25 +242,65 @@ final class AppState {
     /// Pages `client.items` (50/page) into the cache until the server-reported total is
     /// satisfied or a 20-page (1000-item) cap is hit — a deliberate M1a limit; full unbounded
     /// paging is out of scope until it's needed.
+    ///
+    /// A completed page-through (every item seen, uncapped) reconciles via `replaceItems` so
+    /// items the server no longer reports (deleted/moved libraries) disappear from the cache —
+    /// otherwise a capped/interrupted page-through only upserts what it saw, exactly like before.
+    ///
+    /// On outright failure (network/server error), a library the cache already has content for
+    /// gets a non-blocking `refreshBanner` instead of throwing — the existing (possibly stale)
+    /// items stay on screen. A library the cache has nothing for still throws, preserving
+    /// `LibraryItemsView`'s existing loadError/ContentUnavailableView path.
     func refreshItems(libraryID: String) async throws {
         guard let client, let connectionID = activeConnectionID else {
             throw ABSError.notAuthenticated
         }
         activeLibraryID = libraryID
         let limit = 50
-        var accumulated = 0
-        for page in 0..<20 {
-            let result = try await client.items(libraryID: libraryID, limit: limit, page: page)
-            let mapped = result.results.map { item in
-                CachedItem(id: item.id, connectionID: connectionID, libraryID: libraryID,
-                          title: item.media.metadata.title ?? "Untitled",
-                          authorName: item.media.metadata.authorName,
-                          duration: item.media.duration, updatedAt: item.updatedAt)
+        var accumulated: [CachedItem] = []
+        var lastTotal = 0
+        var completed = false
+        do {
+            for page in 0..<20 {
+                let result = try await client.items(libraryID: libraryID, limit: limit, page: page)
+                lastTotal = result.total
+                accumulated += result.results.map { item in
+                    CachedItem(id: item.id, connectionID: connectionID, libraryID: libraryID,
+                              title: item.media.metadata.title ?? "Untitled",
+                              authorName: item.media.metadata.authorName,
+                              duration: item.media.duration, updatedAt: item.updatedAt)
+                }
+                if result.results.isEmpty || accumulated.count >= result.total {
+                    completed = true
+                    break
+                }
             }
-            try cache.upsertItemsPage(mapped, connectionID: connectionID, libraryID: libraryID)
-            accumulated += result.results.count
-            if result.results.isEmpty || accumulated >= result.total { break }
+        } catch {
+            if let existing = try? cache.items(connectionID: connectionID, libraryID: libraryID),
+               !existing.isEmpty {
+                refreshBanner = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                return
+            }
+            throw error
         }
+        if completed {
+            // replaceItems with [] wipes the library's cache — only reached after a completed
+            // page-through; guarded below so a lying/failed response that reports a non-zero
+            // total but hands back zero items can never nuke a good cache.
+            if !(lastTotal > 0 && accumulated.isEmpty) {
+                try cache.replaceItems(accumulated, connectionID: connectionID, libraryID: libraryID)
+            }
+        } else {
+            try cache.upsertItemsPage(accumulated, connectionID: connectionID, libraryID: libraryID)
+        }
+        refreshBanner = nil
+    }
+
+    /// Retry hook for the `RefreshBanner`'s button — re-runs `refreshItems` against whatever
+    /// library was last open. A no-op if nothing has been opened yet (banner can't be showing).
+    func retryRefresh() {
+        guard let libraryID = activeLibraryID else { return }
+        Task { try? await refreshItems(libraryID: libraryID) }
     }
 
     /// Retire the current session completely (ordering matters: flush → detach sync callback →

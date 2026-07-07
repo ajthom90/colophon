@@ -44,6 +44,11 @@ struct LibraryItemsView: View {
         }
         .fontDesign(.serif)
         .navigationTitle(library.name)
+        .overlay(alignment: .top) {
+            if !items.isEmpty, let banner = app.refreshBanner {
+                RefreshBanner(message: banner, retry: { app.retryRefresh() })
+            }
+        }
         .task(id: library.id) {
             do {
                 for try await value in app.cache.observeItems(connectionID: library.connectionID, libraryID: library.id) {

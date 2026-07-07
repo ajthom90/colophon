@@ -35,7 +35,7 @@ struct ColophonApp: App {
                 if app.phase == .connected {
                     NavigationStack { LibrariesView() }
                         .safeAreaInset(edge: .bottom) { PlayerBarView() }
-                        .alert("Playback error", isPresented: Binding(
+                        .alert("Something went wrong", isPresented: Binding(
                             get: { app.errorMessage != nil },
                             set: { if !$0 { app.errorMessage = nil } })
                         ) {

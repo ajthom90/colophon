@@ -153,10 +153,9 @@ struct AppStateTests {
         #expect(try app.cache.progress(connectionID: cid, itemID: "i2")?.currentTime == 22)
     }
 
-    /// RED driver for Task 4: `apply(.itemRemoved)` should delete the cached row. Today it
-    /// coarse-refreshes instead, so this stays disabled until Task 4 wires `cache.deleteItem`.
-    @Test(.disabled("wired in Task 4"))
-    func itemRemovedDeletes() async throws {
+    /// `apply(.itemRemoved)` deletes the cached row directly (no round trip needed since
+    /// `activeLibraryID` is unset here — the coarse-refresh fallback never fires).
+    @Test func itemRemovedDeletes() async throws {
         let transport = MockTransport()
         await enqueueSuccessfulConnect(transport)
         let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
@@ -171,5 +170,78 @@ struct AppStateTests {
         await app.apply(.itemRemoved(id: "i1"))
 
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").isEmpty)
+    }
+
+    /// The JSON shape `client.items` decodes — mirrors `ABSKitTests/Fixtures/items_page.json`,
+    /// trimmed to just the fields `refreshItems` maps into `CachedItem`.
+    private func itemsPageJSON(total: Int, results: [String] = []) -> String {
+        let entries = results.map { entryID in
+            #"{"id":"\#(entryID)","updatedAt":1,"media":{"duration":10,"metadata":{"title":"Fresh \#(entryID)","authorName":null}}}"#
+        }.joined(separator: ",")
+        return #"{"results":[\#(entries)],"total":\#(total),"limit":50,"page":0}"#
+    }
+
+    /// A `refreshItems` failure (transport has nothing queued for `/items`, so `MockTransport`
+    /// throws) surfaces as a non-blocking `refreshBanner` — not `errorMessage` — when the cache
+    /// already has rows for that library, and those rows are left untouched.
+    @Test func refreshFailureWithCachedItemsSetsBanner() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "i1", connectionID: cid, libraryID: "lib1", title: "Cached",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        #expect(app.refreshBanner != nil)
+        #expect(app.errorMessage == nil)
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 1)
+    }
+
+    /// A completed (uncapped) page-through reconciles: a full single page whose `results` no
+    /// longer includes a previously-cached item makes that item's row disappear.
+    @Test func completedRefreshReconciles() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "stale", connectionID: cid, libraryID: "lib1", title: "Stale",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 1, results: ["i1"]))
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        let items = try app.cache.items(connectionID: cid, libraryID: "lib1")
+        #expect(items.map(\.id) == ["i1"])
+    }
+
+    /// A completed page-through that reports a non-zero total but hands back zero items (a
+    /// lying/broken response) must NOT wipe the cache — the guard in `refreshItems` skips
+    /// `replaceItems` entirely in that case.
+    @Test func emptyResultWithNonZeroTotalDoesNotWipe() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "i1", connectionID: cid, libraryID: "lib1", title: "Kept",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 5, results: []))
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 1)
     }
 }
