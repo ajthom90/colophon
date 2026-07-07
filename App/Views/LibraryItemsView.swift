@@ -45,8 +45,9 @@ struct LibraryItemsView: View {
         .fontDesign(.serif)
         .navigationTitle(library.name)
         .overlay(alignment: .top) {
-            if !items.isEmpty, let banner = app.refreshBanner {
-                RefreshBanner(message: banner, retry: { app.retryRefresh() })
+            // Only this library's failure — a banner for some other library never shows here.
+            if !items.isEmpty, let banner = app.refreshBanner, banner.libraryID == library.id {
+                RefreshBanner(message: banner.message, retry: { app.retryRefresh(libraryID: library.id) })
             }
         }
         .task(id: library.id) {

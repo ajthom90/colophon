@@ -15,10 +15,12 @@ final class AppState {
     /// Non-blocking "couldn't refresh" banner for `LibraryItemsView`, distinct from
     /// `errorMessage` (which drives the blocking playback/connect alert). Set by `refreshItems`
     /// only when the refresh failed AND the cache already had rows for that library (so there's
-    /// a still-usable screen worth keeping up); cleared on the next successful refresh. When the
-    /// cache is empty, `refreshItems` rethrows instead and the existing
-    /// loadError/ContentUnavailableView path in `LibraryItemsView` handles it.
-    private(set) var refreshBanner: String?
+    /// a still-usable screen worth keeping up); tagged with the failing library's ID so a view
+    /// for a *different* library never shows someone else's failure, and cleared on the next
+    /// successful refresh of that same library. When the cache is empty, `refreshItems` rethrows
+    /// instead and the existing loadError/ContentUnavailableView path in `LibraryItemsView`
+    /// handles it.
+    private(set) var refreshBanner: (libraryID: String, message: String)?
     let playback = PlaybackController(backend: AVQueuePlayerBackend())
     let cache: LibraryCacheStore
     let coverStore: CoverStore
@@ -104,9 +106,12 @@ final class AppState {
         // Tear down the previous connection's socket BEFORE any await, and clear the active
         // connection ID with it: otherwise the old socket stays live across the awaits below
         // while `activeConnectionID` may already reference the new connection, and a stray
-        // server-A progress event would be upserted under server-B's ID.
+        // server-A progress event would be upserted under server-B's ID. The refresh banner is
+        // reset here too — a stale "couldn't refresh" from the previous connection's library
+        // must not bleed into the new connection (library IDs could even collide across servers).
         stopSocket()
         activeConnectionID = nil
+        refreshBanner = nil
         phase = .connecting
         do {
             let transport = self.transport
@@ -278,7 +283,8 @@ final class AppState {
         } catch {
             if let existing = try? cache.items(connectionID: connectionID, libraryID: libraryID),
                !existing.isEmpty {
-                refreshBanner = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                refreshBanner = (libraryID: libraryID,
+                                 message: (error as? LocalizedError)?.errorDescription ?? error.localizedDescription)
                 return
             }
             throw error
@@ -293,13 +299,14 @@ final class AppState {
         } else {
             try cache.upsertItemsPage(accumulated, connectionID: connectionID, libraryID: libraryID)
         }
-        refreshBanner = nil
+        // Success clears only this library's banner — another library's failure stays visible
+        // on its own screen until *it* refreshes successfully.
+        if refreshBanner?.libraryID == libraryID { refreshBanner = nil }
     }
 
-    /// Retry hook for the `RefreshBanner`'s button — re-runs `refreshItems` against whatever
-    /// library was last open. A no-op if nothing has been opened yet (banner can't be showing).
-    func retryRefresh() {
-        guard let libraryID = activeLibraryID else { return }
+    /// Retry hook for the `RefreshBanner`'s button — re-runs `refreshItems` for the library the
+    /// banner belongs to (the view passes its own `library.id`, no `activeLibraryID` indirection).
+    func retryRefresh(libraryID: String) {
         Task { try? await refreshItems(libraryID: libraryID) }
     }
 

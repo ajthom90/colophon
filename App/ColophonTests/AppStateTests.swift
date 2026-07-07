@@ -172,6 +172,30 @@ struct AppStateTests {
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").isEmpty)
     }
 
+    /// `apply(.itemRemoved)` with a library open (`activeLibraryID` set): the precise delete
+    /// happens AND the coarse re-page fires — the `/items` request is actually made, and the
+    /// removed row stays gone because the served page no longer contains it.
+    @Test func itemRemovedDeletesAndCoarseRefreshesOpenLibrary() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        // Open lib1 (sets activeLibraryID) with a completed page containing both items.
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 2, results: ["doomed", "keep"]))
+        try await app.refreshItems(libraryID: "lib1")
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 2)
+        // The coarse-refresh page the removal event will trigger — "doomed" is absent.
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 1, results: ["keep"]))
+
+        await app.apply(.itemRemoved(id: "doomed"))
+
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").map(\.id) == ["keep"])
+        let itemsRequests = await transport.recorded.filter { ($0.url?.path ?? "").contains("/items") }
+        #expect(itemsRequests.count == 2)   // the open + the event-driven coarse refresh
+    }
+
     /// The JSON shape `client.items` decodes — mirrors `ABSKitTests/Fixtures/items_page.json`,
     /// trimmed to just the fields `refreshItems` maps into `CachedItem`.
     private func itemsPageJSON(total: Int, results: [String] = []) -> String {
@@ -183,7 +207,8 @@ struct AppStateTests {
 
     /// A `refreshItems` failure (transport has nothing queued for `/items`, so `MockTransport`
     /// throws) surfaces as a non-blocking `refreshBanner` — not `errorMessage` — when the cache
-    /// already has rows for that library, and those rows are left untouched.
+    /// already has rows for that library, and those rows are left untouched. The banner carries
+    /// the failing library's ID.
     @Test func refreshFailureWithCachedItemsSetsBanner() async throws {
         let transport = MockTransport()
         await enqueueSuccessfulConnect(transport)
@@ -198,9 +223,36 @@ struct AppStateTests {
 
         try await app.refreshItems(libraryID: "lib1")
 
-        #expect(app.refreshBanner != nil)
+        #expect(app.refreshBanner?.libraryID == "lib1")
+        #expect(app.refreshBanner?.message.isEmpty == false)
         #expect(app.errorMessage == nil)
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 1)
+    }
+
+    /// The banner is tagged with the library that actually failed: fail library B's refresh and
+    /// the banner's `libraryID` is B — a `LibraryItemsView` for library A (which matches on
+    /// `banner.libraryID == library.id`) would not show it.
+    @Test func bannerIsScopedToFailingLibrary() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        // Both libraries have cached content; only libB's refresh fails (nothing queued).
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "a1", connectionID: cid, libraryID: "libA", title: "A",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "libA")
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "b1", connectionID: cid, libraryID: "libB", title: "B",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "libB")
+
+        try await app.refreshItems(libraryID: "libB")
+
+        #expect(app.refreshBanner?.libraryID == "libB")
+        #expect(app.refreshBanner?.libraryID != "libA")
     }
 
     /// A completed (uncapped) page-through reconciles: a full single page whose `results` no
@@ -243,5 +295,26 @@ struct AppStateTests {
         try await app.refreshItems(libraryID: "lib1")
 
         #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 1)
+    }
+
+    /// The complementary guard case: a genuinely empty library (`total == 0`, `results == []`)
+    /// IS a completed page-through, so `replaceItems([])` runs and wipes the stale cached rows —
+    /// the server really has nothing, and keeping ghosts would be the reconciliation bug.
+    @Test func emptyLibraryTotalZeroWipes() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "ghost", connectionID: cid, libraryID: "lib1", title: "Ghost",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 0, results: []))
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").isEmpty)
     }
 }
