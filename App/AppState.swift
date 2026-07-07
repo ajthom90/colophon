@@ -117,16 +117,28 @@ final class AppState {
     /// doc comment. Not awaited by `activateConnection` itself; exists so a fresh activation can
     /// cancel whatever probe preceded it.
     private var probeTask: Task<Void, Never>?
-    /// Monotonic token capturing "the latest connection-mutating user intent." Every flow that
-    /// mutates connection state (`connect`, `connectWithOIDC`, `activateConnection`, `signOut`,
-    /// `removeConnection`) bumps this at entry and captures its value; after every `await` — and in
-    /// the detached `probeTask` — it re-checks `connectionGeneration == myGeneration` before writing
-    /// any shared state or standing up a socket, and bails if a newer flow has superseded it. This
-    /// is the authoritative "am I still the current intent?" guard that composes across all four
-    /// flows, where the per-flow guards (`phase`, `activatingConnectionID`, `activeConnectionID`)
-    /// did not: it stops a slow/abandoned connect from clobbering a newer activation, and stops an
-    /// in-flight probe from resurrecting a connection the user just signed out of or removed.
-    private var connectionGeneration = 0
+    /// Monotonic epoch capturing "the latest connection-mutating user intent" — the ONE
+    /// authoritative "am I still the current intent?" guard. Every flow that mutates connection
+    /// state (`connect`, `connectWithOIDC`, `activateConnection`, `signOut`, `removeConnection`)
+    /// calls `beginConnectionFlow()` once it's committed to actually starting, capturing the
+    /// returned `myEpoch`; after every `await` — and in the detached `probeTask` — it re-checks
+    /// `connectionEpoch == myEpoch` before writing any shared state or standing up a socket, and
+    /// bails if a newer flow has superseded it. It composes across all five flows where the per-flow
+    /// guards (`phase`, `activatingConnectionID`, `activeConnectionID`) did not: it stops a
+    /// slow/abandoned connect from clobbering a newer activation, stops an in-flight probe from
+    /// resurrecting a connection the user just signed out of or removed, and stops an older
+    /// `signOut`/`removeConnection` tail from stomping a newer activation started during its awaits.
+    private var connectionEpoch = 0
+
+    /// Opens a new connection epoch and returns it — the single entry point every connection-mutating
+    /// flow calls exactly once, at the moment it commits to running (for `connect`/`connectWithOIDC`
+    /// that is AFTER URL validation, so an invalid URL that returns early never stales a healthy
+    /// active connection's in-flight probe). Callers capture the return as `myEpoch` and re-check
+    /// `connectionEpoch == myEpoch` after every subsequent await.
+    private func beginConnectionFlow() -> Int {
+        connectionEpoch += 1
+        return connectionEpoch
+    }
 
     /// Every argument defaults to production behavior; tests override them to run entirely
     /// offline (MockTransport, temp-dir cache, FakeSocket, `InMemoryTokenStore` — the Keychain
@@ -182,12 +194,14 @@ final class AppState {
         // Closes the same-frame double-tap window: without this, two rapid taps both race past
         // the stopSocket/ID-nil prefix below and each spins up its own socket, leaking one live.
         guard phase != .connecting else { return }
-        connectionGeneration += 1
-        let myGeneration = connectionGeneration
         errorMessage = nil
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
         }
+        // Bump the epoch only NOW, once URL validation has passed and we're committed to starting a
+        // connection flow. An invalid URL returns above WITHOUT bumping, so it never stales a healthy
+        // active connection's in-flight probe (Asymmetry fix A).
+        let myEpoch = beginConnectionFlow()
         // Tear down the previous connection's socket BEFORE any await, and clear the active
         // connection ID with it: otherwise the old socket stays live across the awaits below
         // while `activeConnectionID` may already reference the new connection, and a stray
@@ -203,28 +217,28 @@ final class AppState {
             let status = try await ABSClient.status(baseURL: url, transport: transport)
             // A newer flow (a fresh activation/connect, or a sign-out) superseded this connect
             // while `/status` was in flight: discard silently — the newer flow owns the state now.
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             try checkVersionGate(status)
             let connection = try findOrCreateConnection(address: url.absoluteString, username: username)
             // Awaited (not fire-and-forget) so migration can never race a fresh login's token
             // save — it must finish moving any legacy entry before `auth.login` writes new ones.
             await TokenMigration.migrateLegacyTokensIfNeeded(
                 from: url.absoluteString, to: connection.id, store: tokenStore)
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             _ = try await auth.login(username: username, password: password)
             // A stale connect whose (possibly minutes-long) login finally landed must NOT clobber
             // the connection a newer activation put in place. Its saved tokens are harmless —
             // keyed by this connection's own id — so just discard without touching shared state.
-            guard connectionGeneration == myGeneration else { return }
-            try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
+            guard connectionEpoch == myEpoch else { return }
+            try await completeConnection(connection: connection, auth: auth, url: url, epoch: myEpoch)
         } catch ABSError.http(status: 401) {
             // Only surface the error / reset state if we're still the current intent — a stale
             // connect must not stopSocket a newer connection nor bounce the user out. If the
             // superseder was a signOut and `completeConnection` had already published (then threw),
             // the bail still clears the stranded publication.
-            guard connectionGeneration == myGeneration else {
+            guard connectionEpoch == myEpoch else {
                 clearStalePublicationIfDisconnected()
                 return
             }
@@ -233,7 +247,7 @@ final class AppState {
             activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = "Wrong username or password"
         } catch {
-            guard connectionGeneration == myGeneration else {
+            guard connectionEpoch == myEpoch else {
                 clearStalePublicationIfDisconnected()
                 return
             }
@@ -261,12 +275,13 @@ final class AppState {
     /// supplies the username up front.
     func connectWithOIDC(serverURL: String, browser: @Sendable (URL) async throws -> URL) async {
         guard phase != .connecting else { return }
-        connectionGeneration += 1
-        let myGeneration = connectionGeneration
         errorMessage = nil
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
         }
+        // Bump only after the normalize/validate prefix, before the awaits — same Asymmetry-fix-A
+        // reasoning as `connect()`: an invalid URL returns above without staling an active probe.
+        let myEpoch = beginConnectionFlow()
         stopSocket()
         activeConnectionID = nil
         refreshBanner = nil
@@ -274,24 +289,24 @@ final class AppState {
         do {
             let transport = self.transport
             let status = try await ABSClient.status(baseURL: url, transport: transport)
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             try checkVersionGate(status)
             let flow = OIDCFlow(serverURL: url, transport: oidcTransport)
             // The browser hop can sit open for minutes; a newer activation/connect in that window
-            // supersedes this one and its `myGeneration` will no longer match below.
+            // supersedes this one and its `myEpoch` will no longer match below.
             let loginResponse = try await flow.authenticate(browser: browser)
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             let connection = try findOrCreateConnection(
                 address: url.absoluteString, username: loginResponse.user.username, authMethod: "openid")
             let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             try await auth.completeOIDC(loginResponse: loginResponse)
-            guard connectionGeneration == myGeneration else { return }
-            try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
+            guard connectionEpoch == myEpoch else { return }
+            try await completeConnection(connection: connection, auth: auth, url: url, epoch: myEpoch)
         } catch {
             // A stale OIDC connect must not tear down or reset a newer connection's state — but
             // it does clear its own stranded publication if a signOut superseded it mid-tail.
-            guard connectionGeneration == myGeneration else {
+            guard connectionEpoch == myEpoch else {
                 clearStalePublicationIfDisconnected()
                 return
             }
@@ -327,7 +342,7 @@ final class AppState {
     /// The tail both sign-in paths share once they hold an authenticated `AuthManager`: build the
     /// client, publish connection state, fetch+cache the library list, and stand up the realtime
     /// socket. Only reached after a successful login/OIDC exchange, so `phase` ends `.connected`.
-    private func completeConnection(connection: CachedConnection, auth: AuthManager, url: URL, generation: Int) async throws {
+    private func completeConnection(connection: CachedConnection, auth: AuthManager, url: URL, epoch myEpoch: Int) async throws {
         let transport = self.transport
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
@@ -344,7 +359,7 @@ final class AppState {
         // "no stale ID while disconnected" invariant holds. Scoped tightly to `.disconnected`
         // (see the helper's doc): a newer activation (`.connected`) or a newer in-flight connect
         // (`.connecting`, which republishes these fields itself) is left untouched.
-        guard connectionGeneration == generation else {
+        guard connectionEpoch == myEpoch else {
             clearStalePublicationIfDisconnected()
             return
         }
@@ -362,7 +377,7 @@ final class AppState {
         phase = .connected
     }
 
-    /// Cleanup for a superseded (stale-generation) connect flow's bail paths. `completeConnection`
+    /// Cleanup for a superseded (stale-epoch) connect flow's bail paths. `completeConnection`
     /// publishes `activeConnectionID`/`client`/`auth` BEFORE its `libraries()` await; if a
     /// signOut/removeConnection supersedes during that await (normalizing a stranded `.connecting`
     /// to `.disconnected` — it can't know this flow had already published), the stale bail — the
@@ -445,10 +460,12 @@ final class AppState {
         guard activatingConnectionID != id else { return }
         activatingConnectionID = id
         defer { activatingConnectionID = nil }
-        // Bump AFTER the same-id reentrancy guard above: a reentrant same-id call bails without a
-        // bump, so it can't invalidate the first (still legitimate) activation's own probe.
-        connectionGeneration += 1
-        let myGeneration = connectionGeneration
+        // Open the epoch AFTER the same-id reentrancy guard above: a reentrant same-id call bails
+        // without opening one, so it can't invalidate the first (still legitimate) activation's own
+        // probe. This minimal same-id guard is retained (folding it into the epoch can't replace it:
+        // a same-id double-tap must bail synchronously, before the token-store await, or it would
+        // build a second `AuthManager`/`ABSClient` and probe — see `activateConnectionReentrancyGuard`).
+        let myEpoch = beginConnectionFlow()
 
         guard let connection = try? cache.connections().first(where: { $0.id == id }),
               let url = URL(string: connection.address) else { return }
@@ -474,49 +491,49 @@ final class AppState {
         guard await tokenStore.tokens(for: id) != nil else {
             // The token lookup is a real suspension point — a newer flow may have superseded us
             // while it was in flight; if so, leave its state alone.
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             client = nil
             auth = nil
             needsSignIn.insert(id)
             return
         }
-        guard connectionGeneration == myGeneration else { return }
+        guard connectionEpoch == myEpoch else { return }
         let auth = AuthManager(baseURL: url, connectionID: id, transport: transport, store: tokenStore)
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
         self.client = client
 
         // The network probe: detached so `activateConnection` returns now, with cached browsing
-        // already live. Every branch re-checks the generation (authoritative — a sign-out/removal
+        // already live. Every branch re-checks the epoch (authoritative — a sign-out/removal
         // or a newer activation of this or another id supersedes this probe) plus `activeConnectionID
         // == id` for id-specificity, since either an in-flight `authorize()` or the `libraries()`
         // that follows can resume long after the user has moved on. A signed-out connection leaves
-        // `activeConnectionID == id`, so without the generation check the probe would RESURRECT it
+        // `activeConnectionID == id`, so without the epoch check the probe would RESURRECT it
         // (needsSignIn.remove, isOnline, socket) for a connection the user just abandoned.
         probeTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await client.authorize()
-                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.needsSignIn.remove(id)
                 self.isOnline = true
                 self.startSocket(url: url, auth: auth)
                 if let libs = try? await client.libraries() {
-                    guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                    guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                     try? self.cache.upsertLibraries(libs.enumerated().map { index, lib in
                         CachedLibrary(id: lib.id, connectionID: id, name: lib.name,
                                       mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
                     }, connectionID: id)
                 }
             } catch ABSError.reauthRequired, ABSError.notAuthenticated {
-                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
                 self.needsSignIn.insert(id)
             } catch {
                 // Host down / transport error: stay in cached-only offline mode. `isOnline ==
                 // false` drives the offline banner; no blocking error alert for an expected
                 // offline case.
-                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
             }
         }
@@ -527,12 +544,17 @@ final class AppState {
     /// cached rows so the user can still browse offline and sign back in later. Marks it
     /// `needsSignIn` so `ConnectionsView` badges it and routes a tap to re-auth.
     func signOut(connectionID id: String) async {
-        // Bump FIRST, before any await: an in-flight `activateConnection` probe for THIS connection
-        // (parked in `authorize()`/`libraries()`) captured the previous generation, so bumping here
-        // immediately makes it stale — when it resumes it will no-op instead of resurrecting the
-        // connection we're signing out (needsSignIn.remove + isOnline + socket for a dead session).
-        connectionGeneration += 1
-        // The bump also makes any in-flight connect/connectWithOIDC bail at its generation guards
+        await performSignOut(connectionID: id, epoch: beginConnectionFlow())
+    }
+
+    /// The sign-out body, run under a caller-owned epoch so `removeConnection` can share ONE epoch
+    /// across its whole flow (it opens the epoch, runs this, then guards its own tail on the same
+    /// value). Opening the epoch FIRST, before any await: an in-flight `activateConnection` probe for
+    /// THIS connection (parked in `authorize()`/`libraries()`) captured the previous epoch, so this
+    /// immediately makes it stale — when it resumes it will no-op instead of resurrecting the
+    /// connection we're signing out (needsSignIn.remove + isOnline + socket for a dead session).
+    private func performSignOut(connectionID id: String, epoch myEpoch: Int) async {
+        // Opening the epoch also makes any in-flight connect/connectWithOIDC bail at its epoch guards
         // — INCLUDING the catch blocks that normally reset `phase` — so a connect mid-flight right
         // now would otherwise strand `phase == .connecting` forever, and both connect entry guards
         // (`guard phase != .connecting`) would refuse every future sign-in. Normalize it here: the
@@ -543,7 +565,13 @@ final class AppState {
         if playingConnectionID == id {
             await retireCurrentSession()
         }
-        if activeConnectionID == id {
+        // Active-state teardown is guarded on the epoch, not just `activeConnectionID == id`
+        // (Asymmetry fix B): a newer activation started during retire's flush/close round-trips —
+        // even a re-activation of THIS same id, which `activeConnectionID == id` alone can't
+        // distinguish — now owns the live socket/client, so this older sign-out must not stomp it.
+        // The id-scoped bookkeeping below (clear tokens, badge, reload) still runs unconditionally
+        // so the signed-out row is genuinely signed out regardless of who is active now.
+        if connectionEpoch == myEpoch, activeConnectionID == id {
             stopSocket()
             isOnline = false
             client = nil
@@ -560,12 +588,19 @@ final class AppState {
     /// folder. If it was the active connection, drops back to a disconnected state so the boot
     /// flow re-routes to `ConnectionsView` (or `ConnectView` when none remain).
     func removeConnection(_ id: String) async {
-        // Generation bump AND `.connecting`-phase normalization both happen inside `signOut`
-        // (unconditionally, before its first await), so every removeConnection path — active or
-        // inactive row — leaves `phase` definite; the branch below only additionally drops a
-        // previously-CONNECTED active row to `.disconnected`.
-        await signOut(connectionID: id)
-        if activeConnectionID == id {
+        // Open ONE epoch for the whole remove flow and thread it through the shared sign-out body,
+        // so this method and its inner sign-out agree on a single "am I still the latest intent"
+        // value (rather than the sign-out opening one this method can't see). Epoch open AND
+        // `.connecting`-phase normalization both happen inside `performSignOut` (unconditionally,
+        // before its first await), so every removeConnection path — active or inactive row — leaves
+        // `phase` definite; the branch below only additionally drops a previously-CONNECTED active
+        // row to `.disconnected`.
+        let myEpoch = beginConnectionFlow()
+        await performSignOut(connectionID: id, epoch: myEpoch)
+        // Same Asymmetry-fix-B guard as the sign-out body: only clear the active session down to
+        // `.disconnected` if we're STILL the latest intent — a newer activation during the awaits
+        // above (its probe, retire, or `tokenStore.clear`) owns `activeConnectionID`/`phase` now.
+        if connectionEpoch == myEpoch, activeConnectionID == id {
             activeConnectionID = nil
             client = nil
             auth = nil

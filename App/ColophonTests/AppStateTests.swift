@@ -664,6 +664,99 @@ struct AppStateTests {
         #expect(app.errorMessage == nil)
     }
 
+    // MARK: - Connection epoch (M1c-a Task 1 — asymmetry fixes)
+
+    /// Asymmetry fix A — an invalid-URL `connect()` must not stale a healthy active connection's
+    /// in-flight probe. Activate `C1` with its `authorize()` parked on a `GatedTransport`; while the
+    /// probe hangs, call `connect()` with a malformed URL string (fails `normalizedServerURL` and
+    /// returns early). Because the epoch bump now lives BELOW URL validation, that early return
+    /// leaves the epoch untouched — so when the gate opens the probe is still the current intent and
+    /// brings `C1` online. Pre-fix, the top-of-`connect` bump would have staled the probe and left
+    /// `C1` permanently offline.
+    @Test func invalidURLConnectDoesNotStaleActiveProbe() async throws {
+        let dir = makeTempDir()
+        let transport = GatedTransport(gatePath: "/api/authorize")   // park the active connection's probe
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: dir, transport: transport, tokenStore: tokenStore)
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+
+        await app.activateConnection("C1")   // returns; the probe is launched and parks on the gate
+        while await transport.requestCount(pathContains: "/api/authorize") == 0 { await Task.yield() }
+        #expect(app.isOnline == false)
+
+        // A malformed URL fails validation and returns before any epoch bump or socket teardown.
+        await app.connect(serverURL: "no-scheme-here", username: "root", password: "pw")
+        #expect(app.errorMessage == "Invalid server URL")
+        #expect(app.activeConnectionID == "C1")   // the rejected connect left the active id untouched
+
+        // Release the gate: the probe is STILL the current intent (the invalid connect never bumped
+        // the epoch), so it brings C1 online with a live socket.
+        await transport.enqueue(status: 200, json: "{}")           // the probe's /api/authorize
+        await transport.enqueue(status: 200, json: librariesOK)    // the probe's /libraries
+        await transport.openGate()
+        while !app.isOnline { await Task.yield() }
+        #expect(app.isOnline == true)
+        #expect(app.activeConnectionID == "C1")
+    }
+
+    /// Asymmetry fix B — a signOut whose owning-session retire is parked mid-await must not let its
+    /// tail stomp a newer activation started during that await. Connect `A` and start playback (so
+    /// `signOut(A)`'s retire does flush/close round-trips), gate `/close` so the retire parks, then
+    /// activate `B` (bumps the epoch, brings B online with its own socket). Release the gate: the
+    /// stale signOut tail no-ops its active-state teardown on the epoch guard, so B's
+    /// activeConnectionID/isOnline/socket survive — while A is still genuinely signed out (its
+    /// id-scoped bookkeeping — session retired, tokens cleared, badge set — still runs).
+    @Test func signOutTailDoesNotStompNewerActivation() async throws {
+        let dir = makeTempDir()
+        let transport = GatedTransport(gatePath: "/close")   // park signOut's retire on the session close
+        await transport.enqueue(status: 200, json: statusOK)          // A connect: /status
+        await transport.enqueue(status: 200, json: loginOK)          // A connect: /login
+        await transport.enqueue(status: 200, json: librariesOK)      // A connect: /libraries
+        await transport.enqueue(status: 200, json: playSessionJSON)  // A: /play
+        // Four 200s covering, in removeFirst order: a possible flush /sync, B probe /api/authorize,
+        // B probe /libraries, and the gated /close (served last on gate open). B comes online right
+        // after its authorize regardless of what /libraries decodes, so plain "{}" bodies suffice.
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: "{}")
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: dir, transport: transport, tokenStore: tokenStore)
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        let aID = try #require(app.activeConnectionID)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+
+        // The newer connection, seeded with tokens so its probe comes online with a socket.
+        try app.cache.upsertConnection(CachedConnection(id: "B", address: "http://b:13378", name: "B",
+                                                        username: "root", authMethod: "local", sortIndex: 1))
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "B")
+
+        // Sign out A (owns playback): its retire parks on the gated /close.
+        let signOutTask = Task { await app.signOut(connectionID: aID) }
+        while await transport.requestCount(pathContains: "/close") == 0 { await Task.yield() }
+
+        // While the signOut tail is parked, activate B — bumps the epoch and brings B online.
+        await app.activateConnection("B")
+        #expect(app.activeConnectionID == "B")
+        while !app.isOnline { await Task.yield() }   // B's probe consumed authorize, its socket is up
+
+        // Release /close: the retire completes and the stale signOut tail runs against a superseded epoch.
+        await transport.openGate()
+        await signOutTask.value
+
+        #expect(app.activeConnectionID == "B")               // newer activation survives
+        #expect(app.isOnline == true)                        // B's online/socket not torn down by the tail
+        #expect(app.playback.isPlaying == false)             // A's owning session was retired
+        #expect(app.needsSignIn.contains(aID))               // A genuinely signed out
+        #expect(await tokenStore.tokens(for: aID) == nil)    // A's tokens cleared
+        #expect(!app.needsSignIn.contains("B"))              // B is online, not badged
+    }
+
     // MARK: - OIDC
 
     /// A canned OIDC browser closure: ignores the authorize URL and returns a fixed
