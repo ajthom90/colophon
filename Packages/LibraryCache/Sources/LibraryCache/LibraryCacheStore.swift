@@ -8,8 +8,21 @@ public struct LibraryCacheStore: Sendable {
         try FileManager.default.createDirectory(
             at: databaseURL.deletingLastPathComponent(),
             withIntermediateDirectories: true)
-        pool = try DatabasePool(path: databaseURL.path)
+        do {
+            pool = try Self.openAndMigrate(at: databaseURL)
+        } catch {
+            // Corrupt or incompatible store: the cache is reconstructable from the server — recreate.
+            for suffix in ["", "-wal", "-shm"] {
+                try? FileManager.default.removeItem(atPath: databaseURL.path + suffix)
+            }
+            pool = try Self.openAndMigrate(at: databaseURL)
+        }
+    }
+
+    private static func openAndMigrate(at url: URL) throws -> DatabasePool {
+        let pool = try DatabasePool(path: url.path)
         try Schema.migrator.migrate(pool)
+        return pool
     }
 
     public func upsertConnection(_ c: CachedConnection) throws {
@@ -46,6 +59,46 @@ public struct LibraryCacheStore: Sendable {
                                                                     "episodeID": p.episodeID]),
                existing.lastUpdate > p.lastUpdate { return }   // last-write-wins by server timestamp
             try p.upsert(db)
+        }
+    }
+
+    /// Batched progress sync: skips rows that are stale OR unchanged (`>=`, stronger than the
+    /// single-row `>` above) so a re-sync of already-current progress never churns observers.
+    public func upsertProgressBatch(_ batch: [CachedProgress]) throws {
+        try pool.write { db in
+            for p in batch {
+                if let existing = try CachedProgress.fetchOne(db, key: ["connectionID": p.connectionID,
+                                                                        "itemID": p.itemID,
+                                                                        "episodeID": p.episodeID]),
+                   existing.lastUpdate >= p.lastUpdate { continue }
+                try p.upsert(db)
+            }
+        }
+    }
+
+    /// Removes a single item (and, via the FTS5 `synchronize` trigger, its search index row).
+    public func deleteItem(connectionID: String, itemID: String) throws {
+        try pool.write { db in
+            _ = try CachedItem.filter(Column("connectionID") == connectionID
+                                       && Column("id") == itemID).deleteAll(db)
+        }
+    }
+
+    /// Reconciles a library page's full item list against the cache: deletes rows scoped to
+    /// (connectionID, libraryID) that are absent from `items`, then upserts the rest. Progress
+    /// rows are untouched — the server owns their lifecycle independently of item paging.
+    public func replaceItems(_ items: [CachedItem], connectionID: String, libraryID: String) throws {
+        try pool.write { db in
+            let ids = items.map(\.id)
+            try CachedItem.filter(Column("connectionID") == connectionID
+                                   && Column("libraryID") == libraryID
+                                   && !ids.contains(Column("id"))).deleteAll(db)
+            for item in items {
+                var item = item
+                item.connectionID = connectionID
+                item.libraryID = libraryID
+                try item.upsert(db)
+            }
         }
     }
 

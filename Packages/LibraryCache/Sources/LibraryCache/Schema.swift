@@ -3,6 +3,9 @@ import GRDB
 enum Schema {
     static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
+        #if DEBUG
+        migrator.eraseDatabaseOnSchemaChange = true
+        #endif
         migrator.registerMigration("v1") { db in
             try db.create(table: "cachedConnection") { t in
                 t.primaryKey("id", .text)
@@ -13,20 +16,22 @@ enum Schema {
                 t.column("sortIndex", .integer).notNull()
             }
             try db.create(table: "cachedLibrary") { t in
-                t.primaryKey("id", .text)
+                t.column("id", .text).notNull()
                 t.column("connectionID", .text).notNull().indexed()
                 t.column("name", .text).notNull()
                 t.column("mediaType", .text).notNull()
                 t.column("displayOrder", .integer).notNull()
+                t.primaryKey(["connectionID", "id"])
             }
             try db.create(table: "cachedItem") { t in
-                t.primaryKey("id", .text)
+                t.column("id", .text).notNull()
                 t.column("connectionID", .text).notNull().indexed()
                 t.column("libraryID", .text).notNull().indexed()
                 t.column("title", .text).notNull()
                 t.column("authorName", .text)
                 t.column("duration", .double)
                 t.column("updatedAt", .integer)
+                t.primaryKey(["connectionID", "id"])
             }
             try db.create(table: "cachedProgress") { t in
                 t.column("connectionID", .text).notNull()

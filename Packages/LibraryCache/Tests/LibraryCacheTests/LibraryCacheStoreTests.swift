@@ -91,4 +91,58 @@ import Testing
         let next = try await iterator.next()
         #expect(next?.map(\.id) == ["L1"])
     }
+
+    @Test func sameServerIDsCoexistAcrossConnections() throws {
+        let store = try makeStore()
+        let a = CachedItem(id: "i1", connectionID: "C1", libraryID: "L1", title: "A", authorName: nil, duration: 1, updatedAt: 1)
+        let b = CachedItem(id: "i1", connectionID: "C2", libraryID: "L1", title: "B", authorName: nil, duration: 1, updatedAt: 1)
+        try store.upsertItemsPage([a], connectionID: "C1", libraryID: "L1")
+        try store.upsertItemsPage([b], connectionID: "C2", libraryID: "L1")
+        #expect(try store.items(connectionID: "C1", libraryID: "L1").map(\.title) == ["A"])
+        #expect(try store.items(connectionID: "C2", libraryID: "L1").map(\.title) == ["B"])   // not clobbered
+    }
+
+    @Test func deleteItemRemovesRowAndFTS() throws {
+        let store = try makeStore()
+        try store.upsertItemsPage([CachedItem(id: "i1", connectionID: "C1", libraryID: "L1",
+                                              title: "Dracula", authorName: nil, duration: 1, updatedAt: 1)],
+                                  connectionID: "C1", libraryID: "L1")
+        try store.deleteItem(connectionID: "C1", itemID: "i1")
+        #expect(try store.items(connectionID: "C1", libraryID: "L1").isEmpty)
+        #expect(try store.searchItems(connectionID: "C1", query: "drac").isEmpty)
+    }
+
+    @Test func replaceItemsReconcilesAbsentRows() throws {
+        let store = try makeStore()
+        let keep = CachedItem(id: "i1", connectionID: "C1", libraryID: "L1", title: "Keep", authorName: nil, duration: 1, updatedAt: 1)
+        let gone = CachedItem(id: "i2", connectionID: "C1", libraryID: "L1", title: "Gone", authorName: nil, duration: 1, updatedAt: 1)
+        let other = CachedItem(id: "i9", connectionID: "C2", libraryID: "L1", title: "OtherConn", authorName: nil, duration: 1, updatedAt: 1)
+        try store.upsertItemsPage([keep, gone], connectionID: "C1", libraryID: "L1")
+        try store.upsertItemsPage([other], connectionID: "C2", libraryID: "L1")
+        try store.replaceItems([keep], connectionID: "C1", libraryID: "L1")
+        #expect(try store.items(connectionID: "C1", libraryID: "L1").map(\.id) == ["i1"])
+        #expect(try store.items(connectionID: "C2", libraryID: "L1").map(\.id) == ["i9"])     // scoped: untouched
+    }
+
+    @Test func progressBatchSkipsStaleAndUnchanged() throws {
+        let store = try makeStore()
+        try store.upsertProgress(CachedProgress(connectionID: "C1", itemID: "i1", episodeID: nil,
+                                                currentTime: 50, isFinished: false, lastUpdate: 200))
+        try store.upsertProgressBatch([
+            CachedProgress(connectionID: "C1", itemID: "i1", episodeID: nil, currentTime: 10, isFinished: false, lastUpdate: 100), // stale
+            CachedProgress(connectionID: "C1", itemID: "i1", episodeID: nil, currentTime: 50, isFinished: false, lastUpdate: 200), // unchanged (>= skips)
+            CachedProgress(connectionID: "C1", itemID: "i2", episodeID: nil, currentTime: 7, isFinished: false, lastUpdate: 300),  // new
+        ])
+        #expect(try store.progress(connectionID: "C1", itemID: "i1")?.currentTime == 50)
+        #expect(try store.progress(connectionID: "C1", itemID: "i2")?.currentTime == 7)
+    }
+
+    @Test func corruptDatabaseFileRecoversFresh() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dbURL = dir.appending(path: "cache.sqlite")
+        try Data("this is not a sqlite database".utf8).write(to: dbURL)
+        let store = try LibraryCacheStore(databaseURL: dbURL)   // must not throw: delete-and-recreate
+        #expect(try store.connections().isEmpty)
+    }
 }
