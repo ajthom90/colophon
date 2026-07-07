@@ -1024,6 +1024,108 @@ struct AppStateTests {
         #expect(itemsRequests.count == 3)                          // all three pages actually fetched
     }
 
+    /// The definitive cap-raise proof: a page-through that EXCEEDS the old 20-page hard cap.
+    /// 25 pages (one item each), `total = 25` spanning all of them, plus a previously-cached
+    /// stale row absent from every fresh page. After the completed 25-page fetch, `replaceItems`
+    /// reconciled the stale row away and all 25 fresh rows are present.
+    ///
+    /// RED against the OLD 20-page cap (`for page in 0..<20`): only pages 0–19 (20 items) would be
+    /// fetched, so `accumulated (20) < total (25)` — the loop ends WITHOUT `completed`, falls to
+    /// the per-page `upsertItemsPage` branch (never `replaceItems`), and the stale row SURVIVES.
+    /// Both the "stale gone" and "25 requests" assertions below would fail. GREEN now that the
+    /// cap is a generous 200-page safety bound: all 25 pages are fetched, the fetch completes, and
+    /// `replaceItems` reconciles. (The 3-page sibling above passes against the old cap too, so it
+    /// alone does NOT prove the cap was raised — this one does.)
+    @Test func largeLibraryReconcilesBeyondTwentyPages() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "stale", connectionID: cid, libraryID: "lib1", title: "Stale",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        // 25 pages, one fresh item each, total = 25 — spans well past the old 20-page cap.
+        let freshIDs = (0..<25).map { "m\($0)" }
+        for id in freshIDs {
+            await transport.enqueue(status: 200, json: itemsPageJSON(total: 25, results: [id]))
+        }
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        let items = try app.cache.items(connectionID: cid, libraryID: "lib1")
+        #expect(Set(items.map(\.id)) == Set(freshIDs))             // every one of the 25 pages' items present
+        #expect(!items.contains { $0.id == "stale" })             // reconciled away — proves replaceItems ran
+        let itemsRequests = await transport.recorded.filter { ($0.url?.path ?? "").contains("/items") }
+        #expect(itemsRequests.count == 25)                         // all 25 pages fetched (old cap stopped at 20)
+    }
+
+    /// `apply(.itemsChanged(ids:))` below the batch threshold patches EACH id individually via
+    /// `ABSClient.item(id:)` — no coarse full-library re-page. Three ids → exactly three
+    /// `/api/items/:id` requests, no `/api/libraries/:id/items` full-refresh, and all three cached
+    /// rows updated to their patched titles.
+    @Test func itemsChangedPatchesEachBelowThreshold() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: "x", connectionID: cid, libraryID: "lib1", title: "Old X",
+                        authorName: nil, duration: 1, updatedAt: 1),
+             CachedItem(id: "y", connectionID: cid, libraryID: "lib1", title: "Old Y",
+                        authorName: nil, duration: 1, updatedAt: 1),
+             CachedItem(id: "z", connectionID: cid, libraryID: "lib1", title: "Old Z",
+                        authorName: nil, duration: 1, updatedAt: 1)],
+            connectionID: cid, libraryID: "lib1")
+        // One expanded-detail response per id, consumed FIFO in the ["x","y","z"] iteration order.
+        for id in ["x", "y", "z"] {
+            await transport.enqueue(status: 200, json: #"""
+                {"id":"\#(id)","libraryId":"lib1","updatedAt":7,"media":{"duration":5,"metadata":{"title":"Patched \#(id)","authorName":null}}}
+                """#)
+        }
+
+        await app.apply(.itemsChanged(ids: ["x", "y", "z"]))
+
+        let items = try app.cache.items(connectionID: cid, libraryID: "lib1")
+        #expect(items.first { $0.id == "x" }?.title == "Patched x")
+        #expect(items.first { $0.id == "y" }?.title == "Patched y")
+        #expect(items.first { $0.id == "z" }?.title == "Patched z")
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.filter { $0.hasPrefix("/api/items/") }.count == 3)                 // three single patches
+        #expect(!paths.contains { $0.contains("/libraries/") && $0.contains("/items") }) // NO full re-page
+    }
+
+    /// `apply(.itemsChanged(ids:))` ABOVE the batch threshold (> 50 ids) falls back to ONE full
+    /// `refreshItems` of the active library rather than firing 51 single-item fetches — a bulk
+    /// edit is cheaper and cleaner to reconcile in one paged pass. `activeLibraryID` is primed by
+    /// an initial `refreshItems`; the 51-id event then triggers exactly one more `/items?page`
+    /// request and ZERO `/api/items/:id` single fetches.
+    @Test func itemsChangedFallsBackToFullRefreshAboveThreshold() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        _ = try #require(app.activeConnectionID)
+        // Prime activeLibraryID with an initial open (one /items page).
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 1, results: ["seed"]))
+        try await app.refreshItems(libraryID: "lib1")
+        let itemsRequestsBefore = await transport.recorded.filter { ($0.url?.path ?? "").contains("/libraries/") }.count
+        // The fallback refresh's page.
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 1, results: ["seed"]))
+
+        await app.apply(.itemsChanged(ids: (0..<51).map { "id\($0)" }))
+
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(!paths.contains { $0.hasPrefix("/api/items/") })          // NOT 51 single fetches
+        let itemsRequestsAfter = paths.filter { $0.contains("/libraries/") && $0.contains("/items") }.count
+        #expect(itemsRequestsAfter == itemsRequestsBefore + 1)            // exactly one full-refresh page
+    }
+
 }
 
 // MARK: - Settings plumbing (Task 9 / Fix round 2)
