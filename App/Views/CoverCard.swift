@@ -24,6 +24,10 @@ struct CoverCard: View {
     let duration: Double?
     /// Joined from the cache (nil when the server reports no progress for this item).
     let progress: CachedProgress?
+    /// True for a `mediaType == "podcast"` item (the library grid passes `library.mediaType ==
+    /// "podcast"`). A podcast card pushes `PodcastDetailRoute` → `PodcastDetailView` (the episode
+    /// list), NOT the book `ItemDetailView`, and drops the book-only queue context menu.
+    var isPodcast: Bool = false
 
     static let width: CGFloat = 150
 
@@ -38,68 +42,83 @@ struct CoverCard: View {
     }
 
     var body: some View {
-        NavigationLink(value: ItemDetailRoute(
-            itemID: itemID, title: title, author: author, updatedAt: updatedAt, duration: duration)
-        ) {
-            VStack(alignment: .leading, spacing: 6) {
-                CachedCoverView(itemID: itemID, updatedAt: updatedAt)
-                    .frame(width: Self.width, height: Self.width)
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                    .overlay(alignment: .bottom) {
-                        if let fraction {
-                            ProgressView(value: fraction)
-                                .progressViewStyle(.linear)
-                                .tint(.accentColor)
-                                .padding(.horizontal, 8)
-                                .padding(.bottom, 8)
-                        }
+        // A podcast card pushes `PodcastDetailRoute` (→ the episode list); a book card pushes
+        // `ItemDetailRoute` (→ the book page). `NavigationLink(value:)` is resolved by the value's
+        // concrete type, so the two routes must be distinct branches (an erased `AnyHashable` value
+        // wouldn't match either `navigationDestination(for:)`), sharing one `cardLabel`.
+        Group {
+            if isPodcast {
+                NavigationLink(value: PodcastDetailRoute(
+                    itemID: itemID, title: title, author: author, updatedAt: updatedAt)
+                ) { cardLabel }
+            } else {
+                NavigationLink(value: ItemDetailRoute(
+                    itemID: itemID, title: title, author: author, updatedAt: updatedAt, duration: duration)
+                ) { cardLabel }
+                .contextMenu {
+                    // Up-next queue affordances (Task 8) — native context-menu actions on a book
+                    // browse card. Enabled only while a book is playing (there's a "current book" to
+                    // queue after). The guard is per-BUTTON, not on the card, so it never disables
+                    // tap-through to the detail. Not offered for podcasts (episode queueing is Task 5).
+                    Button {
+                        app.playNext(itemID: itemID, title: title, author: author)
+                    } label: {
+                        Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
                     }
-
-                // Serif comes from the app-wide `.fontDesign` (root typeface toggle) — per the
-                // ColophonApp convention, per-view `.fontDesign(.serif)` is NOT reintroduced here.
-                Text(title)
-                    .font(.subheadline.weight(.semibold))
-                    .lineLimit(2, reservesSpace: true)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
-
-                if let author, !author.isEmpty {
-                    Text(author)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-
-                if let fraction {
-                    Text("\(Int((fraction * 100).rounded()))%")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Capsule().fill(.tint))
-                        .accessibilityLabel("\(Int((fraction * 100).rounded())) percent listened")
+                    .disabled(app.nowPlayingItemID == nil)
+                    Button {
+                        app.addToQueue(itemID: itemID, title: title, author: author)
+                    } label: {
+                        Label("Add to Queue", systemImage: "text.append")
+                    }
+                    .disabled(app.nowPlayingItemID == nil)
                 }
             }
-            .frame(width: Self.width, alignment: .leading)
         }
         .buttonStyle(.plain)
-        .contextMenu {
-            // Up-next queue affordances (Task 8) — native context-menu actions on a browse card.
-            // Enabled only while a book is playing (there's a "current book" to queue after). The
-            // guard is per-BUTTON, not on the card, so it never disables tap-through to the detail.
-            Button {
-                app.playNext(itemID: itemID, title: title, author: author)
-            } label: {
-                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+    }
+
+    private var cardLabel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            CachedCoverView(itemID: itemID, updatedAt: updatedAt)
+                .frame(width: Self.width, height: Self.width)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(alignment: .bottom) {
+                    if let fraction {
+                        ProgressView(value: fraction)
+                            .progressViewStyle(.linear)
+                            .tint(.accentColor)
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 8)
+                    }
+                }
+
+            // Serif comes from the app-wide `.fontDesign` (root typeface toggle) — per the
+            // ColophonApp convention, per-view `.fontDesign(.serif)` is NOT reintroduced here.
+            Text(title)
+                .font(.subheadline.weight(.semibold))
+                .lineLimit(2, reservesSpace: true)
+                .foregroundStyle(.primary)
+                .multilineTextAlignment(.leading)
+
+            if let author, !author.isEmpty {
+                Text(author)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
             }
-            .disabled(app.nowPlayingItemID == nil)
-            Button {
-                app.addToQueue(itemID: itemID, title: title, author: author)
-            } label: {
-                Label("Add to Queue", systemImage: "text.append")
+
+            if let fraction {
+                Text("\(Int((fraction * 100).rounded()))%")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(.tint))
+                    .accessibilityLabel("\(Int((fraction * 100).rounded())) percent listened")
             }
-            .disabled(app.nowPlayingItemID == nil)
         }
+        .frame(width: Self.width, alignment: .leading)
     }
 }
 

@@ -132,6 +132,9 @@ private struct LibraryTabContent: View {
         // series' book grid all resolve `ItemDetailRoute` (they're reached through the mode switch,
         // so they must not self-register).
         .itemDetailDestination()
+        // A podcast library's Grid pushes `PodcastDetailRoute` → `PodcastDetailView`; registered on
+        // the same stable root as the book route above.
+        .podcastDetailDestination()
         .task(id: app.activeConnectionID) {
             let connectionID = app.activeConnectionID
             // Only reset the browse state for a GENUINELY new connection — not on every

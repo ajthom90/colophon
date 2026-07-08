@@ -140,6 +140,10 @@ struct SplitShell: View {
             NavigationStack {
                 LibraryGridView(library: library)
                     .itemDetailDestination()
+                    // A podcast library's grid pushes `PodcastDetailRoute`; register it here on the
+                    // stack's ROOT CONTENT (inside the stack, same rule as `.itemDetailDestination()`)
+                    // so a podcast card resolves to `PodcastDetailView` within the detail column.
+                    .podcastDetailDestination()
             }
         case .series(let library):
             NavigationStack {

@@ -974,11 +974,15 @@ final class AppState {
     /// same reconcile semantics `replaceItems` uses for the browse grid). `season`/`episode` are
     /// carried through as the STRINGS the server sends (`"1"`, not `1`) — no numeric coercion.
     ///
-    /// This wires the fetch → cache path (M1c-c Task 3); the podcast-detail view that calls it on
-    /// appear, and reads back via `episodes`/`observeEpisodes` for instant paint, is Task 4. Per-
-    /// episode progress rides the SAME `cachedProgress` join `refreshProgress()` already performs
-    /// (`episodeId` populated per `me()` entry) — no separate progress fetch is needed here.
-    func refreshPodcastEpisodes(itemID: String) async throws {
+    /// This wires the fetch → cache path (M1c-c Task 3); the podcast-detail view (Task 4) calls it on
+    /// appear and reads episodes back via `episodes`/`observeEpisodes` for instant paint. Returns the
+    /// fetched `PodcastDetail` (`@discardableResult` so the Task-3 test's bare call still compiles) so
+    /// the same single round trip also feeds the detail view's header (title/author/HTML description),
+    /// with no redundant second `podcastItem` fetch. Per-episode progress rides the SAME
+    /// `cachedProgress` join `refreshProgress()` already performs (`episodeId` populated per `me()`
+    /// entry) — no separate progress fetch is needed here.
+    @discardableResult
+    func refreshPodcastEpisodes(itemID: String) async throws -> PodcastDetail {
         guard let client, let connectionID = activeConnectionID else {
             throw ABSError.notAuthenticated
         }
@@ -1002,6 +1006,7 @@ final class AppState {
                 guid: episode.guid)
         }
         try cache.upsertEpisodes(episodes, connectionID: connectionID, itemID: itemID)
+        return detail
     }
 
     /// Joins `GET /api/me`'s `mediaProgress[]` into the cache's `CachedProgress` — THE source of
