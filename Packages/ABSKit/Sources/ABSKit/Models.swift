@@ -229,6 +229,13 @@ public struct ShelfEntityMetadata: Decodable, Sendable {
     public let authorName: String?
     public let narratorName: String?
     public let seriesName: String?
+    /// A PODCAST's shelf-entity metadata reports its author as `author` (singular) — NOT `authorName`
+    /// (the book field) — LIVE-VERIFIED (M1c-c Task 7, `podcast-personalized.json`'s `recently-added`
+    /// entity: `media.metadata.author == "Colophon Dev"`, `authorName` absent/nil). A caller resolving
+    /// a display author for a `.book`-shaped shelf entity that might actually be a podcast (see
+    /// `Shelf.type == "podcast"`) must fall back to this field when `authorName` is nil, or a
+    /// podcast's recently-added card silently shows no author.
+    public let author: String?
 }
 
 public struct ShelfAuthorEntity: Decodable, Sendable, Identifiable {
@@ -274,6 +281,22 @@ public struct ShelfEpisodeEntity: Decodable, Sendable {
         public let publishedAt: Int?
         public let guid: String?
         public let duration: Double?
+        /// The nested `audioFile.duration` — RE-VERIFIED LIVE (M1c-c Task 7, against the running dev
+        /// server, not just the captured fixture): the top-level `duration` above is reliably `null`
+        /// in this shelf projection, but `audioFile.duration` IS populated (`465.397551` for the
+        /// seeded Episode One) — ABS just nests the real number one level deeper here than the full
+        /// `?expanded=1` item response does. `effectiveDuration` below is the fallback a progress-pill
+        /// caller should use.
+        public let audioFile: AudioFileDuration?
+
+        public struct AudioFileDuration: Decodable, Sendable {
+            public let duration: Double?
+        }
+
+        /// The best duration available for this shelf projection: the top-level field when present,
+        /// else the nested `audioFile.duration` (LIVE-VERIFIED to carry the real value when the
+        /// top-level one is `null`) — never a bogus guess.
+        public var effectiveDuration: Double? { duration ?? audioFile?.duration }
     }
 }
 

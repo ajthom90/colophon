@@ -260,9 +260,32 @@ private func fixture(_ name: String) throws -> Data {
         // index/duration come back null in the shelf projection — optionality verified.
         #expect(ep.recentEpisode?.index == nil)
         #expect(ep.recentEpisode?.duration == nil)
+        // ...but the nested audioFile.duration IS populated (M1c-c Task 7, re-verified live against
+        // the running dev server) — effectiveDuration falls back to it so a Home shelf progress pill
+        // has a real duration to compute a fraction from.
+        #expect(ep.recentEpisode?.audioFile?.duration == 465.397551)
+        #expect(ep.recentEpisode?.effectiveDuration == 465.397551)
 
         #expect(shelves.contains { $0.id == "newest-episodes" && $0.type == "episode" })
-        #expect(shelves.contains { $0.id == "recently-added" && $0.type == "podcast" })
+
+        // `recently-added` on a PODCAST library is shelf `type` "podcast" (a book library's own
+        // recently-added is `type` "book" — see `personalized.json`), and its entities decode as
+        // `.book` (they carry `media`, not `recentEpisode`) — the PODCAST item itself, not an
+        // episode. This `type` is the ONLY discriminator available (the entity/media shape carries
+        // no `mediaType` of its own), and it's what M1c-c Task 7's home-shelf routing keys off of to
+        // send these cards to `PodcastDetailRoute` instead of `ItemDetailRoute`.
+        let recentlyAdded = try #require(shelves.first { $0.id == "recently-added" })
+        #expect(recentlyAdded.type == "podcast")
+        guard case let .book(podcastAsBook) = recentlyAdded.entities.first else {
+            Issue.record("expected the podcast recently-added entity to decode as a book-shaped entity")
+            return
+        }
+        #expect(podcastAsBook.id == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(podcastAsBook.media.metadata.title == "Colophon Test Podcast")
+        // A podcast's shelf-entity metadata reports its author as "author", not "authorName" (the
+        // book field) — verified live; a caller must fall back to `author` for a podcast entity.
+        #expect(podcastAsBook.media.metadata.authorName == nil)
+        #expect(podcastAsBook.media.metadata.author == "Colophon Dev")
     }
 
     /// `podcast-search.json` is a live `GET /api/libraries/:podcastLib/search?q=on` capture: `q=on`

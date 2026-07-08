@@ -165,21 +165,75 @@ struct AuthorCard: View {
     }
 }
 
-/// A podcast-episode shelf entity card — STUBBED for M1c-a. Renders the podcast cover + the recent
-/// episode's title with a "Podcast" caption; real per-episode cards (playback, per-episode
-/// progress, download) land in M1c-c. Deliberately not tappable-to-play yet. The seeded dev stack
-/// has no podcast library, so this path is source-verified, not live-exercised, this milestone.
-struct EpisodeStubCard: View {
-    let itemID: String
+/// A podcast-episode shelf entity card (continue-listening / newest-episodes / listen-again) —
+/// M1c-c Task 7 REPLACES the M1c-a `EpisodeStubCard` with a real, tappable card, now that the
+/// podcast dev fixture (Task 1) and episode detail page (Task 6) both exist to render/route into.
+/// Renders the shared podcast cover (an episode carries no distinct artwork of its own — same
+/// convention as `EpisodeDetailView`'s header, which shows the show's art on an episode page), the
+/// episode title (2-line clamp, matching `CoverCard`'s title treatment), the podcast title as a
+/// secondary caption (in place of `CoverCard`'s author line), and — MATCHING `CoverCard` exactly —
+/// an in-progress bar hugging the cover's bottom edge + a percentage pill, shown ONLY when this
+/// episode has a meaningful 0 < fraction < 1 (not finished, duration known). Progress is the
+/// caller-resolved `progress` param (from `ShelfRow.episodeProgressFor`'s `(itemID, episodeID)` — see
+/// `LibraryCache`'s `indexedByItemAndEpisode()`), never a collapsed "best row for this item" lookup,
+/// so a podcast with several episodes shows each card's OWN progress, not a sibling's. Tapping pushes
+/// `EpisodeDetailRoute` (Play/Resume lives on the detail page, per Task 6's row-tap convention) — the
+/// destination must be registered wherever this card can be reached (`HomeView` self-registers it
+/// alongside `.podcastDetailDestination()`; the Library stacks already did in Tasks 4/6).
+struct EpisodeCard: View {
+    let podcastItemID: String
+    let episodeID: String
     let title: String
+    let podcastTitle: String
+    /// The episode's duration — the caller passes `recentEpisode.effectiveDuration` (the shelf
+    /// entity's top-level `duration`, falling back to the nested `audioFile.duration` when the
+    /// top-level field is `null`, which Task 1 verified it reliably is; `audioFile.duration` is
+    /// re-verified LIVE, M1c-c Task 7, to carry the real value instead). If somehow neither is
+    /// present, the fraction/pill below just doesn't render — exactly like `CoverCard` with an
+    /// unknown duration (never a crash or a bogus 0%/100% pill).
+    let duration: Double?
+    let updatedAt: Int?
+    /// This episode's OWN `cachedProgress` row (nil = untouched). Resolved by the caller via the
+    /// 3-part `(itemID, episodeID)` key — NOT `CoverCard`'s item-collapsed lookup, which would return
+    /// the wrong row for a podcast item that has several episodes sharing one `itemID`.
+    let progress: CachedProgress?
 
-    static let width: CGFloat = 150
+    static let width: CGFloat = CoverCard.width
+
+    /// The listened fraction — ONLY when meaningfully in-progress (0 < f < 1, not finished) — the
+    /// identical guard `CoverCard.fraction` uses, so the two card kinds render pills identically.
+    private var fraction: Double? {
+        guard let progress, !progress.isFinished,
+              let duration, duration > 0 else { return nil }
+        let f = progress.currentTime / duration
+        guard f > 0, f < 1 else { return nil }
+        return f
+    }
 
     var body: some View {
+        NavigationLink(value: EpisodeDetailRoute(
+            podcastItemID: podcastItemID, episodeID: episodeID,
+            podcastTitle: podcastTitle, updatedAt: updatedAt)
+        ) {
+            cardLabel
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var cardLabel: some View {
         VStack(alignment: .leading, spacing: 6) {
-            CachedCoverView(itemID: itemID, updatedAt: nil)
+            CachedCoverView(itemID: podcastItemID, updatedAt: updatedAt)
                 .frame(width: Self.width, height: Self.width)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(alignment: .bottom) {
+                    if let fraction {
+                        ProgressView(value: fraction)
+                            .progressViewStyle(.linear)
+                            .tint(.accentColor)
+                            .padding(.horizontal, 8)
+                            .padding(.bottom, 8)
+                    }
+                }
 
             Text(title)
                 .font(.subheadline.weight(.semibold))
@@ -187,9 +241,20 @@ struct EpisodeStubCard: View {
                 .foregroundStyle(.primary)
                 .multilineTextAlignment(.leading)
 
-            Text("Podcast · M1c-c")
-                .font(.caption2)
+            Text(podcastTitle)
+                .font(.caption)
                 .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            if let fraction {
+                Text("\(Int((fraction * 100).rounded()))%")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(.tint))
+                    .accessibilityLabel("\(Int((fraction * 100).rounded())) percent listened")
+            }
         }
         .frame(width: Self.width, alignment: .leading)
     }

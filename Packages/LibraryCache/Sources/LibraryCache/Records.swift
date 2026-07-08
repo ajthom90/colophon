@@ -324,4 +324,23 @@ public extension Array where Element == CachedProgress {
             return lhs.lastUpdate >= rhs.lastUpdate ? lhs : rhs
         }
     }
+
+    /// Indexes a connection's progress rows by the FULL `itemID + "/" + episodeID` key (a book-style
+    /// row keys with an empty episode suffix) — M1c-c Task 7, for a podcast-episode shelf card that
+    /// must resolve ITS OWN progress row and no other's.
+    ///
+    /// `indexedByItem()` deliberately COLLAPSES every row sharing an `itemID` down to a single "best"
+    /// one, which is correct for a card that shows exactly one pill per item (a book, or a podcast's
+    /// own book-style row) — but a PODCAST'S `itemID` is shared by every one of its episodes'
+    /// `cachedProgress` rows (the 3-part PK's `itemID` is the podcast, not the episode), so looking an
+    /// episode shelf card up via `indexedByItem()` could hand it a SIBLING episode's progress (or,
+    /// under that function's book-row-wins collision rule, would even prefer a book-style row that a
+    /// podcast item never actually has). Keying by the full `(itemID, episodeID)` pair keeps every
+    /// episode's row distinct, so `progressByItemEpisode[itemID + "/" + episodeID]` always resolves
+    /// the exact row for that exact episode.
+    func indexedByItemAndEpisode() -> [String: CachedProgress] {
+        Dictionary(map { ($0.itemID + "/" + $0.episodeID, $0) }) { lhs, rhs in
+            lhs.lastUpdate >= rhs.lastUpdate ? lhs : rhs
+        }
+    }
 }
