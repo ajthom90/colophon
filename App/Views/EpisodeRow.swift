@@ -7,16 +7,23 @@ import LibraryCache
 /// in-progress bar plus a "…left" affordance. A finished episode dims its title and shows a green
 /// checkmark instead of the play glyph.
 ///
-/// The WHOLE row is the play tap target (a plain-styled `Button`); a context menu offers
-/// Play / Add to Queue. The two actions are DISTINCT hooks (M1c-c Task 5): the row tap and the
-/// context-menu "Play" invoke `onPlay` (real episode playback via the shared player); "Add to Queue"
-/// invokes `onAddToQueue` (enqueues the episode into the up-next queue). This row deliberately does
-/// NOT start playback or mutate the queue itself (no forked playback path) — it only calls back.
+/// **Row-tap-navigates, Play-button-plays (M1c-c Task 6):** the row itself is a
+/// `NavigationLink(value: detailRoute)` — tapping anywhere in the row (HIG: tapping a list row opens
+/// its detail) pushes `EpisodeDetailView`. The leading glyph is a SEPARATE, plain-styled `Button`
+/// nested inside the link's label — a `List` row's navigation is driven by row *selection*, while an
+/// interactive control (`Button`) inside the row's content claims its own tap independently (the same
+/// idiom Reminders/Mail use for a row checkbox + navigation), so tapping the glyph plays without
+/// navigating. A context menu (long-press) offers the same Play / Add to Queue as direct actions,
+/// unaffected by the navigation. `onPlay`/`onAddToQueue` are DISTINCT hooks (M1c-c Task 5): this row
+/// deliberately does NOT start playback, mutate the queue, or navigate itself — it only calls back /
+/// pushes the route.
 struct EpisodeRow: View {
     let episode: CachedEpisode
     /// The per-episode progress for THIS episode (nil = untouched), joined from `cachedProgress`.
     let progress: CachedProgress?
-    /// Play THIS episode now — invoked by the row tap and the context-menu "Play".
+    /// The route the row tap pushes — opens `EpisodeDetailView` for this episode.
+    let detailRoute: EpisodeDetailRoute
+    /// Play THIS episode now — invoked by the leading glyph button and the context-menu "Play".
     let onPlay: () -> Void
     /// Enqueue THIS episode into the up-next queue — invoked by the context-menu "Add to Queue".
     let onAddToQueue: () -> Void
@@ -34,12 +41,18 @@ struct EpisodeRow: View {
     }
 
     var body: some View {
-        Button(action: onPlay) {
+        NavigationLink(value: detailRoute) {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: isFinished ? "checkmark.circle.fill" : "play.circle")
-                    .font(.title2)
-                    .foregroundStyle(isFinished ? Color.green : Color.accentColor)
-                    .accessibilityHidden(true)
+                // A SEPARATE tap target from the row's NavigationLink (see the type doc comment): a
+                // nested `Button` inside a List row's link label claims its own tap without pushing
+                // the detail route.
+                Button(action: onPlay) {
+                    Image(systemName: isFinished ? "checkmark.circle.fill" : "play.circle")
+                        .font(.title2)
+                        .foregroundStyle(isFinished ? Color.green : Color.accentColor)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(isFinished ? "Played" : "Play")
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text(episode.title ?? "Untitled Episode")
@@ -62,18 +75,16 @@ struct EpisodeRow: View {
                             .padding(.top, 2)
                     }
                 }
+                .accessibilityElement(children: .combine)
                 Spacer(minLength: 8)
             }
             .padding(.vertical, 4)
             .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
         .contextMenu {
             Button(action: onPlay) { Label("Play", systemImage: "play.fill") }
             Button(action: onAddToQueue) { Label("Add to Queue", systemImage: "text.append") }
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isButton)
     }
 
     /// "Jul 8, 2026 · 42m" (untouched/finished) or "Jul 8, 2026 · 12m left" (in progress).

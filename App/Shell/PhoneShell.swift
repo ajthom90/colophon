@@ -135,6 +135,9 @@ private struct LibraryTabContent: View {
         // A podcast library's Grid pushes `PodcastDetailRoute` → `PodcastDetailView`; registered on
         // the same stable root as the book route above.
         .podcastDetailDestination()
+        // An episode row (inside `PodcastDetailView`, reached through the destination above) pushes
+        // `EpisodeDetailRoute`; registered on the same stable root, inside the stack.
+        .episodeDetailDestination()
         .task(id: app.activeConnectionID) {
             let connectionID = app.activeConnectionID
             // Only reset the browse state for a GENUINELY new connection — not on every

@@ -163,6 +163,9 @@ struct PodcastDetailView: View {
         EpisodeRow(
             episode: episode,
             progress: progressByEpisode[episode.episodeID],
+            detailRoute: EpisodeDetailRoute(
+                podcastItemID: route.itemID, episodeID: episode.episodeID,
+                podcastTitle: displayTitle, updatedAt: route.updatedAt),
             onPlay: { startEpisodePlayback(episode) },
             onAddToQueue: { addEpisodeToQueue(episode) })
     }
