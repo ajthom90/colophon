@@ -220,6 +220,17 @@ public struct LibraryCacheStore: Sendable {
         }
     }
 
+    /// Live stream of one item's episodes (M1c-c), same ordering as `episodes(connectionID:itemID:)`
+    /// — mirrors `observeItems`'s role for the browse grid: the podcast-detail view subscribes so
+    /// an `upsertEpisodes` reconcile (fresh `podcastItem` fetch) repaints instantly with no refetch.
+    public func observeEpisodes(connectionID: String, itemID: String) -> AsyncValueObservation<[CachedEpisode]> {
+        ValueObservation.tracking { db in
+            try CachedEpisode.filter(Column("connectionID") == connectionID && Column("itemID") == itemID)
+                .order(Column("publishedAt").desc)
+                .fetchAll(db)
+        }.values(in: pool)
+    }
+
     // MARK: - v3: per-book playback-rate preference
 
     /// Sets (or, with `rate: nil`, clears back to "no per-book rate") this book's persisted

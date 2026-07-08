@@ -326,6 +326,36 @@ import Testing
         #expect(fetched.map(\.episodeID) == ["e2", "e3", "e1"])   // 300, 200, 100 -> DESC
     }
 
+    /// Every `CachedEpisode` column round-trips through the DB unchanged — in particular `season`/
+    /// `episode` stay STRINGS ("1"/"2", not coerced to/from integers), matching the live
+    /// `PodcastEpisode` shape (M1c-c Task 1/2) the `AppState.refreshPodcastEpisodes` mapping feeds
+    /// this table from.
+    @Test func episodeFieldsRoundTripWithStringSeasonAndEpisode() throws {
+        let store = try makeStore()
+        let full = CachedEpisode(
+            connectionID: "C1", itemID: "i1", episodeID: "e1",
+            idx: 3, season: "1", episode: "2", episodeType: "full",
+            title: "Episode Two: Attack by Stratagem", subtitle: "Winning without fighting",
+            episodeDescription: "<p>HTML description</p>", pubDate: "Mon, 13 Jan 2025 08:00:00 GMT",
+            publishedAt: 1736755200000, durationSeconds: 506.827755, sizeBytes: 4055751,
+            guid: "colophon-test-ep-0002")
+        try store.upsertEpisodes([full], connectionID: "C1", itemID: "i1")
+
+        let fetched = try #require(try store.episodes(connectionID: "C1", itemID: "i1").first)
+        #expect(fetched.idx == 3)
+        #expect(fetched.season == "1")
+        #expect(fetched.episode == "2")
+        #expect(fetched.episodeType == "full")
+        #expect(fetched.title == "Episode Two: Attack by Stratagem")
+        #expect(fetched.subtitle == "Winning without fighting")
+        #expect(fetched.episodeDescription == "<p>HTML description</p>")
+        #expect(fetched.pubDate == "Mon, 13 Jan 2025 08:00:00 GMT")
+        #expect(fetched.publishedAt == 1736755200000)
+        #expect(fetched.durationSeconds == 506.827755)
+        #expect(fetched.sizeBytes == 4055751)
+        #expect(fetched.guid == "colophon-test-ep-0002")
+    }
+
     @Test func upsertEpisodesReplacesScopedToItem() throws {
         let store = try makeStore()
         let aKeep = CachedEpisode(connectionID: "C1", itemID: "A", episodeID: "a1", publishedAt: 1)
@@ -416,6 +446,62 @@ import Testing
         #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e1")?.currentTime == 10)
         #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.currentTime == 20)
         #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.isFinished == true)
+    }
+
+    /// M1c-c Task 3: a book-style progress row (`episodeID: nil` → `""`) and a real episode
+    /// progress row (`episodeID` populated, as `AppState.refreshProgress` writes from a `me()`
+    /// entry whose `episodeId` is non-empty) coexist independently under the SAME connection+item
+    /// — the 3-part PK keeps them distinct rows rather than one clobbering the other, and each is
+    /// individually addressable via `progress(episodeID:)`. Extends `episodeProgressStillKeyedPerEpisode`
+    /// (which only covered episode-vs-episode) with the book-vs-episode case.
+    @Test func episodeProgressDistinctFromBookProgress() throws {
+        let store = try makeStore()
+        let bookRow = CachedProgress(connectionID: "C1", itemID: "i1", episodeID: nil,
+                                     currentTime: 500, isFinished: false, lastUpdate: 100)
+        let episodeRow = CachedProgress(connectionID: "C1", itemID: "i1", episodeID: "ep_1",
+                                        currentTime: 30, isFinished: true, lastUpdate: 200)
+        try store.upsertProgress(bookRow)
+        try store.upsertProgress(episodeRow)
+
+        let book = try #require(try store.progress(connectionID: "C1", itemID: "i1"))
+        let episode = try #require(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "ep_1"))
+        #expect(book.episodeID == "")
+        #expect(book.currentTime == 500)
+        #expect(book.isFinished == false)
+        #expect(episode.episodeID == "ep_1")
+        #expect(episode.currentTime == 30)
+        #expect(episode.isFinished == true)
+
+        // A stale re-write of the book row must not disturb the episode row, and vice versa.
+        try store.upsertProgress(CachedProgress(connectionID: "C1", itemID: "i1", episodeID: nil,
+                                                currentTime: 1, isFinished: false, lastUpdate: 1))
+        #expect(try store.progress(connectionID: "C1", itemID: "i1")?.currentTime == 500)
+        #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "ep_1")?.currentTime == 30)
+    }
+
+    /// `observeEpisodes` (M1c-c Task 3) mirrors `observeLibraries`'/`observeItems`'s live-stream
+    /// role for the podcast-detail view: the initial emission reflects whatever's cached (empty
+    /// for a never-fetched item), and an `upsertEpisodes` reconcile pushes a fresh emission with no
+    /// refetch needed by the observer.
+    @Test func observeEpisodesEmitsOnUpsert() async throws {
+        let store = try makeStore()
+        let observation = store.observeEpisodes(connectionID: "C1", itemID: "i1")
+        var iterator = observation.makeAsyncIterator()
+        let initial = try await iterator.next()
+        #expect(initial == [])                                                  // nothing cached yet
+
+        try store.upsertEpisodes([
+            CachedEpisode(connectionID: "C1", itemID: "i1", episodeID: "e1", title: "First", publishedAt: 100),
+        ], connectionID: "C1", itemID: "i1")
+        let afterUpsert = try await iterator.next()
+        #expect(afterUpsert?.map(\.episodeID) == ["e1"])
+
+        // A reconcile that drops e1 and adds e2 pushes another emission — scoped to this item only.
+        try store.upsertEpisodes([
+            CachedEpisode(connectionID: "C1", itemID: "i1", episodeID: "e2", title: "Second", publishedAt: 200),
+        ], connectionID: "C1", itemID: "i1")
+        let afterReplace = try await iterator.next()
+        #expect(afterReplace?.map(\.episodeID) == ["e2"])
     }
 
     // MARK: - v3: per-book playback-rate preference (Task 7)

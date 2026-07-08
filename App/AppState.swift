@@ -967,6 +967,43 @@ final class AppState {
         Task { try? await refreshItems(libraryID: libraryID) }
     }
 
+    /// Fetches a podcast item's full detail (`GET /api/items/:id?expanded=1` via `podcastItem(id:)`
+    /// — the podcast-shaped sibling of `patchItem`'s `item(id:)`, same request-building) and
+    /// reconciles its `media.episodes[]` into the v2 `cachedEpisode` table (`upsertEpisodes`,
+    /// replace-scoped-to-item: episodes the feed no longer reports for this item are dropped, the
+    /// same reconcile semantics `replaceItems` uses for the browse grid). `season`/`episode` are
+    /// carried through as the STRINGS the server sends (`"1"`, not `1`) — no numeric coercion.
+    ///
+    /// This wires the fetch → cache path (M1c-c Task 3); the podcast-detail view that calls it on
+    /// appear, and reads back via `episodes`/`observeEpisodes` for instant paint, is Task 4. Per-
+    /// episode progress rides the SAME `cachedProgress` join `refreshProgress()` already performs
+    /// (`episodeId` populated per `me()` entry) — no separate progress fetch is needed here.
+    func refreshPodcastEpisodes(itemID: String) async throws {
+        guard let client, let connectionID = activeConnectionID else {
+            throw ABSError.notAuthenticated
+        }
+        let detail = try await client.podcastItem(id: itemID)
+        let episodes = detail.media.episodes.map { episode in
+            CachedEpisode(
+                connectionID: connectionID,
+                itemID: itemID,
+                episodeID: episode.id,
+                idx: episode.index,
+                season: episode.season,
+                episode: episode.episode,
+                episodeType: episode.episodeType,
+                title: episode.title,
+                subtitle: episode.subtitle,
+                episodeDescription: episode.description,
+                pubDate: episode.pubDate,
+                publishedAt: episode.publishedAt,
+                durationSeconds: episode.duration,
+                sizeBytes: episode.size,
+                guid: episode.guid)
+        }
+        try cache.upsertEpisodes(episodes, connectionID: connectionID, itemID: itemID)
+    }
+
     /// Joins `GET /api/me`'s `mediaProgress[]` into the cache's `CachedProgress` — THE source of
     /// the home shelves' progress pills, since personalized-shelf entities carry NO progress field
     /// (verified live). `HomeView` calls this on appear and on pull-to-refresh; from the connected

@@ -261,6 +261,89 @@ struct AppStateTests {
         #expect(mePaths.contains("/api/me"))
     }
 
+    /// Extends `mediaProgressFromMeLandsInCache` (M1c-c Task 3): a `me()` response mixing a
+    /// book-style entry (`episodeId: null`) and a real episode entry (`episodeId` populated) for
+    /// the SAME item lands as two DISTINCT `cachedProgress` rows — the 3-part PK, not a collision —
+    /// confirming `refreshProgress`'s existing `entry.episodeId` mapping (M1a Task 7) already
+    /// handles per-episode progress with no change needed.
+    @Test func mediaProgressFromMeDistinguishesEpisodeFromBookProgress() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        await transport.enqueue(status: 200, json: #"""
+        {"id":"root","username":"root","mediaProgress":[
+          {"libraryItemId":"pod1","episodeId":null,"progress":0.1,"currentTime":50,"duration":500,"isFinished":false,"lastUpdate":1000},
+          {"libraryItemId":"pod1","episodeId":"ep1","progress":0.9,"currentTime":450,"duration":500,"isFinished":true,"lastUpdate":2000}
+        ]}
+        """#)
+
+        await app.refreshProgress()
+
+        let bookProgress = try #require(try app.cache.progress(connectionID: cid, itemID: "pod1"))
+        let episodeProgress = try #require(try app.cache.progress(connectionID: cid, itemID: "pod1", episodeID: "ep1"))
+        #expect(bookProgress.episodeID == "")
+        #expect(bookProgress.currentTime == 50)
+        #expect(bookProgress.isFinished == false)
+        #expect(episodeProgress.episodeID == "ep1")
+        #expect(episodeProgress.currentTime == 450)
+        #expect(episodeProgress.isFinished == true)
+    }
+
+    /// M1c-c Task 3: `refreshPodcastEpisodes(itemID:)` fetches the podcast item (`podcastItem(id:)`)
+    /// and reconciles `media.episodes[]` into the v2 `cachedEpisode` table via `upsertEpisodes` —
+    /// the AppState-level hook the podcast-detail view (Task 4) will call on appear. Asserts the
+    /// mapping preserves `season`/`episode` as STRINGS (not coerced) and carries every other
+    /// `PodcastEpisode` field through to its `CachedEpisode` column.
+    @Test func refreshPodcastEpisodesFetchesAndUpsertsEpisodes() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        await transport.enqueue(status: 200, json: #"""
+        {"id":"pod1","libraryId":"lib1","updatedAt":1700000000000,"media":{
+          "metadata":{"title":"Colophon Test Podcast","author":"Colophon Dev","description":"<p>desc</p>",
+                      "releaseDate":null,"genres":[],"feedUrl":"http://x/feed.xml","imageUrl":"http://x/cover.jpg",
+                      "explicit":true,"language":"en-us","type":"episodic"},
+          "coverPath":"/podcasts/x/cover.jpg",
+          "episodes":[
+            {"libraryItemId":"pod1","podcastId":"m1","id":"ep1","index":null,"season":"1","episode":"1",
+             "episodeType":"full","title":"Episode One","subtitle":"Sub1","description":"<p>d1</p>",
+             "enclosure":{"url":"http://x/e1.mp3","type":"audio/mpeg","length":"3723859"},
+             "guid":"guid-1","pubDate":"Mon, 06 Jan 2025 08:00:00 GMT","chapters":[],
+             "publishedAt":1736150400000,"size":3724390,"duration":465.397551},
+            {"libraryItemId":"pod1","podcastId":"m1","id":"ep2","index":null,"season":"1","episode":"2",
+             "episodeType":"full","title":"Episode Two","subtitle":"Sub2","description":"<p>d2</p>",
+             "enclosure":{"url":"http://x/e2.mp3","type":"audio/mpeg","length":"4055167"},
+             "guid":"guid-2","pubDate":"Mon, 13 Jan 2025 08:00:00 GMT","chapters":[],
+             "publishedAt":1736755200000,"size":4055751,"duration":506.827755}
+          ]}}
+        """#)
+
+        try await app.refreshPodcastEpisodes(itemID: "pod1")
+
+        let episodes = try app.cache.episodes(connectionID: cid, itemID: "pod1")
+        #expect(episodes.map(\.episodeID) == ["ep2", "ep1"])   // newest publishedAt first
+        let ep1 = try #require(episodes.first { $0.episodeID == "ep1" })
+        #expect(ep1.season == "1")
+        #expect(ep1.episode == "1")
+        #expect(ep1.title == "Episode One")
+        #expect(ep1.episodeType == "full")
+        #expect(ep1.episodeDescription == "<p>d1</p>")
+        #expect(ep1.pubDate == "Mon, 06 Jan 2025 08:00:00 GMT")
+        #expect(ep1.publishedAt == 1736150400000)
+        #expect(ep1.durationSeconds == 465.397551)
+        #expect(ep1.sizeBytes == 3724390)
+        #expect(ep1.guid == "guid-1")
+
+        let podcastPaths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(podcastPaths.contains { $0.contains("/items/pod1") })
+    }
+
     /// The banner is tagged with the library that actually failed: fail library B's refresh and
     /// the banner's `libraryID` is B — a `LibraryItemsView` for library A (which matches on
     /// `banner.libraryID == library.id`) would not show it.

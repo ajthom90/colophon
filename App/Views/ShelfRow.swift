@@ -49,7 +49,7 @@ struct ShelfRow: View {
             AuthorCard(name: author.name)
         case .episode(let episode):
             EpisodeStubCard(
-                itemID: episode.id ?? "",
+                itemID: episode.id,
                 title: episode.recentEpisode?.title ?? episode.media?.metadata.title ?? "Episode")
         case .unknown:
             EmptyView()
