@@ -132,6 +132,9 @@ struct AuthorDetailView: View {
     @State private var detail: AuthorDetail?
     @State private var progressByItem: [String: CachedProgress] = [:]
     @State private var state: LoadState = .idle
+    /// The author bio (HTML) parsed into an `AttributedString` ONCE (see `HTMLText`) — populated by
+    /// `.task(id: detail?.description)`, never per `body`. Nil until parsed / when there's no bio.
+    @State private var formattedDescription: AttributedString?
 
     private enum LoadState: Equatable { case idle, loading, loaded, failed(String) }
 
@@ -152,6 +155,14 @@ struct AuthorDetailView: View {
         #endif
         .task(id: author.id) { await load() }
         .task(id: app.activeConnectionID) { await observeProgress() }
+        .task(id: detail?.description) {
+            // Parse the HTML bio ONCE per value on the main actor (see `ItemDetailView`).
+            if let description = detail?.description, !description.isEmpty {
+                formattedDescription = HTMLText.attributed(fromHTML: description)
+            } else {
+                formattedDescription = nil
+            }
+        }
     }
 
     private var header: some View {
@@ -167,7 +178,8 @@ struct AuthorDetailView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 if let description = detail?.description, !description.isEmpty {
-                    Text(description)
+                    // HTML bio rendered as formatted text (see `HTMLText`); raw fallback until parsed.
+                    Text(formattedDescription ?? AttributedString(description))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(6)

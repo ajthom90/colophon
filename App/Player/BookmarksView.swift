@@ -50,6 +50,11 @@ struct BookmarksView: View {
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+        // macOS ignores `.presentationDetents`, so without an explicit size the sheet collapses to
+        // its content's ideal size (the toolbar "+" and list get clipped). Give it a usable minimum.
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 520)
+        #endif
         .fontDesign(.default)
     }
 
@@ -58,10 +63,19 @@ struct BookmarksView: View {
     @ViewBuilder
     private var content: some View {
         if app.bookmarks.items.isEmpty {
-            ContentUnavailableView(
-                "No Bookmarks",
-                systemImage: "bookmark",
-                description: Text("Tap + to bookmark the current spot."))
+            // An explicit "Add Bookmark" action in the empty state so the create affordance is never
+            // hidden — a belt-and-braces companion to the toolbar "+" (which the collapsed macOS
+            // sheet could clip). Both call the same `addAtCurrentTime()`.
+            ContentUnavailableView {
+                Label("No Bookmarks", systemImage: "bookmark")
+            } description: {
+                Text("Bookmark the current spot to find it again.")
+            } actions: {
+                Button { addAtCurrentTime() } label: {
+                    Label("Add Bookmark", systemImage: "plus")
+                }
+                .buttonStyle(.borderedProminent)
+            }
         } else {
             List {
                 ForEach(app.bookmarks.items) { bookmark in

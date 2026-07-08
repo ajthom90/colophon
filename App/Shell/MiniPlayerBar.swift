@@ -128,9 +128,13 @@ struct MiniPlayerBar: View {
 /// cluster. Shown only while a session is active.
 struct TransportBar: View {
     @Environment(AppState.self) private var app
-    /// The expand affordance: tapping the now-playing artwork/title opens the full player — a
-    /// large detented sheet on iPad, the dedicated player Window on Mac (wired by `SplitShell`).
+    /// The expand affordance: tapping the now-playing artwork/title (or the explicit expand button)
+    /// opens the full player — a large detented sheet on iPad, the dedicated player Window on Mac
+    /// (wired by `SplitShell`).
     var onExpand: () -> Void = {}
+    /// Presents the shared `BookmarksView` (its list + create-at-current-time "+") straight from the
+    /// docked bar, so Mac/iPad users reach bookmarks without first opening the Now Playing window.
+    @State private var showingBookmarks = false
 
     var body: some View {
         let playback = app.playback
@@ -157,11 +161,42 @@ struct TransportBar: View {
                     .font(.callout).monospacedDigit().foregroundStyle(.secondary)
                     .fontDesign(.default)
                 TransportControls(playback: playback)
+                // Bookmark quick-access: the SAME `BookmarksView` the full player uses (list + its
+                // create-at-current-time "+"), presented as a sheet so it doesn't require opening the
+                // whole Now Playing window. A `.glass` SECONDARY control (never a second prominent —
+                // the one tinted `.glassProminent` stays play/pause in `TransportControls`); the bar
+                // renders only for an active session, so this is inherently session-gated.
+                Button {
+                    showingBookmarks = true
+                } label: {
+                    Image(systemName: "bookmark")
+                }
+                .buttonStyle(.glass)
+                .fontDesign(.default)
+                .help("Bookmarks")
+                .accessibilityLabel("Bookmarks")
+                .sheet(isPresented: $showingBookmarks) {
+                    BookmarksView()
+                }
+                // Visible expand affordance — the Mac docked bar previously had NO visible cue (only
+                // the unlabeled artwork/title tap), so the full player (chapters, bookmarks, speed,
+                // sleep timer, queue) was undiscoverable. This `.glass` secondary button opens the
+                // Now Playing window (Mac) / full-player sheet (iPad); `.help` gives the macOS tooltip.
+                Button(action: onExpand) {
+                    Image(systemName: "arrow.up.left.and.arrow.down.right")
+                }
+                .buttonStyle(.glass)
+                .fontDesign(.default)
+                .help("Open Now Playing")
+                .accessibilityLabel("Open Now Playing")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 10)
             .frame(maxWidth: .infinity)
             .background(.bar)
+            // A visible hairline above the bar so the docked transport reads as a distinct chrome
+            // strip against the content, not a subtle material blend into the window.
+            .overlay(alignment: .top) { Divider() }
         }
     }
 }

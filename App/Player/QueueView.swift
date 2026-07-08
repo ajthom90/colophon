@@ -40,6 +40,11 @@ struct QueueView: View {
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)
+        // macOS ignores `.presentationDetents`, so without an explicit size the sheet collapses to
+        // its content's ideal size and the queue rows get clipped. Give it a usable minimum.
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 520)
+        #endif
         .fontDesign(.default)
     }
 

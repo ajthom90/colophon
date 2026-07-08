@@ -36,6 +36,8 @@ final class NowPlayingUpdater {
         center.togglePlayPauseCommand.removeTarget(nil)
         center.skipForwardCommand.removeTarget(nil)
         center.skipBackwardCommand.removeTarget(nil)
+        center.nextTrackCommand.removeTarget(nil)
+        center.previousTrackCommand.removeTarget(nil)
         center.changePlaybackPositionCommand.removeTarget(nil)
 
         // Remote-command handlers are NOT guaranteed to arrive on the main thread,
@@ -65,6 +67,27 @@ final class NowPlayingUpdater {
         }
         center.skipBackwardCommand.preferredIntervals = [NSNumber(value: controller.skipInterval)]
         center.skipBackwardCommand.addTarget { [weak controller] _ in
+            Task { @MainActor in
+                guard let controller else { return }
+                controller.skip(-Double(controller.skipInterval))
+            }
+            return .success
+        }
+        // Hardware media keys (Mac F7/F9) and BT/CarPlay remotes fire previous/next-TRACK, NOT
+        // skip-forward/back — an audiobook has no "tracks" to page, so map them to the SAME
+        // skip-by-interval as the skip handlers above (reading `controller.skipInterval` live).
+        // `isEnabled` is toggled explicitly (enabled here, disabled in `clear()`) so the commands
+        // are advertised only while a session is loaded — and so the wiring is unit-observable.
+        center.nextTrackCommand.isEnabled = true
+        center.nextTrackCommand.addTarget { [weak controller] _ in
+            Task { @MainActor in
+                guard let controller else { return }
+                controller.skip(Double(controller.skipInterval))
+            }
+            return .success
+        }
+        center.previousTrackCommand.isEnabled = true
+        center.previousTrackCommand.addTarget { [weak controller] _ in
             Task { @MainActor in
                 guard let controller else { return }
                 controller.skip(-Double(controller.skipInterval))
@@ -141,6 +164,10 @@ final class NowPlayingUpdater {
         center.togglePlayPauseCommand.removeTarget(nil)
         center.skipForwardCommand.removeTarget(nil)
         center.skipBackwardCommand.removeTarget(nil)
+        center.nextTrackCommand.removeTarget(nil)
+        center.nextTrackCommand.isEnabled = false
+        center.previousTrackCommand.removeTarget(nil)
+        center.previousTrackCommand.isEnabled = false
         center.changePlaybackPositionCommand.removeTarget(nil)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
         #if os(macOS)

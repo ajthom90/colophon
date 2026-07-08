@@ -68,19 +68,23 @@ struct SplitShell: View {
             .accountMenu()
         } detail: {
             detailColumn
-                .safeAreaInset(edge: .bottom) {
-                    TransportBar {
-                        #if os(macOS)
-                        openWindow(id: PlayerWindowScene.id)
-                        #else
-                        showingFullPlayer = true
-                        #endif
-                    }
-                }
-                // iPad per-platform presentation (Task 4): a large detented sheet on the detail
-                // column. No-op on macOS (the Mac uses the dedicated player Window above).
-                .iPadPlayerSheet(isPresented: $showingFullPlayer)
         }
+        // Dock the transport on the WHOLE `NavigationSplitView` (not just the detail column) so it
+        // spans the FULL window width — sidebar + detail — the standard Music-style bottom transport.
+        // Attached here rather than inside `detail:` because a `safeAreaInset` on the detail column
+        // alone left the bar spanning only that column's width, so on Mac it read as invisible.
+        .safeAreaInset(edge: .bottom) {
+            TransportBar {
+                #if os(macOS)
+                openWindow(id: PlayerWindowScene.id)
+                #else
+                showingFullPlayer = true
+                #endif
+            }
+        }
+        // iPad per-platform presentation (Task 4): a large detented sheet. No-op on macOS (the Mac
+        // uses the dedicated player Window above).
+        .iPadPlayerSheet(isPresented: $showingFullPlayer)
         .task(id: app.activeConnectionID) {
             // Reset before observing so a connection switch never flashes the previous
             // connection's libraries, and never leaves a stale library selected.

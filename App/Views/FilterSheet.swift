@@ -42,6 +42,11 @@ struct FilterSheet: View {
                 }
         }
         .presentationDetents([.medium, .large])
+        // macOS ignores `.presentationDetents`, so without an explicit size the sheet collapses to
+        // its content's ideal size and the filter form gets clipped. Give it a usable minimum.
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 520)
+        #endif
         .task { await load() }
     }
 
