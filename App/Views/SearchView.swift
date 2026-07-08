@@ -39,6 +39,7 @@ struct SearchView: View {
             .navigationDestination(for: AuthorSummary.self) { author in
                 if let library = activeLibrary { AuthorDetailView(library: library, author: author) }
             }
+            .itemDetailDestination()
     }
 
     @ViewBuilder
@@ -177,16 +178,17 @@ private struct SearchResultsView: View {
     }
 }
 
-/// A compact title result row: small cover, title, author (or subtitle) — tapping plays the item
-/// (item detail is M1c-b), consistent with `CoverCard` everywhere else.
+/// A compact title result row: small cover, title, author (or subtitle) — tapping pushes
+/// `ItemDetailView` (the Play/Resume action lives there), consistent with `CoverCard` everywhere
+/// else. The stack's `.itemDetailDestination()` (registered on `SearchView`) resolves the push.
 private struct SearchTitleRow: View {
-    @Environment(AppState.self) private var app
     let row: ItemRow
 
     var body: some View {
-        Button {
-            Task { await app.startPlayback(itemID: row.id) }
-        } label: {
+        NavigationLink(value: ItemDetailRoute(
+            itemID: row.id, title: row.title, author: row.author ?? row.subtitle,
+            updatedAt: row.updatedAt, duration: row.duration)
+        ) {
             HStack(spacing: 12) {
                 CachedCoverView(itemID: row.id, updatedAt: row.updatedAt)
                     .frame(width: 44, height: 44)
@@ -206,9 +208,7 @@ private struct SearchTitleRow: View {
                 Spacer(minLength: 0)
             }
             .padding(.vertical, 2)
-            .contentShape(Rectangle())
         }
-        .buttonStyle(.plain)
     }
 }
 

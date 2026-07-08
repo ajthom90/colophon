@@ -87,6 +87,21 @@ final class AppState {
     /// handles it.
     private(set) var refreshBanner: (libraryID: String, message: String)?
     let playback = PlaybackController(backend: AVQueuePlayerBackend())
+    /// The audiobook sleep timer (Task 5). Owned here — NOT by the player view — so an armed timer
+    /// survives the full player being dismissed and keeps counting while the book plays. Its
+    /// `chapters` are refreshed on `startPlayback` and it's disarmed when the session is retired.
+    let sleepTimer: SleepTimer
+    /// The current book's bookmarks (Task 6). Owned here — like `sleepTimer` — so the list survives
+    /// the bookmarks/player sheet being dismissed. `startPlayback` points it at the active client +
+    /// now-playing item and reconciles it from `me()`; `retireCurrentSession` clears it. IN-MEMORY +
+    /// `me()`-sourced (not persisted to LibraryCache) — see `Bookmarks`' caching-decision note.
+    let bookmarks = Bookmarks()
+    /// The up-next queue (Task 8) — books to play AFTER the current one. Owned here (like
+    /// `sleepTimer`/`bookmarks`) so it survives the player/queue sheet being dismissed. IN-MEMORY
+    /// for v1 (persistence/Continuity is post-v1). `startPlayback`'s book-finished signal and the
+    /// player's Next action both drain it via `advanceToNext`; browse surfaces enqueue via
+    /// `playNext`/`addToQueue`; signing out / removing a connection drops that connection's entries.
+    let queue = PlaybackQueue()
     let cache: LibraryCacheStore
     let coverStore: CoverStore
 
@@ -102,6 +117,13 @@ final class AppState {
     static let defaultRateKey = "colophon.defaultRate"
     static let skipIntervalKey = "colophon.skipInterval"
 
+    /// Single source of truth for the skip-interval setting (Task 4), shared by `SettingsView`'s
+    /// `@AppStorage` default + Picker options, `storedSkipInterval()` below, and the live-update
+    /// `onChange` in `ColophonApp`. Default 30s; choices 10/15/30/45/60 (all valid `gobackward.N` /
+    /// `goforward.N` SF Symbols, so the transport glyphs render for every option).
+    static let defaultSkipInterval = 30
+    static let skipIntervalOptions = [10, 15, 30, 45, 60]
+
     /// The user's default playback rate (Settings), applied to every freshly opened book in
     /// `startPlayback` — per-book overrides are M2/CloudSync scope. `UserDefaults.double` returns
     /// 0 for an absent key (nothing set yet, or `SettingsView` never opened), which reads as the
@@ -111,11 +133,12 @@ final class AppState {
         return stored == 0 ? 1.0 : stored
     }
 
-    /// The user's skip-interval preference (Settings), seconds — one of 10/15/30/45. Same
-    /// unset-reads-as-default treatment as `storedDefaultRate`: an absent key reads as 15.
+    /// The user's skip-interval preference (Settings), seconds — one of `skipIntervalOptions`
+    /// (10/15/30/45/60). Same unset-reads-as-default treatment as `storedDefaultRate`: an absent
+    /// key (`UserDefaults.integer` returns 0) reads as `defaultSkipInterval` (30).
     private static func storedSkipInterval() -> Int {
         let stored = UserDefaults.standard.integer(forKey: skipIntervalKey)
-        return stored == 0 ? 15 : stored
+        return stored == 0 ? defaultSkipInterval : stored
     }
 
     /// UUID of the `CachedConnection` row for whatever server/user is currently signed in —
@@ -148,6 +171,12 @@ final class AppState {
     /// `playingConnectionID` when `startPlayback` succeeds and cleared when the session is retired.
     /// Read-only to the UI (private setter).
     private(set) var nowPlayingItemID: String?
+    /// The currently-playing book's chapters (GLOBAL book seconds, `{id,start,end,title}`), taken
+    /// straight from the /play envelope's `session.chapters`. This is the ONLY surface the full
+    /// player (`PlayerModel`/`FullPlayerView`/`ChapterListView`) reads chapters from — the mini-bar
+    /// and transport don't need them. Set alongside `nowPlayingItemID` when `startPlayback`
+    /// succeeds and cleared (to `[]`) when the session is retired. Read-only to the UI.
+    private(set) var nowPlayingChapters: [Chapter] = []
     /// Last library ID `refreshItems` was asked to page — recorded so a future first-run/
     /// offline flow (M1b) can resume browsing the last-viewed library without a live server.
     private(set) var activeLibraryID: String?
@@ -196,6 +225,14 @@ final class AppState {
     /// `retireCurrentSession` (handle nil) and both await `client.startPlayback`; if response A
     /// lands after B, the user hears the wrong item and B's server session leaks open.
     private var isStartingPlayback = false
+    /// First-advance-wins reentrancy guard for `advanceToNext` (Task 8). Without it a reentrant
+    /// advance — the book-finished signal firing while the user taps Play Next, or a double-tap —
+    /// would peek/consume the queue a second time while the first advance's `startPlayback` is
+    /// mid-flight; `startPlayback`'s own `isStartingPlayback` guard then silently drops the second,
+    /// so a peeked/popped item would be LOST (and the empty branch would `retireCurrentSession`
+    /// twice → a double `/close`). Held across the whole async body so only one advance runs at a
+    /// time; combined with peek-then-commit, a superseded advance leaves the queue untouched.
+    private var isAdvancing = false
     /// Reentrancy guard for `activateConnection`'s synchronous section — see its doc comment.
     private var activatingConnectionID: String?
     /// The background probe kicked off by the most recent `activateConnection` call — see its
@@ -238,6 +275,9 @@ final class AppState {
         self.transport = transportProvider()
         self.oidcTransport = oidcTransportProvider?()
         self.tokenStore = tokenStore ?? KeychainTokenStore()
+        // `playback` is initialized at its declaration, so it's already live here; the timer
+        // captures only that controller (not `self`), keeping init capture-free.
+        self.sleepTimer = SleepTimer(host: playback)
         self.socketFactory = socketFactory ?? { url, tokenProvider in
             SocketService(serverURL: url, tokenProvider: tokenProvider)
         }
@@ -256,6 +296,14 @@ final class AppState {
         // array and flashes `ConnectView` for one frame before `.task` runs `loadConnections()`,
         // even when connections already exist on disk.
         connections = (try? cache.connections()) ?? []
+        // Wire the BOOK-finished signal (Task 8): when the current book plays to its end, advance
+        // to the next queued item (or stop if the queue is empty). Set once here — `advanceToNext`
+        // always consults the CURRENT queue/state, so this survives every `startPlayback`. Detached
+        // because the callback fires synchronously from the (MainActor) controller and the advance
+        // is async; `[weak self]` avoids a retain cycle (AppState owns `playback`).
+        playback.onBookFinished = { [weak self] in
+            Task { await self?.advanceToNext() }
+        }
     }
 
     var deviceInfo: DeviceInfo {
@@ -664,6 +712,10 @@ final class AppState {
         }
         await tokenStore.clear(for: id)
         needsSignIn.insert(id)
+        // Drop this connection's up-next entries (Task 8): a signed-out / removed connection can't
+        // play, so its queued books shouldn't linger. `advanceToNext`'s valid-connection guard is
+        // the defense-in-depth backstop; this keeps the visible queue honest immediately.
+        queue.removeEntries(connectionID: id)
         loadConnections()
     }
 
@@ -930,6 +982,10 @@ final class AppState {
     /// server's own `lastUpdate`, falling back to wall-clock only when the server omits it.
     func refreshProgress() async {
         guard let client, let connectionID = activeConnectionID else { return }
+        // Snapshot the bookmarks generation BEFORE the me() fetch: a mutation that lands during the
+        // round-trip bumps it, so the (now-stale) snapshot below is dropped rather than clobbering
+        // the just-confirmed create/rename/delete.
+        let bookmarkGeneration = bookmarks.generation
         guard let me = try? await client.me() else { return }
         // A connection switch during the me() round-trip must never write server-A progress under
         // server-B's ID.
@@ -945,6 +1001,27 @@ final class AppState {
                 lastUpdate: entry.lastUpdate ?? now)
         }
         try? cache.upsertProgressBatch(batch)
+        // Reuse the same `me()` payload to keep the now-playing book's bookmarks fresh (Task 6):
+        // `me().bookmarks[]` is the source of truth, filtered to the playing item. Cheap, and
+        // ignored by the store when no book is playing (`nowPlayingItemID` nil) or the item differs.
+        if let itemID = nowPlayingItemID {
+            bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID,
+                                expectedGeneration: bookmarkGeneration)
+        }
+    }
+
+    /// Loads the now-playing book's bookmarks from `GET /api/me`'s `bookmarks[]`, filtered to
+    /// `itemID` (Task 6). Driven from `startPlayback` so the player shows existing bookmarks the
+    /// moment a book opens — `refreshProgress` (Home appear/refresh) keeps them fresh thereafter,
+    /// reusing its own `me()` call. Best-effort: an absent/failed `me()` leaves the list untouched.
+    /// Guards against a connection switch or a new book started during the round-trip.
+    func refreshBookmarks(forItemID itemID: String) async {
+        guard let client, let connectionID = activeConnectionID else { return }
+        let bookmarkGeneration = bookmarks.generation
+        guard let me = try? await client.me() else { return }
+        guard connectionID == activeConnectionID, nowPlayingItemID == itemID else { return }
+        bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID,
+                            expectedGeneration: bookmarkGeneration)
     }
 
     /// Retire the current session completely (ordering matters: flush → detach sync callback →
@@ -962,6 +1039,12 @@ final class AppState {
         sessionHandle = nil
         playingConnectionID = nil
         nowPlayingItemID = nil
+        nowPlayingChapters = []
+        // Retiring the book cancels any armed sleep timer (it was scoped to that book).
+        sleepTimer.turnOff()
+        sleepTimer.chapters = []
+        // The bookmarks were scoped to that book too — drop them and the writer/item pointers.
+        bookmarks.clear()
     }
 
     func startPlayback(itemID: String) async {
@@ -987,6 +1070,22 @@ final class AppState {
             // holds its own client, captured above — independent of `self.client`).
             playingConnectionID = owner
             nowPlayingItemID = itemID
+            // Surface this book's chapters (global seconds) to the full player. Cleared in
+            // `retireCurrentSession`; the mini-bar/transport don't consume these.
+            nowPlayingChapters = envelope.session.chapters
+            // Hand the same chapters to the sleep timer so its End-of-Chapter mode can find this
+            // book's boundaries. A fresh book starts with no armed timer.
+            sleepTimer.chapters = envelope.session.chapters
+            sleepTimer.turnOff()
+            // Point the bookmarks store at this session's client + item, then load the existing
+            // bookmarks from `me()` (best-effort, detached — the player is playable immediately).
+            bookmarks.configure(writer: client, itemID: itemID)
+            Task { await refreshBookmarks(forItemID: itemID) }
+            // Now-playing artwork (Task 9): load this book's cover bytes (through the same disk
+            // cover cache `CachedCoverView` uses) and hand them to the controller so the lock
+            // screen / Control Center / Now Playing menu show the cover. Detached + best-effort —
+            // playback is audible immediately regardless. `owner` is this session's connection.
+            if let owner { Task { await loadNowPlayingArtwork(itemID: itemID, connectionID: owner) } }
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }
@@ -998,11 +1097,110 @@ final class AppState {
             playback.skipInterval = Self.storedSkipInterval()
             playback.load(session: envelope.session, trackURLs: urls)
             // Set AFTER `load()` (which resets the controller's session state) and BEFORE
-            // `play()`: a freshly opened book starts at the user's default rate.
-            playback.rate = Float(Self.storedDefaultRate())
+            // `play()`: a freshly opened book resumes at ITS stored per-book rate (Task 7's `v3`
+            // `cachedItemPref` table), falling back to the user's global default rate when this
+            // book has none stored yet. `owner` (captured before the awaits above) is the
+            // connection this session belongs to — the same id `setPlaybackRate` persists under.
+            let storedRate = owner.flatMap { try? cache.playbackRate(connectionID: $0, itemID: itemID) }
+            playback.rate = Float(storedRate ?? Self.storedDefaultRate())
             playback.play()
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+        }
+    }
+
+    /// Loads the now-playing book's cover bytes (through the disk-backed `CoverStore`, the same
+    /// cache `CachedCoverView` uses) and hands them to the `PlaybackController` for the lock-screen /
+    /// Control-Center / Now-Playing-menu artwork (Task 9). Best-effort: a fetch/decode failure just
+    /// leaves the now-playing surface without art. Guards against the book changing during the fetch
+    /// so a slow cover for a superseded book never overwrites the current one's artwork.
+    private func loadNowPlayingArtwork(itemID: String, connectionID: String) async {
+        guard let client else { return }
+        let coverURL = client.coverURL(itemID: itemID, width: 600, updatedAt: nil)
+        guard let data = try? await coverStore.coverData(
+            connectionID: connectionID, itemID: itemID, updatedAt: nil,
+            fetch: { try await URLSession.shared.data(from: coverURL).0 }
+        ) else { return }
+        guard nowPlayingItemID == itemID else { return }
+        playback.setNowPlayingArtwork(data)
+    }
+
+    /// The `SpeedControl` write path (Task 7): applies `rate` to the LIVE `PlaybackController`
+    /// immediately, and persists it as this (connection, item)'s per-book preference so a later
+    /// `startPlayback` of the SAME book resumes at it (read back via `cache.playbackRate` above).
+    /// Persistence is a best-effort no-op when no book is playing (`playingConnectionID`/
+    /// `nowPlayingItemID` unset) — defensive; the UI only offers rate control while one is — and a
+    /// failed write is swallowed rather than surfaced, matching `retireCurrentSession`'s `try?`
+    /// treatment of this same cache: a missed persist costs only "resumes at the global default
+    /// next time," never a playback-breaking error.
+    func setPlaybackRate(_ rate: Double) {
+        playback.setRate(Float(rate))
+        guard let connectionID = playingConnectionID, let itemID = nowPlayingItemID else { return }
+        try? cache.setPlaybackRate(rate, connectionID: connectionID, itemID: itemID)
+    }
+
+    // MARK: - Up-next queue (Task 8)
+
+    /// Enqueue a browse item at the FRONT of the up-next queue ("Play Next"). Scoped to the active
+    /// connection (the surface the user is browsing owns the item); a no-op with no active
+    /// connection. The minimal display payload rides along so `QueueView` paints without a fetch.
+    func playNext(itemID: String, title: String, author: String?) {
+        guard let connectionID = activeConnectionID else { return }
+        queue.playNext(QueueEntry(itemID: itemID, connectionID: connectionID, title: title, author: author))
+    }
+
+    /// Enqueue a browse item at the END of the up-next queue ("Add to Queue"). Same scoping as
+    /// `playNext`.
+    func addToQueue(itemID: String, title: String, author: String?) {
+        guard let connectionID = activeConnectionID else { return }
+        queue.addToQueue(QueueEntry(itemID: itemID, connectionID: connectionID, title: title, author: author))
+    }
+
+    /// Advance past the current book — driven by the book-finished signal (`playback.onBookFinished`,
+    /// wired in `init`) AND the player's manual Next action. The CORE DECISION is the pure, unit-tested
+    /// `PlaybackQueue.peekNextPlayable(validConnectionIDs:)`: it drops any leading entry whose owning
+    /// connection can't play (signed out / removed — the item is unreachable) and returns the next
+    /// playable one WITHOUT consuming it (peek-then-commit), or `nil` to stop.
+    ///
+    /// - First-advance-wins: a reentrant advance (book-finished racing a Play Next tap, or a
+    ///   double-tap) bails immediately, so the queue is never peeked/consumed twice.
+    /// - Non-empty → start the next entry's book, then COMMIT (remove it) only once `startPlayback`
+    ///   actually opened it. If `startPlayback` bails (a connection that can't authenticate), the
+    ///   entry STAYS queued (not lost) and the finished session is retired here so it's never left
+    ///   dangling open. When the entry belongs to a DIFFERENT connection than the active one, that
+    ///   connection is activated first so the new /play session opens on it.
+    /// - Empty (or only dead entries) → `retireCurrentSession()` (stop): the finished book's session
+    ///   is closed and nothing new plays.
+    func advanceToNext() async {
+        guard !isAdvancing else { return }
+        isAdvancing = true
+        defer { isAdvancing = false }
+
+        // Connections that can PLAY right now: they exist in the cache AND aren't flagged
+        // `needsSignIn` (signed out / rejected). Peeking against this set drops an unreachable
+        // entry and skips to the next genuinely-playable one rather than stalling on it. Freshly
+        // read so a just-removed / just-signed-out connection is reflected.
+        let playable = Set(((try? cache.connections()) ?? []).map(\.id)).subtracting(needsSignIn)
+        guard let next = queue.peekNextPlayable(validConnectionIDs: playable) else {
+            // Nothing playable left: stop cleanly (close the finished session, tear down playback).
+            await retireCurrentSession()
+            return
+        }
+        // A queued item may belong to a different connection than the active one — activate it so
+        // `startPlayback`'s `self.client` / owner point at the right server. (In v1's single-server
+        // flow the entry's connection is usually the active one, so this is skipped.)
+        if next.connectionID != activeConnectionID {
+            await activateConnection(next.connectionID)
+        }
+        await startPlayback(itemID: next.itemID)
+        if nowPlayingItemID == next.itemID {
+            queue.remove(next)            // COMMIT: it actually started → drop it from the queue
+        } else {
+            // `startPlayback` bailed (e.g. the connection can't authenticate): the entry is LEFT
+            // queued by the peek above, so it isn't lost. But `startPlayback` bails BEFORE its own
+            // retire, so the finished session could still be open — retire it here (idempotent: a
+            // no-op if already retired) so nothing is left dangling.
+            await retireCurrentSession()
         }
     }
 

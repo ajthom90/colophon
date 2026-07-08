@@ -173,3 +173,45 @@ App/ColophonApp.swift                          MOD  player Window scene (Mac); a
 - **Schema discipline:** v1/v2 frozen; per-book prefs in an additive v3 with a preserve-existing-rows migration test (same rigor as the v2 test the M1c-a reviewer sabotage-proved).
 - **Audio safety baked in:** every E2E task states COLOPHON_AUTO_MUTE=1 + always-terminate + the ≤3-screenshot cap (the M1c-a Task 9 lesson).
 - **Deferred to M1c-c / post-v1:** podcast episode playback + episode UI (M1c-c reuses this player); offline downloads (M2); queue persistence + Handoff/Continuity + iCloud-synced prefs (post-v1); the M1c-a source-only claims (episode DTOs, authorImageURL) get their live fixture in M1c-c.
+
+---
+
+## M1c-b shipped reality (Task 10 wrap-up)
+
+All 10 tasks complete (commits 0386aad..e6015b0, base = main post-M1c-a merge 970146e). Full cold-start sweep GREEN: `make test` 164 (ABSKit 101, PlayerEngine 30, LibraryCache 33), `make test-app` 99, `make gen`, `make build-ios`, `make build-mac` — zero real compiler warnings (only the benign, non-Colophon "AppIntents.framework metadata extraction skipped" build-system notice on both platforms; the M1c-a-era PerfSpikeView warning did not recur this run).
+
+**Shipped player surfaces:**
+- Item detail view (universal tap-through from every browse surface) with cache-then-refresh, Resume-from-progress, one `.glassProminent` primary, opaque metadata/description/chapters-count row.
+- Full-screen player (`FullPlayerView`/`PlayerModel`): `backgroundExtensionEffect` immersive backdrop, chapter-aware `Slider` (drag-detach, seek-on-release, global book-seconds via `BookTimeline`), `ChapterListView` (tap-to-seek, current highlighted).
+- Per-platform presentation (`PlayerPresentation.swift`): iPhone `.fullScreenCover`, iPad `.sheet(.large)`, Mac dedicated `Window("Now Playing", id: "player")` via `openWindow` — never a takeover. Configurable skip interval (10/15/30/45/60s, `AppState.defaultSkipInterval`) live-applies to the transport glyph and `PlaybackController.skipInterval`, including on the lock screen/Control Center without reopening the book.
+- Mac `Playback` command menu: prev/next chapter (⌥⌘←/→), speed (⇧⌘,/.), skip (⌘←/→), Show Player (⌘0) — all non-Space, session-guarded, preserving the M1c-a bare-Space fix (play/pause stays menu-click-only).
+- Sleep timer: Off/5/10/15/30/45/60-min presets + End-of-Chapter, live countdown, `fadeOutAndPause(over:steps:)` (volume ramp → pause, mute-aware, cancel-safe on session retire).
+- Bookmarks: create-at-current-time/rename/delete/seek-to, optimistic + generation-guarded reconcile from `/api/me`, fractional-time round-trip.
+- Per-book speed: `v3` GRDB migration (`cachedItemPref`, PK connectionID+itemID, additive, `v1`/`v2` byte-frozen and preserved), read-on-play, persists across relaunch.
+- Up-next queue: play-next/add-to-queue/reorder/remove, book-finished auto-advance (peek-then-commit, race-safe), dropped entries on connection removal.
+- Now Playing/lock-screen/Control Center: artwork (off-main-safe), chapter title that updates live on boundary crossing (not just at open), remote command mapping, clears on retire — no zombie card.
+- Human-verification checklist: `docs/superpowers/m1c-b-human-verification.md` (a–h: audible playback, chapter seek by ear, sleep-timer fade, lock-screen/media-keys/Now-Playing-menu, Mac window+commands, per-book speed resume, bookmarks, queue advance), referenced from the README.
+
+**Deferred / follow-up, grouped:**
+
+*M1c-c (podcasts):*
+- Episode playback + episode browse UI (this player is reused as-is).
+- Episode/podcast DTO + `series.books` + `authorImageURL` need live fixtures (carried from the M1c-a review; still source-only claims).
+- Podcast search buckets in the blended local-FTS5 + server search.
+
+*Post-v1:*
+- Up-next queue is in-memory only — no persistence, no Handoff/Continuity resume.
+- Per-book playback speed and other prefs are device-local — no iCloud sync.
+- Offline bookmark cache (bookmarks currently reconcile live from `/api/me`, no local cache table for offline viewing).
+
+*PENDING HUMAN verification (checklist a–h at `docs/superpowers/m1c-b-human-verification.md`):* Mac lock-screen/Now-Playing-menu visual + audible playback + media keys are TCC/device-only and cannot be automated in the sandboxed/muted E2E harness — a human must run the full checklist on a real device/Mac against a real library, unmuted, before this ships to users.
+
+**Small deferred code minors (carried forward, none blocking):**
+- `LibraryCacheStore.setPlaybackRate` does a full-row upsert; its comment already flags that this would silently reset a future sibling per-book pref — switch to read-modify-write when one lands (no sibling pref exists yet in M1c-b, so left as-is).
+- No UI to clear a book's stored rate back to "unset" (falls back to the global default) — by design for v1.
+- Item detail: no truncation detection for the description's More/Show Less control (always shown); `%`/Resume labels not yet `.monospacedDigit()` (cosmetic).
+- Full player: double-sort of chapters (defensive, negligible cost); `@Observable` `PlayerModel` re-created inertly per body; stacked aspectRatio/scrim slightly heavier than needed; elapsed can render `-0:00` at the very end of a book (cosmetic).
+- Mac: the player Window's dismiss chevron is redundant with the native traffic-light close (harmless, flagged for a future pass); Mac `Playback` menu's bare `⌘←/→` skip shortcuts can be captured while the sidebar Search field has focus (pre-existing, much narrower than the bare-Space issue M1c-a fixed).
+- Bookmarks rename is not idb-drivable (SwiftUI `TextField` limitation) — covered by unit + contract tests instead of E2E.
+
+M1c-b: all 10 tasks complete. Ready for whole-branch review (no tag yet — controller tags after).

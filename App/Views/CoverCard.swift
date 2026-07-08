@@ -10,9 +10,9 @@ import LibraryCache
 /// duration for the fraction is a caller-supplied duration source (progress rows store
 /// `currentTime`, not duration): a shelf card passes the shelf entity's `media.duration`, and the
 /// LIBRARY GRID passes `CachedItem.duration` (always present on the grid row) — the Task 7-review
-/// fix so grid pills render, since the shelf-entity duration isn't available there. Tapping starts
-/// playback of the item (so the shelf/grid is functional and the mini-bar/transport lights up);
-/// item detail is M1c-b.
+/// fix so grid pills render, since the shelf-entity duration isn't available there. Tapping pushes
+/// `ItemDetailView` (via `ItemDetailRoute` — the Play/Resume action lives in the detail); the
+/// destination is registered at each browse stack's stable root (`.itemDetailDestination()`).
 struct CoverCard: View {
     @Environment(AppState.self) private var app
     let itemID: String
@@ -38,9 +38,9 @@ struct CoverCard: View {
     }
 
     var body: some View {
-        Button {
-            Task { await app.startPlayback(itemID: itemID) }
-        } label: {
+        NavigationLink(value: ItemDetailRoute(
+            itemID: itemID, title: title, author: author, updatedAt: updatedAt, duration: duration)
+        ) {
             VStack(alignment: .leading, spacing: 6) {
                 CachedCoverView(itemID: itemID, updatedAt: updatedAt)
                     .frame(width: Self.width, height: Self.width)
@@ -83,6 +83,23 @@ struct CoverCard: View {
             .frame(width: Self.width, alignment: .leading)
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            // Up-next queue affordances (Task 8) — native context-menu actions on a browse card.
+            // Enabled only while a book is playing (there's a "current book" to queue after). The
+            // guard is per-BUTTON, not on the card, so it never disables tap-through to the detail.
+            Button {
+                app.playNext(itemID: itemID, title: title, author: author)
+            } label: {
+                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            .disabled(app.nowPlayingItemID == nil)
+            Button {
+                app.addToQueue(itemID: itemID, title: title, author: author)
+            } label: {
+                Label("Add to Queue", systemImage: "text.append")
+            }
+            .disabled(app.nowPlayingItemID == nil)
+        }
     }
 }
 

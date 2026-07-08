@@ -504,6 +504,151 @@ struct AppStateTests {
         #expect(app.playback.isPlaying == true)           // the switch left the player alone
     }
 
+    // MARK: - Up-next queue advance (Task 8)
+
+    /// `advanceToNext` with a non-empty queue pops the FRONT entry, closes the finished session, and
+    /// starts the next book: the queue drops the played entry (deterministic), and a `/play` for the
+    /// next item id is issued. (Multi-book A→B advance can't be shown live — the seed has one book —
+    /// so this is the unit proof of the deliverable.)
+    @Test func advanceToNextPlaysFrontOfQueueThenRemovesIt() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbs me(i1)/flush
+        await transport.enqueue(status: 200, json: "{}")              // /close i1 on retire
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i2 (advance target)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+
+        app.addToQueue(itemID: "i2", title: "Second", author: "Auth")
+        app.addToQueue(itemID: "i3", title: "Third", author: "Auth")
+        #expect(app.queue.entries.map(\.itemID) == ["i2", "i3"])
+
+        await app.advanceToNext()
+
+        // The front (i2) was popped; i3 remains — the core decision, fully deterministic.
+        #expect(app.queue.entries.map(\.itemID) == ["i3"])
+        // And a /play for i2 was issued (advance handed the front to startPlayback).
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.contains("/items/i2/play") })
+        #expect(app.nowPlayingItemID == "i2")
+    }
+
+    /// `advanceToNext` with an EMPTY queue just retires the current session and stops — nothing new
+    /// plays (no second `/play`), playback halts, and the now-playing item clears.
+    @Test func advanceToNextWithEmptyQueueStops() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbs me(i1)/flush
+        await transport.enqueue(status: 200, json: "{}")              // /close i1 on retire (stop)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+        #expect(app.queue.isEmpty)
+
+        await app.advanceToNext()
+
+        #expect(app.nowPlayingItemID == nil)          // finished session retired
+        #expect(app.playback.isPlaying == false)      // stopped, nothing new started
+        // Only i1's /play was ever issued — the empty queue produced no advance play.
+        let plays = await transport.recorded.compactMap { $0.url?.path }.filter { $0.contains("/play") }
+        #expect(plays.count == 1)
+    }
+
+    /// The book-finished signal (`playback.onBookFinished`, emitted by PlayerEngine when the last
+    /// track ends — see `PlaybackControllerTests.bookFinishedFiresOnlyOnLastItem`) is wired by
+    /// `AppState` to `advanceToNext`. Firing it drains the queue front. (The PlayerEngine→AppState
+    /// callback is proven in the engine suite; this proves AppState's end of the wire.)
+    @Test func bookFinishedSignalTriggersAdvance() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbers for the advance
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i2 (advance target)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+        app.addToQueue(itemID: "i2", title: "Second", author: "Auth")
+        #expect(app.playback.onBookFinished != nil)   // AppState wired the signal in init
+
+        // Fire the wired book-finished signal; it spawns the detached advance.
+        app.playback.onBookFinished?()
+
+        // Await the advance draining the front (the pop is synchronous once the Task runs).
+        for _ in 0..<1000 where app.queue.entries.contains(where: { $0.itemID == "i2" }) {
+            await Task.yield()
+        }
+        #expect(!app.queue.entries.contains { $0.itemID == "i2" })
+    }
+
+    /// CONCURRENCY REGRESSION (Task 8): two advances firing near-simultaneously — the book-finished
+    /// signal racing a manual Play Next, or a double-tap — must consume EXACTLY ONE queued item and
+    /// leave the other queued, never silently dropping it. RED without the first-advance-wins guard +
+    /// peek-then-commit: the original code popped the front on EACH advance, but `startPlayback`'s
+    /// own guard dropped the second, losing that popped item (queue ended empty, i3 gone).
+    @Test func concurrentAdvanceDoesNotDropQueuedItem() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbers for the ONE advance
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i2 (the single advance)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+        app.addToQueue(itemID: "i2", title: "Second", author: "Auth")
+        app.addToQueue(itemID: "i3", title: "Third", author: "Auth")
+        #expect(app.queue.entries.map(\.itemID) == ["i2", "i3"])
+
+        // Fire two advances near-simultaneously. The first sets the in-flight flag before its first
+        // await; the second bails at the guard, so the queue is peeked/consumed exactly once.
+        async let a: Void = app.advanceToNext()
+        async let b: Void = app.advanceToNext()
+        _ = await (a, b)
+
+        #expect(app.queue.entries.map(\.itemID) == ["i3"])   // i2 consumed ONCE; i3 REMAINS (not lost)
+        #expect(app.nowPlayingItemID == "i2")
+        // Exactly two /play requests total: i1's initial open + i2's single advance — no third.
+        let plays = await transport.recorded.compactMap { $0.url?.path }.filter { $0.contains("/play") }
+        #expect(plays.count == 2)
+    }
+
+    /// Removing a connection drops its queued entries (Task 8's removed-connection handling): a
+    /// book queued from a connection that's then forgotten doesn't linger in the up-next queue.
+    @Test func removeConnectionDropsItsQueuedEntries() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        app.addToQueue(itemID: "i9", title: "Queued", author: nil)
+        #expect(app.queue.entries.count == 1)
+
+        await app.removeConnection(cid)
+
+        #expect(app.queue.isEmpty)   // the removed connection's queued entry was dropped
+    }
+
     /// Signing out of the connection that OWNS the playing session retires it first: the `/play`
     /// that opened the session is followed by a `/close` that tears it down server-side.
     @Test func signOutOfOwnerRetiresSession() async throws {
@@ -1321,7 +1466,8 @@ struct SettingsPlumbingTests {
     }
 
     /// Unset Settings keys (fresh install, `SettingsView` never opened) read as the documented
-    /// defaults — 1.0× and 15s — not `UserDefaults`' bare-key zero value.
+    /// defaults — 1.0× and `AppState.defaultSkipInterval` (30s, the Task-4 reconciled single source
+    /// of truth) — not `UserDefaults`' bare-key zero value.
     @Test func unsetSettingsKeysReadAsDocumentedDefaults() async throws {
         let restoreRate = snapshotDefault(AppState.defaultRateKey)
         let restoreSkip = snapshotDefault(AppState.skipIntervalKey)
@@ -1339,6 +1485,82 @@ struct SettingsPlumbingTests {
         await app.startPlayback(itemID: "i1")
 
         #expect(app.playback.rate == 1.0)
-        #expect(app.playback.skipInterval == 15)
+        #expect(app.playback.skipInterval == AppState.defaultSkipInterval)
+    }
+
+    // MARK: - Task 7: per-book playback-rate persistence (v3)
+
+    /// A book with a stored per-book rate (`cache.setPlaybackRate`, Task 7's `v3` table) resumes at
+    /// THAT rate on `startPlayback`, overriding the global default setting.
+    @Test func storedPerBookRateOverridesGlobalDefault() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        defer { restoreRate() }
+        UserDefaults.standard.set(1.0, forKey: AppState.defaultRateKey)   // distinct from the per-book rate
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.setPlaybackRate(1.5, connectionID: cid, itemID: "i1")   // pre-existing per-book pref
+
+        await app.startPlayback(itemID: "i1")
+
+        #expect(app.playback.rate == 1.5)   // per-book rate wins over the 1.0x global default
+    }
+
+    /// The sibling: a book with NO stored rate falls back to the global default, unaffected by a
+    /// DIFFERENT book's per-book preference (scoped by itemID, not just connection).
+    @Test func bookWithoutStoredRateFallsBackToGlobalDefault() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        defer { restoreRate() }
+        UserDefaults.standard.set(1.75, forKey: AppState.defaultRateKey)
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.setPlaybackRate(1.5, connectionID: cid, itemID: "some-other-book")
+
+        await app.startPlayback(itemID: "i1")   // no per-book rate stored for "i1"
+
+        #expect(app.playback.rate == 1.75)   // global default applies
+    }
+
+    /// `AppState.setPlaybackRate` (the SpeedControl write path) both applies the rate to the live
+    /// `PlaybackController` immediately AND persists it as this (connection, item)'s per-book pref —
+    /// so a later `startPlayback` of the SAME book resumes at it.
+    @Test func setPlaybackRateAppliesLiveAndPersistsPerBook() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        defer { restoreRate() }
+        UserDefaults.standard.set(1.0, forKey: AppState.defaultRateKey)
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // first open
+        await transport.enqueue(status: 200, json: "{}")              // possible flush /sync on retire
+        await transport.enqueue(status: 200, json: "{}")              // /close on retire
+        await transport.enqueue(status: 200, json: playSessionJSON)   // re-open
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.rate == 1.0)
+
+        app.setPlaybackRate(1.5)
+        #expect(app.playback.rate == 1.5)                                          // applied live
+        #expect(try app.cache.playbackRate(connectionID: cid, itemID: "i1") == 1.5) // persisted per-book
+
+        await app.startPlayback(itemID: "i1")   // re-open the SAME book
+        #expect(app.playback.rate == 1.5)       // resumes at the persisted per-book rate
     }
 }

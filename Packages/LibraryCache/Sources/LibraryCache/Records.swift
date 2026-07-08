@@ -288,6 +288,27 @@ public struct CachedProgress: Codable, FetchableRecord, PersistableRecord, Senda
     }
 }
 
+/// Per-book, device-local preferences (Task 7, `v3`): currently just the persisted playback rate,
+/// with room in this same row for future per-book prefs (the plan's design intent for `v3`) without
+/// another migration. PK `(connectionID, itemID)`, matching every other per-item table in this store.
+public struct CachedItemPref: Codable, FetchableRecord, PersistableRecord, Sendable, Identifiable, Equatable, Hashable {
+    public static let databaseTableName = "cachedItemPref"
+
+    public var connectionID: String
+    public var itemID: String
+    /// nil = no per-book rate stored — the caller (`AppState.startPlayback`) falls back to the
+    /// global default rate setting.
+    public var playbackRate: Double?
+
+    public var id: String { connectionID + "/" + itemID }
+
+    public init(connectionID: String, itemID: String, playbackRate: Double? = nil) {
+        self.connectionID = connectionID
+        self.itemID = itemID
+        self.playbackRate = playbackRate
+    }
+}
+
 public extension Array where Element == CachedProgress {
     /// Indexes a connection's progress rows by `itemID` — the merge rule shared by every
     /// progress-pill surface (Home shelves, the library grid, and M1c-a Task 9's author/series

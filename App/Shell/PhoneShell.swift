@@ -47,17 +47,21 @@ struct PhoneShell: View {
                         selectedLibraryID: $selectedLibraryID,
                         browseMode: $browseMode,
                         initializedConnectionID: $initializedConnectionID)
+                        .accountMenu()
                 }
             }
             Tab("Downloads", systemImage: "arrow.down.circle") {
-                NavigationStack { DownloadsPlaceholder() }
+                NavigationStack { DownloadsPlaceholder().accountMenu() }
             }
             Tab("Search", systemImage: "magnifyingglass", role: .search) {
-                NavigationStack { SearchView() }
+                NavigationStack { SearchView().accountMenu() }
             }
         }
         .phoneTabChrome { MiniPlayerBar { showingFullPlayer = true } }
-        .sheet(isPresented: $showingFullPlayer) { FullPlayerSheet() }
+        // iPhone per-platform presentation (Task 4): an edge-to-edge `fullScreenCover` (native
+        // slide-up). The presentation seam lives in `PlayerPresentation.swift` — see its morph note
+        // for why this is a standard cover rather than a zoom morph.
+        .iPhonePlayerCover(isPresented: $showingFullPlayer)
     }
 }
 
@@ -123,6 +127,11 @@ private struct LibraryTabContent: View {
         .navigationDestination(for: AuthorSummary.self) { author in
             if let library = selected { AuthorDetailView(library: library, author: author) }
         }
+        // Same stable-root rationale as the Series/Authors destinations above: registered here on
+        // the Library stack's root so a `CoverCard` tap in the Grid, an author's book grid, or a
+        // series' book grid all resolve `ItemDetailRoute` (they're reached through the mode switch,
+        // so they must not self-register).
+        .itemDetailDestination()
         .task(id: app.activeConnectionID) {
             let connectionID = app.activeConnectionID
             // Only reset the browse state for a GENUINELY new connection — not on every

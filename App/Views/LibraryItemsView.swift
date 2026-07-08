@@ -24,9 +24,10 @@ struct LibraryItemsView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 16) {
                         ForEach(items) { item in
-                            Button {
-                                Task { await app.startPlayback(itemID: item.id) }
-                            } label: {
+                            NavigationLink(value: ItemDetailRoute(
+                                itemID: item.id, title: item.title, author: item.authorName,
+                                updatedAt: item.updatedAt, duration: item.duration)
+                            ) {
                                 VStack(alignment: .leading) {
                                     CachedCoverView(itemID: item.id, updatedAt: item.updatedAt)
                                         .clipShape(RoundedRectangle(cornerRadius: 8))

@@ -417,4 +417,173 @@ import Testing
         #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.currentTime == 20)
         #expect(try store.progress(connectionID: "C1", itemID: "i1", episodeID: "e2")?.isFinished == true)
     }
+
+    // MARK: - v3: per-book playback-rate preference (Task 7)
+
+    /// Builds a genuine v1+v2-ONLY database file (registers ONLY "v1" and "v2", replicating the
+    /// frozen migrations byte-for-byte — same discipline as `seedV1OnlyDatabase`, one migration
+    /// further) with a real `cachedItem` row carrying v2 columns AND a `cachedItemDetail` row,
+    /// then closes it. Reopening through the production `LibraryCacheStore` runs v1+v2+v3, so v3's
+    /// `CREATE TABLE cachedItemPref` (additive — no `ALTER`) is proven against a genuinely
+    /// pre-existing v1+v2 file rather than a fresh already-v3 store.
+    private func seedV1V2OnlyDatabase(at url: URL) throws {
+        let dbQueue = try DatabaseQueue(path: url.path)
+        var migrator = DatabaseMigrator()
+        migrator.registerMigration("v1") { db in
+            try db.create(table: "cachedConnection") { t in
+                t.primaryKey("id", .text)
+                t.column("address", .text).notNull()
+                t.column("name", .text).notNull()
+                t.column("username", .text).notNull()
+                t.column("authMethod", .text).notNull()
+                t.column("sortIndex", .integer).notNull()
+            }
+            try db.create(table: "cachedLibrary") { t in
+                t.column("id", .text).notNull()
+                t.column("connectionID", .text).notNull().indexed()
+                t.column("name", .text).notNull()
+                t.column("mediaType", .text).notNull()
+                t.column("displayOrder", .integer).notNull()
+                t.primaryKey(["connectionID", "id"])
+            }
+            try db.create(table: "cachedItem") { t in
+                t.column("id", .text).notNull()
+                t.column("connectionID", .text).notNull().indexed()
+                t.column("libraryID", .text).notNull().indexed()
+                t.column("title", .text).notNull()
+                t.column("authorName", .text)
+                t.column("duration", .double)
+                t.column("updatedAt", .integer)
+                t.primaryKey(["connectionID", "id"])
+            }
+            try db.create(table: "cachedProgress") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")
+                t.column("currentTime", .double).notNull()
+                t.column("isFinished", .boolean).notNull()
+                t.column("lastUpdate", .integer).notNull()
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+            try db.create(virtualTable: "itemFTS", using: FTS5()) { t in
+                t.synchronize(withTable: "cachedItem")
+                t.tokenizer = .unicode61()
+                t.column("title")
+                t.column("authorName")
+            }
+        }
+        migrator.registerMigration("v2") { db in
+            try db.alter(table: "cachedItem") { t in
+                t.add(column: "subtitle", .text)
+                t.add(column: "narratorName", .text)
+                t.add(column: "seriesName", .text)
+                t.add(column: "genresJSON", .text)
+                t.add(column: "publishedYear", .text)
+                t.add(column: "descriptionSnippet", .text)
+            }
+            try db.create(table: "cachedItemDetail") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("description", .text)
+                t.column("publisher", .text)
+                t.column("isbn", .text)
+                t.column("asin", .text)
+                t.column("language", .text)
+                t.column("explicit", .boolean)
+                t.column("abridged", .boolean)
+                t.column("publishedDate", .text)
+                t.column("chaptersJSON", .text)
+                t.primaryKey(["connectionID", "itemID"])
+            }
+            try db.create(table: "cachedEpisode") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull()
+                t.column("idx", .integer)
+                t.column("season", .text)
+                t.column("episode", .text)
+                t.column("episodeType", .text)
+                t.column("title", .text)
+                t.column("subtitle", .text)
+                t.column("episodeDescription", .text)
+                t.column("pubDate", .text)
+                t.column("publishedAt", .integer)
+                t.column("durationSeconds", .double)
+                t.column("sizeBytes", .integer)
+                t.column("guid", .text)
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+        }
+        try migrator.migrate(dbQueue)
+        try dbQueue.write { db in
+            try db.execute(sql: """
+                INSERT INTO cachedItem (id, connectionID, libraryID, title, authorName, duration, updatedAt,
+                                         subtitle, narratorName, seriesName, genresJSON, publishedYear, descriptionSnippet)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: ["i1", "C1", "L1", "Dracula", "Bram Stoker", 100.0, 1,
+                            "A Novel", "Narrator Name", "Gothic Classics", "[\"Horror\"]", "1897", "A count..."])
+            try db.execute(sql: """
+                INSERT INTO cachedItemDetail (connectionID, itemID, description, publisher)
+                VALUES (?, ?, ?, ?)
+                """,
+                arguments: ["C1", "i1", "Full description", "Acme Pub"])
+        }
+        try dbQueue.close()   // release the file so the real store can reopen it
+    }
+
+    /// THE sabotage-provable v3 migration test (same rigor as `v2AddsDetailColumnsPreservingV1Rows`):
+    /// seed a genuine v1+v2-only file, reopen through the production store (runs v1+v2+v3 — v3's
+    /// `CREATE TABLE` executed against real pre-existing tables), and assert (1) the v1 row and its
+    /// v2 columns survive untouched, (2) the v2 `cachedItemDetail` row survives, and (3) the new
+    /// `cachedItemPref` table exists, is queryable, and round-trips a real row.
+    @Test func v3AddsPrefTablePreservingV1V2Rows() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dbURL = dir.appending(path: "cache.sqlite")
+
+        try seedV1V2OnlyDatabase(at: dbURL)                     // genuine v1+v2-only file on disk
+        let store = try LibraryCacheStore(databaseURL: dbURL)   // reopen → runs v1+v2+v3 (CREATE TABLE only)
+
+        // The pre-existing v1 row + its v2 columns survive, values intact.
+        let fetched = try store.items(connectionID: "C1", libraryID: "L1").first
+        #expect(fetched?.id == "i1")
+        #expect(fetched?.title == "Dracula")
+        #expect(fetched?.authorName == "Bram Stoker")
+        #expect(fetched?.subtitle == "A Novel")
+        #expect(fetched?.narratorName == "Narrator Name")
+        #expect(fetched?.seriesName == "Gothic Classics")
+        #expect(fetched?.genres == ["Horror"])
+        #expect(fetched?.publishedYear == "1897")
+        // The pre-existing v2 detail row survives.
+        #expect(try store.itemDetail(connectionID: "C1", itemID: "i1")?.publisher == "Acme Pub")
+        #expect(try store.itemDetail(connectionID: "C1", itemID: "i1")?.description == "Full description")
+
+        // The new v3 table exists, is queryable (a missing table would throw), and round-trips a
+        // real row — absent by default, then set/read.
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == nil)
+        try store.setPlaybackRate(1.5, connectionID: "C1", itemID: "i1")
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == 1.5)
+    }
+
+    @Test func playbackRateRoundTrips() throws {
+        let store = try makeStore()
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == nil)
+        try store.setPlaybackRate(1.5, connectionID: "C1", itemID: "i1")
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == 1.5)
+        // nil clears back to the "no per-book rate" default.
+        try store.setPlaybackRate(nil, connectionID: "C1", itemID: "i1")
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == nil)
+    }
+
+    @Test func playbackRateScopedPerItemAndConnection() throws {
+        let store = try makeStore()
+        try store.setPlaybackRate(1.25, connectionID: "C1", itemID: "i1")
+        try store.setPlaybackRate(2.0, connectionID: "C1", itemID: "i2")
+        try store.setPlaybackRate(0.75, connectionID: "C2", itemID: "i1")   // same itemID, other connection
+
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == 1.25)
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i2") == 2.0)
+        #expect(try store.playbackRate(connectionID: "C2", itemID: "i1") == 0.75)
+    }
 }

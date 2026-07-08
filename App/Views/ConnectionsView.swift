@@ -90,6 +90,10 @@ struct ConnectionsView: View {
             // destination-for-type registered from within another destination fails to resolve):
             // this is what `LibrariesView`'s `NavigationLink(value: CachedLibrary)` pushes into.
             .navigationDestination(for: CachedLibrary.self) { LibraryItemsView(library: $0) }
+            // Same stable-root rationale: `LibraryItemsView`'s cover tap pushes `ItemDetailRoute`,
+            // so this legacy modal server-switcher stack opens the shared `ItemDetailView` too —
+            // consistent with every other browse surface (tap → detail, Play lives in the detail).
+            .itemDetailDestination()
             .confirmationDialog(
                 "Remove this connection?",
                 isPresented: Binding(get: { confirmingRemoval != nil },

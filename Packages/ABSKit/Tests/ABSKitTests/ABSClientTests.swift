@@ -73,4 +73,72 @@ import ABSKitTestSupport
         let url = client.coverURL(itemID: "li_1", width: 400, updatedAt: 1751060000000 as Int?)
         #expect(url.absoluteString == "http://abs.test:13378/api/items/li_1/cover?width=400&ts=1751060000000")
     }
+
+    // MARK: - Task 1: bookmarks
+
+    @Test func createBookmarkPostsTimeAndTitleAndDecodesResult() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: #"{"libraryItemId":"li_1","time":142,"title":"Ch. 3","createdAt":1700000000000}"#)
+        let bookmark = try await client.createBookmark(itemID: "li_1", time: 142, title: "Ch. 3")
+        #expect(bookmark.libraryItemId == "li_1")
+        #expect(bookmark.time == 142)
+        #expect(bookmark.title == "Ch. 3")
+
+        let req = await transport.recorded.first
+        #expect(req?.httpMethod == "POST")
+        #expect(req?.url?.absoluteString == "http://abs.test:13378/api/me/item/li_1/bookmark")
+        let body = try #require(req?.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        #expect(json?["time"] as? Int == 142)
+        #expect(json?["title"] as? String == "Ch. 3")
+    }
+
+    @Test func updateBookmarkPatchesKeyedByTime() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: #"{"libraryItemId":"li_1","time":142,"title":"Renamed","createdAt":1700000000000}"#)
+        let bookmark = try await client.updateBookmark(itemID: "li_1", time: 142, title: "Renamed")
+        #expect(bookmark.title == "Renamed")
+
+        let req = await transport.recorded.first
+        #expect(req?.httpMethod == "PATCH")
+        #expect(req?.url?.absoluteString == "http://abs.test:13378/api/me/item/li_1/bookmark")
+        let body = try #require(req?.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        #expect(json?["time"] as? Int == 142)
+        #expect(json?["title"] as? String == "Renamed")
+    }
+
+    @Test func deleteBookmarkSendsWholeTimeInPathWithoutTrailingZero() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: "{}")
+        try await client.deleteBookmark(itemID: "li_1", time: 142)
+
+        let req = await transport.recorded.first
+        #expect(req?.httpMethod == "DELETE")
+        #expect(req?.url?.absoluteString == "http://abs.test:13378/api/me/item/li_1/bookmark/142")
+        #expect(req?.httpBody == nil)
+    }
+
+    /// Regression guard for the Int-truncation bug: a fractional `time` MUST keep its decimal in
+    /// the DELETE path (`/bookmark/55.7`, not `/bookmark/55`) — the server 404s on a truncated
+    /// key (verified live in `ContractTests.bookmarkFractionalTimeRoundTripsLive`).
+    @Test func deleteBookmarkKeepsFractionalTimeInPath() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: "{}")
+        try await client.deleteBookmark(itemID: "li_1", time: 55.7)
+
+        let req = await transport.recorded.first
+        #expect(req?.url?.absoluteString == "http://abs.test:13378/api/me/item/li_1/bookmark/55.7")
+    }
+
+    @Test func createBookmarkSendsFractionalTimeInBody() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: #"{"libraryItemId":"li_1","time":55.7,"title":"Ch. 3","createdAt":1700000000000}"#)
+        let bookmark = try await client.createBookmark(itemID: "li_1", time: 55.7, title: "Ch. 3")
+        #expect(bookmark.time == 55.7)
+
+        let body = try #require(await transport.recorded.first?.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        #expect(json?["time"] as? Double == 55.7)
+    }
 }

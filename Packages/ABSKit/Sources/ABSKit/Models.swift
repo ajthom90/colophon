@@ -60,13 +60,18 @@ public struct MinifiedMetadata: Decodable, Sendable, Hashable {
     public let authorName: String?
 }
 
-/// Full single-item detail from `GET /api/items/:id?expanded=1` — the per-item counterpart to
-/// the minified `/items` list page. Used by `ABSClient.item(id:)` for `AppState`'s targeted
-/// per-item socket patch (M1c-a Task 3, replacing a coarse full-library `refreshItems` for
-/// `item_updated`/`item_added` events) and, in M1c-b, item-detail views. Decodes tolerantly:
-/// only the fields Task 3 needs today are modeled here; unknown/future fields (chapters, full
-/// relational metadata, progress) are simply ignored by `Decodable`'s default behavior and can
-/// be added later without breaking this decode.
+/// Full single-item detail from `GET /api/items/:id?expanded=1&include=progress` — the per-item
+/// counterpart to the minified `/items` list page. Used by `ABSClient.item(id:)` for `AppState`'s
+/// targeted per-item socket patch (M1c-a Task 3, replacing a coarse full-library `refreshItems`
+/// for `item_updated`/`item_added` events) and, in M1c-b, `ItemDetailView`. Decodes tolerantly:
+/// every added field is optional, so an older/variant/partial server response never fails the
+/// whole decode (the Task 3 socket-patch path only reads `id`/`libraryId`/`updatedAt`/`media.
+/// metadata.title`/`authorName`/`media.duration`, all of which predate this expansion).
+///
+/// Field shapes are grounded in a live ABS 2.35.1 capture (this milestone) — see the endpoint
+/// reference: `media.chapters` are GLOBAL book seconds, `userMediaProgress` rides at the TOP
+/// level of the response (NOT under `media`), and metadata carries the server-computed
+/// `authorName`/`narratorName`/`seriesName` convenience strings alongside the relational arrays.
 public struct LibraryItemDetail: Decodable, Sendable, Identifiable {
     public let id: String
     /// The item's owning library — present on every live server response; optional here only
@@ -75,19 +80,59 @@ public struct LibraryItemDetail: Decodable, Sendable, Identifiable {
     public let libraryId: String?
     public let updatedAt: Int?
     public let media: ExpandedItemMedia
+    /// The signed-in user's progress for this item — only present with `include=progress`.
+    public let userMediaProgress: UserMediaProgress?
 }
 
 public struct ExpandedItemMedia: Decodable, Sendable {
     public let duration: Double?
     public let metadata: ExpandedItemMetadata
+    /// Chapter marks in GLOBAL book seconds (`{id,start,end,title}`), for the chapters preview.
+    public let chapters: [Chapter]?
 }
 
-/// Mirrors `MinifiedMetadata`'s `title`/`authorName` — `authorName` is a server-computed
-/// convenience string (not the raw `authors` relational array), present in both the minified
-/// and expanded metadata shapes.
+/// Expanded book metadata. `authorName`/`narratorName`/`seriesName` are server-computed
+/// convenience strings (flattened from the relational `authors`/`narrators`/`series` arrays);
+/// `series` carries the per-series `sequence` the convenience string drops. Empty strings appear
+/// live for absent narrator/series (verified) — the UI treats "" as absent.
 public struct ExpandedItemMetadata: Decodable, Sendable {
     public let title: String?
+    public let subtitle: String?
     public let authorName: String?
+    public let narratorName: String?
+    public let seriesName: String?
+    public let series: [SeriesRef]?
+    public let genres: [String]?
+    public let publishedYear: String?
+    public let publishedDate: String?
+    public let publisher: String?
+    public let description: String?
+    public let isbn: String?
+    public let asin: String?
+    public let language: String?
+    public let explicit: Bool?
+    public let abridged: Bool?
+}
+
+/// One entry of a book's `metadata.series` — the series identity plus this book's `sequence`
+/// within it (e.g. `"1"`, `"2.5"`, or absent). `sequence` is a string, not a number: ABS stores
+/// fractional/lettered sequences. `id`/`name` are optional so a malformed/future series element
+/// degrades to "no series label" instead of failing the whole `LibraryItemDetail` decode (the
+/// enclosing `series: [SeriesRef]?` is meant to be tolerant); the UI guards on a non-empty `name`.
+public struct SeriesRef: Decodable, Sendable, Identifiable, Hashable {
+    public let id: String?
+    public let name: String?
+    public let sequence: String?
+}
+
+/// The signed-in user's progress for an item, from `GET /api/items/:id?include=progress`'s
+/// top-level `userMediaProgress`. Mirrors the fields `ItemDetailView` needs for its Resume state;
+/// all optional for tolerant decoding.
+public struct UserMediaProgress: Decodable, Sendable, Hashable {
+    public let currentTime: Double?
+    public let progress: Double?
+    public let duration: Double?
+    public let isFinished: Bool?
 }
 
 public struct PlaybackSession: Decodable, Sendable {
@@ -383,15 +428,31 @@ public struct MediaProgressEntry: Decodable, Sendable, Hashable {
     public let lastUpdate: Int?
 }
 
-/// Source-verified shape (`User.createBookmark`, ABS 2.35.1): `{libraryItemId, time, title,
-/// createdAt}` — no `id` field; bookmarks are keyed by `libraryItemId`+`time`, not a UUID.
-/// Live-captured non-empty in `me.json` by creating (then deleting, to leave the dev seed
-/// unchanged) a real bookmark against the dev server during fixture capture.
-public struct Bookmark: Decodable, Sendable, Hashable {
+/// Verified live (ABS 2.35.1, M1c-b Task 1): `POST`/`PATCH /api/me/item/:id/bookmark` and the
+/// `bookmarks[]` entries on `GET /api/me` all share this shape — `{libraryItemId, time, title,
+/// createdAt}`, no server-assigned `id` field; bookmarks are keyed by `libraryItemId`+`time`.
+/// `time` decodes as `Double` (not `Int`) because it's a plain JS number with no schema-enforced
+/// integrality: sending an integer `time` round-trips as an integer (`bookmark.json`'s captured
+/// fixture), but sending a fractional `time` (verified live this session) round-trips fractional
+/// too — `ABSClient.createBookmark`/`updateBookmark` only ever send whole seconds, but a tolerant
+/// decode must not reject a bookmark some OTHER client created with sub-second precision.
+/// `Identifiable` (`id` derived from `libraryItemId`+`time`, the server's own composite key) lets
+/// SwiftUI's `List`/`ForEach` key bookmark rows without a synthesized UUID that would change
+/// every reconcile-from-`/api/me` refresh.
+public struct Bookmark: Codable, Sendable, Hashable, Identifiable {
     public let libraryItemId: String
     public let time: Double?
     public let title: String?
     public let createdAt: Int?
+
+    public var id: String { "\(libraryItemId)#\(time.map { String($0) } ?? "nil")" }
+
+    public init(libraryItemId: String, time: Double?, title: String?, createdAt: Int?) {
+        self.libraryItemId = libraryItemId
+        self.time = time
+        self.title = title
+        self.createdAt = createdAt
+    }
 }
 
 public struct DeviceInfo: Encodable, Sendable {
