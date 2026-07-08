@@ -308,6 +308,91 @@ struct AppStateTests {
         #expect(items.map(\.id) == ["i1"])
     }
 
+    // MARK: - Task 8: filtered vs unfiltered refresh (the browse deviation the grid rests on)
+
+    /// A FILTERED refresh must NOT reconcile-delete: the server returns only the matching items,
+    /// but the non-matching rows already in the cache MUST survive (a transient filter can't
+    /// destroy the offline browse set). It upserts the matches and captures ONLY the matching IDs
+    /// as the grid's order.
+    @Test func filteredRefreshPreservesNonMatchingCachedRows() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        // Three cached items; the filter will match only "a".
+        for id in ["a", "b", "c"] {
+            try app.cache.upsertItemsPage(
+                [CachedItem(id: id, connectionID: cid, libraryID: "lib1", title: "Title \(id)",
+                            authorName: nil, duration: 1, updatedAt: 1)],
+                connectionID: cid, libraryID: "lib1")
+        }
+        app.libraryFilter = LibraryFilter(group: "authors", displayValue: "Sun Tzu", rawValue: "aut_x")
+        // The filtered page returns only "a" (total 1) — the server's matching set.
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 1, results: ["a"]))
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        // All three rows STILL EXIST (upsert, not replaceItems) — "b"/"c" were not deleted.
+        #expect(Set(try app.cache.items(connectionID: cid, libraryID: "lib1").map(\.id)) == ["a", "b", "c"])
+        // The grid's captured order is exactly the single match.
+        #expect(app.libraryItemOrder["lib1"] == ["a"])
+    }
+
+    /// A FILTERED refresh that matches ZERO items captures a PRESENT-but-EMPTY order (not nil), so
+    /// the grid renders "No matches" rather than falling back to the whole cached library — the
+    /// Important bug the round-2 review caught. Cached rows are still preserved.
+    @Test func filteredRefreshZeroMatchesCapturesEmptyOrderNotNil() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        for id in ["a", "b"] {
+            try app.cache.upsertItemsPage(
+                [CachedItem(id: id, connectionID: cid, libraryID: "lib1", title: "Title \(id)",
+                            authorName: nil, duration: 1, updatedAt: 1)],
+                connectionID: cid, libraryID: "lib1")
+        }
+        app.libraryFilter = LibraryFilter(group: "genres", displayValue: "Nope", rawValue: "Nope")
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 0, results: []))
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        // Order captured as an EMPTY array (key present) — the grid shows "No matches".
+        #expect(app.libraryItemOrder["lib1"] != nil)
+        #expect(app.libraryItemOrder["lib1"]?.isEmpty == true)
+        // Cached rows preserved (the filter didn't nuke the cache).
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").count == 2)
+    }
+
+    /// The UNFILTERED sibling: with no filter, a completed page missing a previously-cached row
+    /// still DELETES it (Task 3 reconciliation intact), and captures the full server order.
+    @Test func unfilteredRefreshStillReconciles() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        for id in ["keep", "gone"] {
+            try app.cache.upsertItemsPage(
+                [CachedItem(id: id, connectionID: cid, libraryID: "lib1", title: "Title \(id)",
+                            authorName: nil, duration: 1, updatedAt: 1)],
+                connectionID: cid, libraryID: "lib1")
+        }
+        #expect(app.libraryFilter == nil)   // no filter → reconcile path
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 1, results: ["keep"]))
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        // "gone" is reconciled away; only "keep" survives, and it's the captured order.
+        #expect(try app.cache.items(connectionID: cid, libraryID: "lib1").map(\.id) == ["keep"])
+        #expect(app.libraryItemOrder["lib1"] == ["keep"])
+    }
+
     /// A completed page-through that reports a non-zero total but hands back zero items (a
     /// lying/broken response) must NOT wipe the cache — the guard in `refreshItems` skips
     /// `replaceItems` entirely in that case.

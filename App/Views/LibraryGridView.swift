@@ -41,12 +41,16 @@ struct LibraryGridView: View {
     private let columns = [GridItem(.adaptive(minimum: 150), spacing: 16)]
 
     /// The items to render, in the server-authoritative order captured by the last `refreshItems`
-    /// (which, when a filter is active, is exactly the matching set) — falling back to the cache's
-    /// title order for instant/offline paint before the first refresh lands.
+    /// (which, when a filter is active, is exactly the matching set). The distinction between "no
+    /// order captured yet" (key absent → instant/offline paint in the cache's title order) and
+    /// "order captured, zero matches" (key present but empty → the "No matches" empty state) is
+    /// explicit: a present-but-empty order must NOT fall back to the whole cached library, or a
+    /// zero-match filter would render every item.
     private var orderedItems: [CachedItem] {
-        let serverOrder = app.libraryItemOrder[library.id] ?? []
-        let ids = serverOrder.isEmpty ? observedOrder : serverOrder
-        return ids.compactMap { itemsByID[$0] }
+        if let serverOrder = app.libraryItemOrder[library.id] {
+            return serverOrder.compactMap { itemsByID[$0] }   // captured (empty → No matches)
+        }
+        return observedOrder.compactMap { itemsByID[$0] }     // not captured → title-order paint
     }
 
     var body: some View {

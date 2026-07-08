@@ -876,8 +876,13 @@ final class AppState {
             try cache.replaceItems(accumulated, connectionID: connectionID, libraryID: libraryID)
         }
         // Capture the server-authoritative order (full set unfiltered, matching set filtered) for
-        // the grid — but never clobber a good order with a lying-empty response's zero IDs.
-        if !isLyingEmpty {
+        // the grid — but never clobber a good order with a lying-empty response's zero IDs, and
+        // never settle the grid on a SUPERSEDED order: if the sort/order/filter changed while this
+        // (possibly slow) request was in flight, a newer refresh owns the order, so skip the write
+        // and let it win. (Cache writes above are always safe — upsert or full reconcile of valid
+        // rows — so only the order, which drives what the grid shows, needs this guard.)
+        let stillCurrent = (librarySort == sort && sortDescending == desc && libraryFilter == activeFilter)
+        if !isLyingEmpty && stillCurrent && !Task.isCancelled {
             libraryItemOrder[libraryID] = accumulated.map(\.id)
         }
         // Success clears only this library's banner — another library's failure stays visible
