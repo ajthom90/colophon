@@ -120,10 +120,9 @@ struct SleepTimerTests {
         #expect(abs((timer.remaining ?? 0) - 600) < 1)   // ~10 minutes
     }
 
-    @Test func fadeRampReachesZeroThenPauses_isProvenInEngine() {
-        // Marker: the real volume ramp → 0 → pause ORDER is covered by PlayerEngine's
-        // `fadeRampReachesZeroThenPauses` against a FakePlayerBackend (volume observable there).
-    }
+    // NOTE: the real volume ramp → 0 → pause ORDER (and the speaker-safety play()/muted
+    // invariants) are covered in PlayerEngine's `PlaybackControllerTests` against a
+    // `FakePlayerBackend` whose volume is observable — not duplicated here.
 
     // MARK: - Countdown semantics (the documented HIG decision)
 

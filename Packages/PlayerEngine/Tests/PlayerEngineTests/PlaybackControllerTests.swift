@@ -145,7 +145,8 @@ final class ClockBox: @unchecked Sendable {
         #expect((zeroIndex ?? .max) < (pauseIndex ?? .min))
     }
 
-    /// A no-op when nothing is playing (never pauses an already-paused/idle controller).
+    /// A no-op when nothing is playing (never pauses an already-paused/idle controller, and never
+    /// touches the volume — the guard returns before any ramp).
     @Test func fadeIsNoOpWhenNotPlaying() async {
         let clock = ClockBox(Date(timeIntervalSince1970: 1_000_000))
         let backend = FakePlayerBackend()
@@ -153,9 +154,85 @@ final class ClockBox: @unchecked Sendable {
         controller.load(session: makeSession(), trackURLs: [
             URL(string: "https://t/1")!, URL(string: "https://t/2")!, URL(string: "https://t/3")!,
         ])
+        let volumeBefore = backend.volume
         // never played
         controller.fadeOutAndPause(over: 5, steps: 10)
         await controller.fadeTask?.value
         #expect(controller.isPlaying == false)
+        #expect(backend.volume == volumeBefore)   // untouched — the ramp never ran
     }
+
+    /// SPEAKER-SAFETY REGRESSION: after a fade parks the volume at 0 and pauses, resuming while
+    /// `muted` must keep the volume at 0 — "muted still wins". If `play()`'s volume restore ever
+    /// regressed to an unconditional `= 1`, this would blast audio out of the user's speakers.
+    /// (Verified RED: changing `play()` to `backend.volume = 1` fails this test.)
+    @Test func playWhileMutedAfterFadeKeepsVolumeZero() async {
+        let clock = ClockBox(Date(timeIntervalSince1970: 1_000_000))
+        let backend = FakePlayerBackend()
+        let controller = PlaybackController(backend: backend, now: { clock.now }, sleepForFade: { _ in })
+        controller.load(session: makeSession(), trackURLs: [
+            URL(string: "https://t/1")!, URL(string: "https://t/2")!, URL(string: "https://t/3")!,
+        ])
+        controller.muted = true
+        controller.play()
+        #expect(backend.volume == 0)
+
+        controller.fadeOutAndPause(over: 0.1, steps: 5)
+        await controller.fadeTask?.value
+        #expect(controller.isPlaying == false)
+        #expect(backend.volume == 0)
+
+        controller.play()
+        #expect(controller.isPlaying == true)
+        #expect(backend.volume == 0)   // muted still wins — NOT restored to 1
+    }
+
+    /// SPEAKER-SAFETY REGRESSION: a user `play()` DURING an in-flight fade must cancel the ramp and
+    /// restore full volume — not leave it stuck at a partial (or 0) value, and not let the fade go
+    /// on to pause afterwards. A blocking `sleepForFade` gate suspends the ramp mid-step so the
+    /// `play()` lands while a fade is genuinely in flight. (Verified RED: dropping `play()`'s
+    /// `fadeTask?.cancel()` + volume restore leaves the volume partial and re-pauses.)
+    @Test func playMidFadeCancelsFadeAndRestoresVolume() async {
+        let clock = ClockBox(Date(timeIntervalSince1970: 1_000_000))
+        let backend = FakePlayerBackend()
+        let gate = FadeSpinGate()
+        let controller = PlaybackController(backend: backend, now: { clock.now }, sleepForFade: { _ in
+            gate.markReached()
+            while !gate.isReleased { await Task.yield() }
+        })
+        controller.load(session: makeSession(), trackURLs: [
+            URL(string: "https://t/1")!, URL(string: "https://t/2")!, URL(string: "https://t/3")!,
+        ])
+        controller.play()
+        #expect(backend.volume == 1)
+
+        controller.fadeOutAndPause(over: 5, steps: 10)
+        let fadeTask = controller.fadeTask
+        // Let the ramp run its first step and suspend inside the gated sleep.
+        while !gate.reached { await Task.yield() }
+        #expect(backend.volume > 0 && backend.volume < 1)   // genuinely mid-fade
+
+        controller.play()                                    // interrupt the fade
+        #expect(controller.isPlaying == true)
+        #expect(backend.volume == 1)                         // restored, not stuck partial
+
+        gate.release()
+        await fadeTask?.value                                 // let the cancelled ramp unwind
+        #expect(backend.volume == 1)                         // fade did NOT complete to 0
+        #expect(controller.isPlaying == true)                // fade did NOT re-pause
+    }
+}
+
+/// Test-only lock-guarded gate: the fade's injected `sleepForFade` marks it reached on the first
+/// step, then spins on `Task.yield()` until the test releases it — so a `play()` can land while a
+/// fade is provably in flight. `@unchecked Sendable` (NSLock-guarded) so it's safe to touch from
+/// both the fade closure and the test.
+final class FadeSpinGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _reached = false
+    private var _released = false
+    var reached: Bool { lock.withLock { _reached } }
+    var isReleased: Bool { lock.withLock { _released } }
+    func markReached() { lock.withLock { _reached = true } }
+    func release() { lock.withLock { _released = true } }
 }
