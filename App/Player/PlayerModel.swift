@@ -32,6 +32,9 @@ final class PlayerModel {
     var title: String { playback.title }
     var author: String { playback.author }
     var skipInterval: Int { playback.skipInterval }
+    /// The book's current playback rate (e.g. `1.5`) — `SpeedControl`'s Menu reads this to show
+    /// the current selection and highlight it among the options.
+    var rate: Double { Double(playback.rate) }
 
     /// The now-playing chapters (global seconds), sorted by start — the source both the scrubber's
     /// current-chapter label and `ChapterListView` read.
@@ -66,6 +69,11 @@ final class PlayerModel {
     func togglePlayPause() { playback.togglePlayPause() }
     func skipForward() { playback.skip(Double(playback.skipInterval)) }
     func skipBackward() { playback.skip(-Double(playback.skipInterval)) }
+
+    /// `SpeedControl`'s write path (Task 7) — routes through `AppState.setPlaybackRate`, which
+    /// applies the rate live AND persists it as this book's per-book preference (Task 7's `v3`
+    /// `cachedItemPref` table), rather than calling `playback.setRate` directly.
+    func setRate(_ rate: Double) { app.setPlaybackRate(rate) }
 
     /// Seek to the next chapter's start (no-op if already in/at the last chapter). Drives the
     /// Mac `⌥⌘→` Next Chapter command.

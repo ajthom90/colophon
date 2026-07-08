@@ -197,17 +197,18 @@ struct FullPlayerView: View {
         }
     }
 
-    // MARK: - Secondary controls (sleep timer + Chapters; bookmarks/speed/queue land in Tasks 6–8)
+    // MARK: - Secondary controls (sleep timer + bookmarks + speed + Chapters; queue lands in Task 8)
 
     private func secondaryControls(model: PlayerModel) -> some View {
         VStack(spacing: 14) {
-            // The shared secondary glass cluster. Task 5 adds the sleep timer; bookmarks (T6) join
-            // it here; speed (T7) and up-next queue (T8) join this same `GlassEffectContainer` as
-            // further `.buttonStyle(.glass)` members — one cluster, never glass-on-glass.
+            // The shared secondary glass cluster. Task 5 adds the sleep timer; bookmarks (T6) and
+            // speed (T7) join it here; up-next queue (T8) joins this same `GlassEffectContainer` as
+            // a further `.buttonStyle(.glass)` member — one cluster, never glass-on-glass.
             GlassEffectContainer(spacing: 16) {
                 HStack(spacing: 16) {
                     SleepTimerView(timer: app.sleepTimer, hasChapters: !model.chapters.isEmpty)
                     bookmarkButton
+                    SpeedControl(model: model)
                 }
             }
             .controlSize(.large)

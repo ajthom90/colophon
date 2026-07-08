@@ -1342,4 +1342,80 @@ struct SettingsPlumbingTests {
         #expect(app.playback.rate == 1.0)
         #expect(app.playback.skipInterval == AppState.defaultSkipInterval)
     }
+
+    // MARK: - Task 7: per-book playback-rate persistence (v3)
+
+    /// A book with a stored per-book rate (`cache.setPlaybackRate`, Task 7's `v3` table) resumes at
+    /// THAT rate on `startPlayback`, overriding the global default setting.
+    @Test func storedPerBookRateOverridesGlobalDefault() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        defer { restoreRate() }
+        UserDefaults.standard.set(1.0, forKey: AppState.defaultRateKey)   // distinct from the per-book rate
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.setPlaybackRate(1.5, connectionID: cid, itemID: "i1")   // pre-existing per-book pref
+
+        await app.startPlayback(itemID: "i1")
+
+        #expect(app.playback.rate == 1.5)   // per-book rate wins over the 1.0x global default
+    }
+
+    /// The sibling: a book with NO stored rate falls back to the global default, unaffected by a
+    /// DIFFERENT book's per-book preference (scoped by itemID, not just connection).
+    @Test func bookWithoutStoredRateFallsBackToGlobalDefault() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        defer { restoreRate() }
+        UserDefaults.standard.set(1.75, forKey: AppState.defaultRateKey)
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try app.cache.setPlaybackRate(1.5, connectionID: cid, itemID: "some-other-book")
+
+        await app.startPlayback(itemID: "i1")   // no per-book rate stored for "i1"
+
+        #expect(app.playback.rate == 1.75)   // global default applies
+    }
+
+    /// `AppState.setPlaybackRate` (the SpeedControl write path) both applies the rate to the live
+    /// `PlaybackController` immediately AND persists it as this (connection, item)'s per-book pref —
+    /// so a later `startPlayback` of the SAME book resumes at it.
+    @Test func setPlaybackRateAppliesLiveAndPersistsPerBook() async throws {
+        let restoreRate = snapshotDefault(AppState.defaultRateKey)
+        defer { restoreRate() }
+        UserDefaults.standard.set(1.0, forKey: AppState.defaultRateKey)
+
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // first open
+        await transport.enqueue(status: 200, json: "{}")              // possible flush /sync on retire
+        await transport.enqueue(status: 200, json: "{}")              // /close on retire
+        await transport.enqueue(status: 200, json: playSessionJSON)   // re-open
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.rate == 1.0)
+
+        app.setPlaybackRate(1.5)
+        #expect(app.playback.rate == 1.5)                                          // applied live
+        #expect(try app.cache.playbackRate(connectionID: cid, itemID: "i1") == 1.5) // persisted per-book
+
+        await app.startPlayback(itemID: "i1")   // re-open the SAME book
+        #expect(app.playback.rate == 1.5)       // resumes at the persisted per-book rate
+    }
 }

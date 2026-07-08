@@ -119,6 +119,20 @@ enum Schema {
                 t.primaryKey(["connectionID", "itemID", "episodeID"])
             }
         }
+        // v3 (M1c-b Task 7): per-book device-local preference — currently just the persisted
+        // playback rate, with room for future per-book prefs to join this same row without another
+        // migration. ADDITIVE-only, like v2: a brand-new CREATE TABLE, no ALTER against v1/v2's
+        // frozen tables, so a v1(+v2) database upgrades in place gaining just this table — no
+        // existing row anywhere is touched. `playbackRate` is nullable (absent = "no per-book rate
+        // set" — the caller falls back to the global default setting).
+        migrator.registerMigration("v3") { db in
+            try db.create(table: "cachedItemPref") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("playbackRate", .double)
+                t.primaryKey(["connectionID", "itemID"])
+            }
+        }
         return migrator
     }
 }

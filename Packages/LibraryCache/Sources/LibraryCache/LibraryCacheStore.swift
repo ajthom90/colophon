@@ -219,4 +219,24 @@ public struct LibraryCacheStore: Sendable {
                 .fetchAll($0)
         }
     }
+
+    // MARK: - v3: per-book playback-rate preference
+
+    /// Sets (or, with `rate: nil`, clears back to "no per-book rate") this book's persisted
+    /// playback rate. Always a full-row upsert — currently just `playbackRate`, but written this
+    /// way so a future sibling per-book pref landing on this same row doesn't need a second write
+    /// path.
+    public func setPlaybackRate(_ rate: Double?, connectionID: String, itemID: String) throws {
+        try pool.write { db in
+            try CachedItemPref(connectionID: connectionID, itemID: itemID, playbackRate: rate).upsert(db)
+        }
+    }
+
+    /// This book's persisted playback rate, or nil when none is stored (no row, or a row whose
+    /// `playbackRate` was cleared) — the caller falls back to the global default rate setting.
+    public func playbackRate(connectionID: String, itemID: String) throws -> Double? {
+        try pool.read { db in
+            try CachedItemPref.fetchOne(db, key: ["connectionID": connectionID, "itemID": itemID])?.playbackRate
+        }
+    }
 }

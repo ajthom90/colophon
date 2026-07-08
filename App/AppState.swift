@@ -1066,12 +1066,30 @@ final class AppState {
             playback.skipInterval = Self.storedSkipInterval()
             playback.load(session: envelope.session, trackURLs: urls)
             // Set AFTER `load()` (which resets the controller's session state) and BEFORE
-            // `play()`: a freshly opened book starts at the user's default rate.
-            playback.rate = Float(Self.storedDefaultRate())
+            // `play()`: a freshly opened book resumes at ITS stored per-book rate (Task 7's `v3`
+            // `cachedItemPref` table), falling back to the user's global default rate when this
+            // book has none stored yet. `owner` (captured before the awaits above) is the
+            // connection this session belongs to — the same id `setPlaybackRate` persists under.
+            let storedRate = owner.flatMap { try? cache.playbackRate(connectionID: $0, itemID: itemID) }
+            playback.rate = Float(storedRate ?? Self.storedDefaultRate())
             playback.play()
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    /// The `SpeedControl` write path (Task 7): applies `rate` to the LIVE `PlaybackController`
+    /// immediately, and persists it as this (connection, item)'s per-book preference so a later
+    /// `startPlayback` of the SAME book resumes at it (read back via `cache.playbackRate` above).
+    /// Persistence is a best-effort no-op when no book is playing (`playingConnectionID`/
+    /// `nowPlayingItemID` unset) — defensive; the UI only offers rate control while one is — and a
+    /// failed write is swallowed rather than surfaced, matching `retireCurrentSession`'s `try?`
+    /// treatment of this same cache: a missed persist costs only "resumes at the global default
+    /// next time," never a playback-breaking error.
+    func setPlaybackRate(_ rate: Double) {
+        playback.setRate(Float(rate))
+        guard let connectionID = playingConnectionID, let itemID = nowPlayingItemID else { return }
+        try? cache.setPlaybackRate(rate, connectionID: connectionID, itemID: itemID)
     }
 
     /// Scene backgrounding: flush accumulated listened-time WITHOUT pausing — background
