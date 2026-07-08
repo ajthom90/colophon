@@ -116,8 +116,11 @@ struct SearchModelTests {
         #expect(row.updatedAt == 42)              // carried over from the FTS placeholder
     }
 
-    /// Query A parks in the server tier; query B supersedes it. A's late server result is discarded
-    /// (its task is cancelled), so only B's local + server data is visible.
+    /// Query B supersedes query A, then B resolves and paints FIRST — so B wins on the merits, not
+    /// by recency. A's server result arrives LATER and must be actively DROPPED (its task is
+    /// cancelled), never clobbering B. Release order is the crux: B before A, so A's late merge is
+    /// the last thing to happen — if the post-server `if Task.isCancelled` guard were missing, A
+    /// would overwrite B's authors and this test would fail (verified RED).
     @Test func cancellationDropsSupersededResults() async {
         let gateA = Gate(); let gateB = Gate()
         let rowA = localRow(id: "a1", title: "Query A book")
@@ -139,17 +142,22 @@ struct SearchModelTests {
         let taskA = model.pendingSearch
         await gateA.waitEntered()          // A parked in the server tier
 
-        model.updateQuery("bb")            // cancels A, starts B
+        model.updateQuery("bb")            // supersedes A → cancels A's task
         let taskB = model.pendingSearch
         await gateB.waitEntered()          // B parked in the server tier
 
-        await gateA.release()              // A's server fn returns — but A is cancelled → dropped
-        await taskA?.value
-        await gateB.release()              // B's result is applied
+        // B resolves FIRST and paints — the winning query.
+        await gateB.release()
         await taskB?.value
+        #expect(model.titles.map(\.id) == [rowB.id])
+        #expect(model.authors.map(\.name) == ["Author B"])
 
-        #expect(model.titles == [rowB])                       // B's local rows, not A's
-        #expect(model.authors.map(\.name) == ["Author B"])    // only B's server bucket
+        // A's LATE result now arrives, AFTER B has already won. It is the last merge to run, so it
+        // must be actively dropped by the cancellation guard — not silently ordered out by recency.
+        await gateA.release()
+        await taskA?.value
+        #expect(model.titles.map(\.id) == [rowB.id])          // A did not replace B's titles
+        #expect(model.authors.map(\.name) == ["Author B"])    // A's stale authors bucket dropped
         #expect(model.isSearching == false)
     }
 
