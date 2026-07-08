@@ -117,24 +117,24 @@ struct SplitShell: View {
 }
 
 #if os(macOS)
-/// Mac-only Playback command menu: `Space` play/pause, `⌘←`/`⌘→` skip (modifier-gated so plain
-/// arrow-key list navigation in the sidebar is untouched), and a speed submenu — all wired to the
-/// shared `PlaybackController` and disabled when no session is active. The full player UI is
-/// M1c-b; these commands are valid now because the transport they drive already exists.
-///
-/// Space is unmodified (the media-app convention) and disabled with no session, so it does not
-/// hijack the space bar while nothing is playing; note that with a session active it may take
-/// precedence over a focused text field's space — acceptable for a media transport menu.
+/// Mac-only Playback command menu: `⌘←`/`⌘→` skip (modifier-gated so plain arrow-key list
+/// navigation in the sidebar is untouched), and a speed submenu — all wired to the shared
+/// `PlaybackController` and disabled when no session is active. The full player UI is M1c-b;
+/// these commands are valid now because the transport they drive already exists.
 struct PlaybackCommands: Commands {
     var app: AppState
     private let rates: [Double] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
 
     var body: some Commands {
         CommandMenu("Playback") {
+            // No `.keyboardShortcut(.space, ...)` here on purpose: AppKit resolves menu
+            // key-equivalents in sendEvent before a focused field editor sees the key, so a
+            // bare-Space shortcut would hijack Space typed into the sidebar's `.searchable`
+            // Search field (SearchView) and would also collide with Space-as-page-down in any
+            // ScrollView. Menu-click and media keys are the supported Mac play/pause controls.
             Button(app.playback.isPlaying ? "Pause" : "Play") {
                 app.playback.togglePlayPause()
             }
-            .keyboardShortcut(.space, modifiers: [])
             .disabled(app.playback.totalDuration <= 0)
 
             Divider()
