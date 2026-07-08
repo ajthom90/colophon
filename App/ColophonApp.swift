@@ -30,6 +30,12 @@ struct ColophonApp: App {
     /// `.fontDesign(.serif)` modifiers were removed everywhere else in `App/Views/*`; do not
     /// reintroduce them.
     @AppStorage("colophon.typeface") private var typeface = "serif"
+    /// The Settings skip-interval (Task 4). Read here — the one always-mounted scene content that
+    /// holds `app` — so changing it applies to `playback.skipInterval` LIVE for the current
+    /// session (the transport glyph + jump reflect it immediately), not just on the next book.
+    /// `@AppStorage` is UserDefaults-KVO-backed, so a change from ANY scene (the account-menu sheet
+    /// on iOS, the ⌘, `Settings` scene on Mac) fires the `onChange` below.
+    @AppStorage("colophon.skipInterval") private var skipInterval = AppState.defaultSkipInterval
 
     init() {
         #if DEBUG && os(macOS)
@@ -88,12 +94,35 @@ struct ColophonApp: App {
             #if DEBUG && os(macOS)
             .background(PerfSpikeAutoOpener())
             #endif
+            .onChange(of: skipInterval) { _, newValue in
+                // Live-apply the Settings change to the running session's transport (glyph + jump).
+                app.playback.skipInterval = newValue
+            }
             .fontDesign(typeface == "serif" ? .serif : .default)
         }
         #if os(macOS)
-        // Mac keyboard transport: Space play/pause, ⌘←/⌘→ skip, speed submenu — wired to the same
+        // Mac keyboard transport: play/pause (menu-only, NO bare Space — the M1c-a fix), ⌘←/⌘→
+        // skip, ⌥⌘←/⌥⌘→ prev/next chapter, ⇧⌘,/⇧⌘. speed steppers + submenu — wired to the same
         // `PlaybackController` the shell's `TransportBar` drives. Guarded on an active session.
         .commands { PlaybackCommands(app: app) }
+        #endif
+        #if os(macOS)
+        // The dedicated Mac full-player Window (Task 4's per-platform presentation — a real window,
+        // NOT an iOS-style full-window sheet takeover). Opened from `TransportBar`'s expand
+        // affordance via `openWindow(id: PlayerWindowScene.id)`; a single instance (`Window`, not
+        // `WindowGroup`). It's a SEPARATE scene, so — like the `Settings` scene below — it inherits
+        // neither `app` nor the root `.fontDesign`, and re-applies both here.
+        Window("Now Playing", id: PlayerWindowScene.id) {
+            FullPlayerView()
+                .environment(app)
+                .fontDesign(typeface == "serif" ? .serif : .default)
+                .frame(minWidth: 380, minHeight: 620)
+        }
+        .windowResizability(.contentMinSize)
+        .defaultSize(width: 440, height: 720)
+        // Don't let macOS state-restoration reopen an empty player window on launch — it only ever
+        // opens on demand from the transport's expand affordance.
+        .restorationBehavior(.disabled)
         #endif
         #if DEBUG && os(macOS)
         Window("Perf Spike", id: "perf-spike") { PerfSpikeView() }

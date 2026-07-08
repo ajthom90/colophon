@@ -67,6 +67,22 @@ final class PlayerModel {
     func skipForward() { playback.skip(Double(playback.skipInterval)) }
     func skipBackward() { playback.skip(-Double(playback.skipInterval)) }
 
+    /// Seek to the next chapter's start (no-op if already in/at the last chapter). Drives the
+    /// Mac `⌥⌘→` Next Chapter command.
+    func goToNextChapter() {
+        if let start = Self.nextChapterStart(after: currentTime, in: chapters) {
+            playback.seek(toGlobal: start)
+        }
+    }
+
+    /// Previous-chapter behavior (the Music/Podcasts idiom): if more than ~3s into the current
+    /// chapter, restart it; otherwise jump to the previous chapter's start. Drives `⌥⌘←`.
+    func goToPreviousChapter() {
+        if let start = Self.previousChapterStart(before: currentTime, in: chapters) {
+            playback.seek(toGlobal: start)
+        }
+    }
+
     // MARK: - Pure helpers (unit-tested in ColophonTests)
 
     /// The chapter a given global time falls in. Prefers a chapter that strictly contains `time`
@@ -82,6 +98,27 @@ final class PlayerModel {
         }
         if let last = sorted.last, time >= last.end { return last }
         return sorted.last(where: { $0.start <= time }) ?? sorted.first
+    }
+
+    /// The start of the first chapter that begins after `time` (with a small epsilon so being
+    /// exactly at a boundary advances rather than no-ops), or nil when `time` is in/at the last
+    /// chapter. Order-independent (sorts by `start`). Drives Next Chapter.
+    static func nextChapterStart(after time: TimeInterval, in chapters: [Chapter]) -> TimeInterval? {
+        chapters.sorted { $0.start < $1.start }.first { $0.start > time + 0.5 }?.start
+    }
+
+    /// The Previous-Chapter target for `time`: restart the current chapter if more than 3s in,
+    /// else the previous chapter's start (or the current/first chapter's start when already at the
+    /// beginning). Order-independent. Returns nil only for an empty chapter list.
+    static func previousChapterStart(before time: TimeInterval, in chapters: [Chapter]) -> TimeInterval? {
+        let sorted = chapters.sorted { $0.start < $1.start }
+        guard let currentIndex = sorted.lastIndex(where: { $0.start <= time }) else {
+            return sorted.first?.start
+        }
+        let currentStart = sorted[currentIndex].start
+        if time - currentStart > 3 { return currentStart }        // deep in the chapter → restart it
+        if currentIndex > 0 { return sorted[currentIndex - 1].start } // near the top → previous chapter
+        return currentStart                                        // already the first chapter
     }
 
     /// "h:mm:ss" when at least an hour, else "m:ss". Non-finite / non-positive input reads as 0:00.

@@ -39,27 +39,33 @@ struct FullPlayerView: View {
         let displayTime = scrubbing ? scrubTime : model.currentTime
         let displayChapterTitle = PlayerModel.chapter(at: displayTime, in: model.chapters)?.title
 
-        ZStack {
-            backdrop
-            VStack(spacing: 0) {
-                dismissBar
-                Spacer(minLength: 8)
-                artwork(model: model)
-                    .padding(.horizontal, 32)
-                Spacer(minLength: 20)
-                titleBlock(model: model)
-                    .padding(.horizontal, 32)
-                Spacer(minLength: 20)
-                scrubber(model: model, displayTime: displayTime, chapterTitle: displayChapterTitle)
-                    .padding(.horizontal, 28)
-                Spacer(minLength: 22)
-                TransportControls(playback: model.playback)
-                    .controlSize(.large)
-                secondaryControls(model: model)
-                Spacer(minLength: 12)
-            }
-            .padding(.bottom, 16)
+        // The opaque content column defines the layout (constrained to the safe area), and the
+        // immersive `backdrop` is drawn BEHIND it via `.background` — NOT as a `ZStack` sibling. A
+        // sibling backdrop with `.backgroundExtensionEffect()` inflates the shared coordinate space
+        // (the effect reports an enlarged ideal size), which pushed the leading-aligned dismiss
+        // chevron and the full-width scrubber off-screen (verified live: a11y chevron x = -172,
+        // slider width 722 on a 402pt screen). As a `.background`, the backdrop fills behind the
+        // content (it ignores the safe area itself) without dictating the content's size.
+        VStack(spacing: 0) {
+            dismissBar
+            Spacer(minLength: 8)
+            artwork(model: model)
+                .padding(.horizontal, 32)
+            Spacer(minLength: 20)
+            titleBlock(model: model)
+                .padding(.horizontal, 32)
+            Spacer(minLength: 20)
+            scrubber(model: model, displayTime: displayTime, chapterTitle: displayChapterTitle)
+                .padding(.horizontal, 28)
+            Spacer(minLength: 22)
+            TransportControls(playback: model.playback)
+                .controlSize(.large)
+            secondaryControls(model: model)
+            Spacer(minLength: 12)
         }
+        .padding(.bottom, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background { backdrop }
         .sheet(isPresented: $showingChapters) {
             ChapterListView()
         }

@@ -67,4 +67,56 @@ struct PlayerModelTests {
         #expect(PlayerModel.timeString(3661) == "1:01:01")
         #expect(PlayerModel.timeString(7200) == "2:00:00")
     }
+
+    // MARK: - Chapter navigation (Task 4 — Mac ⌥⌘←/⌥⌘→ commands)
+
+    @Test func nextChapterStartAdvancesToTheFollowingChapter() {
+        // Mid-chapter-0 → chapter 1 (start 100); mid-chapter-1 → chapter 2 (start 260).
+        #expect(PlayerModel.nextChapterStart(after: 50, in: chapters) == 100)
+        #expect(PlayerModel.nextChapterStart(after: 150, in: chapters) == 260)
+    }
+
+    @Test func nextChapterStartAtABoundaryAdvancesPastIt() {
+        // Exactly at chapter 1's start (100): the +0.5 epsilon means we advance to chapter 2, not
+        // no-op on the chapter we're already at the top of.
+        #expect(PlayerModel.nextChapterStart(after: 100, in: chapters) == 260)
+    }
+
+    @Test func nextChapterStartInTheLastChapterIsNil() {
+        #expect(PlayerModel.nextChapterStart(after: 300, in: chapters) == nil)
+        #expect(PlayerModel.nextChapterStart(after: 400, in: chapters) == nil)
+    }
+
+    @Test func nextChapterStartEmptyIsNil() {
+        #expect(PlayerModel.nextChapterStart(after: 10, in: []) == nil)
+    }
+
+    @Test func previousChapterStartDeepInChapterRestartsIt() {
+        // 50s into chapter 0 (start 0) → restart chapter 0.
+        #expect(PlayerModel.previousChapterStart(before: 50, in: chapters) == 0)
+        // 60s into chapter 1 (start 100, time 160) → restart chapter 1.
+        #expect(PlayerModel.previousChapterStart(before: 160, in: chapters) == 100)
+    }
+
+    @Test func previousChapterStartNearTopGoesToPreviousChapter() {
+        // 2s into chapter 1 (start 100, time 102 — within the 3s threshold) → previous chapter (0).
+        #expect(PlayerModel.previousChapterStart(before: 102, in: chapters) == 0)
+        // 1s into chapter 2 (start 260, time 261) → previous chapter (1, start 100).
+        #expect(PlayerModel.previousChapterStart(before: 261, in: chapters) == 100)
+    }
+
+    @Test func previousChapterStartNearTopOfFirstChapterStaysAtZero() {
+        // 1s into chapter 0: no earlier chapter, so stay at its start.
+        #expect(PlayerModel.previousChapterStart(before: 1, in: chapters) == 0)
+    }
+
+    @Test func previousChapterStartEmptyIsNil() {
+        #expect(PlayerModel.previousChapterStart(before: 50, in: []) == nil)
+    }
+
+    @Test func chapterNavigationIsOrderIndependent() {
+        let shuffled = [chapters[2], chapters[0], chapters[1]]
+        #expect(PlayerModel.nextChapterStart(after: 50, in: shuffled) == 100)
+        #expect(PlayerModel.previousChapterStart(before: 261, in: shuffled) == 100)
+    }
 }

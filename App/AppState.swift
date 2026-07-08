@@ -102,6 +102,13 @@ final class AppState {
     static let defaultRateKey = "colophon.defaultRate"
     static let skipIntervalKey = "colophon.skipInterval"
 
+    /// Single source of truth for the skip-interval setting (Task 4), shared by `SettingsView`'s
+    /// `@AppStorage` default + Picker options, `storedSkipInterval()` below, and the live-update
+    /// `onChange` in `ColophonApp`. Default 30s; choices 10/15/30/45/60 (all valid `gobackward.N` /
+    /// `goforward.N` SF Symbols, so the transport glyphs render for every option).
+    static let defaultSkipInterval = 30
+    static let skipIntervalOptions = [10, 15, 30, 45, 60]
+
     /// The user's default playback rate (Settings), applied to every freshly opened book in
     /// `startPlayback` — per-book overrides are M2/CloudSync scope. `UserDefaults.double` returns
     /// 0 for an absent key (nothing set yet, or `SettingsView` never opened), which reads as the
@@ -111,11 +118,12 @@ final class AppState {
         return stored == 0 ? 1.0 : stored
     }
 
-    /// The user's skip-interval preference (Settings), seconds — one of 10/15/30/45. Same
-    /// unset-reads-as-default treatment as `storedDefaultRate`: an absent key reads as 15.
+    /// The user's skip-interval preference (Settings), seconds — one of `skipIntervalOptions`
+    /// (10/15/30/45/60). Same unset-reads-as-default treatment as `storedDefaultRate`: an absent
+    /// key (`UserDefaults.integer` returns 0) reads as `defaultSkipInterval` (30).
     private static func storedSkipInterval() -> Int {
         let stored = UserDefaults.standard.integer(forKey: skipIntervalKey)
-        return stored == 0 ? 15 : stored
+        return stored == 0 ? defaultSkipInterval : stored
     }
 
     /// UUID of the `CachedConnection` row for whatever server/user is currently signed in —

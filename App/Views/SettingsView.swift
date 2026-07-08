@@ -12,10 +12,12 @@ import SwiftUI
 struct SettingsView: View {
     @AppStorage("colophon.typeface") private var typeface = "serif"
     @AppStorage("colophon.defaultRate") private var defaultRate = 1.0
-    @AppStorage("colophon.skipInterval") private var skipInterval = 15
+    // Default + options come from `AppState` — the single source of truth also read by
+    // `AppState.storedSkipInterval()` and the live-update `onChange` in `ColophonApp`.
+    @AppStorage("colophon.skipInterval") private var skipInterval = AppState.defaultSkipInterval
 
     private let rates: [Double] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
-    private let skipIntervals = [10, 15, 30, 45]
+    private let skipIntervals = AppState.skipIntervalOptions
 
     var body: some View {
         Form {

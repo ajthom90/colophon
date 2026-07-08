@@ -1321,7 +1321,8 @@ struct SettingsPlumbingTests {
     }
 
     /// Unset Settings keys (fresh install, `SettingsView` never opened) read as the documented
-    /// defaults — 1.0× and 15s — not `UserDefaults`' bare-key zero value.
+    /// defaults — 1.0× and `AppState.defaultSkipInterval` (30s, the Task-4 reconciled single source
+    /// of truth) — not `UserDefaults`' bare-key zero value.
     @Test func unsetSettingsKeysReadAsDocumentedDefaults() async throws {
         let restoreRate = snapshotDefault(AppState.defaultRateKey)
         let restoreSkip = snapshotDefault(AppState.skipIntervalKey)
@@ -1339,6 +1340,6 @@ struct SettingsPlumbingTests {
         await app.startPlayback(itemID: "i1")
 
         #expect(app.playback.rate == 1.0)
-        #expect(app.playback.skipInterval == 15)
+        #expect(app.playback.skipInterval == AppState.defaultSkipInterval)
     }
 }

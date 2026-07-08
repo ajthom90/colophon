@@ -128,19 +128,31 @@ struct MiniPlayerBar: View {
 /// cluster. Shown only while a session is active.
 struct TransportBar: View {
     @Environment(AppState.self) private var app
+    /// The expand affordance: tapping the now-playing artwork/title opens the full player — a
+    /// large detented sheet on iPad, the dedicated player Window on Mac (wired by `SplitShell`).
+    var onExpand: () -> Void = {}
 
     var body: some View {
         let playback = app.playback
         if hasActiveSession(playback) {
             HStack(spacing: 14) {
-                NowPlayingArtwork(side: 44)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(playback.title).font(.headline).lineLimit(1)
-                    if !playback.author.isEmpty {
-                        Text(playback.author).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                // The leading info region is the expand affordance (Task 4). A plain button so it
+                // reads as opaque content, never glass; the glass stays on `TransportControls`.
+                Button(action: onExpand) {
+                    HStack(spacing: 14) {
+                        NowPlayingArtwork(side: 44)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(playback.title).font(.headline).lineLimit(1)
+                            if !playback.author.isEmpty {
+                                Text(playback.author).font(.subheadline).foregroundStyle(.secondary).lineLimit(1)
+                            }
+                        }
+                        Spacer(minLength: 12)
                     }
+                    .contentShape(Rectangle())
                 }
-                Spacer(minLength: 12)
+                .buttonStyle(.plain)
+                .accessibilityLabel("Open Player")
                 Text(hms(playback.globalTime))
                     .font(.callout).monospacedDigit().foregroundStyle(.secondary)
                     .fontDesign(.default)
