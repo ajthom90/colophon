@@ -167,5 +167,6 @@ struct TransportBar: View {
 }
 
 // The full player (`FullPlayerView`) — artwork, serif title/author, a chapter-aware scrubber,
-// the glass transport cluster, and a chapter list — now lives in `App/Player/`. The shell presents
-// it over the mini-bar (see `PhoneShell.fullPlayerPresentation`).
+// the glass transport cluster, and a chapter list — now lives in `App/Player/`. Tapping this
+// mini-bar presents it per-platform (see `PlayerPresentation.swift`: `iPhonePlayerCover` on
+// iPhone, `iPadPlayerSheet` on iPad, a dedicated Mac `Window` via `PlayerWindowScene`).

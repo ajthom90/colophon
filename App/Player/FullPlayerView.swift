@@ -16,9 +16,9 @@ import ABSKit
 /// maps global↔track internally). Dragging seeks only on release (editing-ended) to avoid thrashing
 /// the player with a seek per drag tick.
 ///
-/// Presentation is a Task-4 concern; for now the shell presents this over the mini-bar (a
-/// `fullScreenCover` on iOS, a sheet elsewhere) — a deliberate stopgap so the player is viewable
-/// and testable today.
+/// Presentation is per-platform (see `PlayerPresentation.swift`): an edge-to-edge `fullScreenCover`
+/// on iPhone, a large detented `.sheet` on iPad, and a dedicated `Window` on the Mac — never a
+/// shared layout.
 struct FullPlayerView: View {
     @Environment(AppState.self) private var app
     @Environment(\.dismiss) private var dismiss

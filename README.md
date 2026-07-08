@@ -4,32 +4,48 @@ A native audiobook & podcast client for [Audiobookshelf](https://www.audiobooksh
 across iPhone, iPad, Mac, Apple TV, Vision Pro, and Apple Watch. Serif-typeset,
 Liquid Glass, and unapologetically Mac-assed on the Mac.
 
-**Status:** M1c-a browse & search foundation — a native, per-platform Liquid
-Glass navigation shell (iPhone `TabView` with a `tabViewBottomAccessory`
+**Status:** M1c-b full in-app player — every browse surface now pushes into a
+native item-detail view (cover, serif title/author/narrator, series,
+description, a metadata row, and a chapters-count preview) with a
+`.glassProminent` Play/Resume primary that reads live progress from
+`/api/me`. Play opens a full-screen Liquid Glass player built on the
+existing `PlayerEngine`: a chapter-aware scrubber and chapter list working
+in global book-seconds, a sleep timer (5/10/15/30/45/60-minute presets plus
+End-of-Chapter, with a fade-then-pause on fire), bookmarks (create/rename/
+delete/seek-to, round-tripped through the live bookmark endpoints and
+reconciled from `/api/me`), per-book playback speed that persists
+device-locally and resumes automatically, and an up-next queue (play-next/
+add-to-queue, book-finished auto-advance, reorderable). Presentation is
+native per platform — iPhone `.fullScreenCover`, iPad a large detented
+`.sheet`, and a dedicated Mac `Window("Now Playing")` (never a takeover) —
+with a `Playback` command menu (skip, next/prev chapter, speed; all
+non-Space shortcuts) and Now Playing/lock-screen/Control Center integration
+that keeps cover art, chapter, and elapsed time live across skip-interval
+changes and chapter boundaries, and clears itself when a session retires. A
+configurable skip interval (10/15/30/45/60s) applies everywhere transport
+appears. Underneath: a `v3` GRDB migration (additive per-book playback-rate
+prefs, `v1`/`v2` frozen and preserved). See
+`docs/superpowers/m1c-b-human-verification.md` for the on-device checklist
+(audible playback, lock-screen/media keys, Mac window) the automated,
+always-muted E2E suite can't cover.
+
+Built on M1c-a's browse & search foundation (a native, per-platform Liquid
+Glass navigation shell — iPhone `TabView` with a `tabViewBottomAccessory`
 mini-player; iPad/Mac `NavigationSplitView` with a hand-built bottom-docked
-Mac transport bar and a `Playback` command menu) fronts personalized home
-shelves (Continue Listening / Recently Added / Newest Authors, each cover
-carrying a progress pill joined from `/api/me`), a library cover grid with
-native sort and a filterdata-driven filter sheet, series & authors browse,
-and a blended local-FTS5 + server search (instant on-device results, enriched
-in place as the server responds). Underneath: a `v2` GRDB schema (an
-item-detail table plus a podcast episodes table, ahead of M1c-c), a
-connection-epoch refactor unifying every connection-mutating flow under one
-guard, uncapped reconciliation (arbitrarily large libraries page through to
-completion instead of stopping at 20 pages), and a per-item socket patch (a
-changed item updates its one row instead of re-paging the whole library).
-Built on M1b's sign-in & connections UX (OIDC single sign-on via
-`ASWebAuthenticationSession` alongside password auth, multi-connection
-management with cached-first offline activation, a Settings scene for
-typeface/speed/skip, live deletion reconciliation) and the M0/M1a walking
-skeleton (library browse, multi-file streaming playback with server progress
-sync, live Socket.IO updates, on iOS + macOS). The full in-app player
-(chapters, sleep timer, bookmarks, speed, queue) is M1c-b; podcast episode
-browse/playback is M1c-c; offline downloads are M2. Spikes for socket.io
-handshake, macOS grid performance, and the OIDC cookie/redirect walk are
-documented in `docs/superpowers/spikes/`. CarPlay entitlement application:
-pending user filing (will be recorded in
-docs/superpowers/carplay-entitlement.md).
+Mac transport bar — fronting personalized home shelves, a library cover
+grid with native sort/filter, series & authors browse, and a blended
+local-FTS5 + server search; a `v2` GRDB schema, a connection-epoch refactor,
+uncapped reconciliation, and a per-item socket patch), M1b's sign-in &
+connections UX (OIDC single sign-on via `ASWebAuthenticationSession`
+alongside password auth, multi-connection management with cached-first
+offline activation, a Settings scene for typeface/speed/skip, live deletion
+reconciliation), and the M0/M1a walking skeleton (library browse, multi-file
+streaming playback with server progress sync, live Socket.IO updates, on
+iOS + macOS). Podcast episode browse/playback (reusing this same player) is
+M1c-c; offline downloads are M2. Spikes for socket.io handshake, macOS grid
+performance, and the OIDC cookie/redirect walk are documented in
+`docs/superpowers/spikes/`. CarPlay entitlement application: pending user
+filing (will be recorded in docs/superpowers/carplay-entitlement.md).
 
 ## Development
 
