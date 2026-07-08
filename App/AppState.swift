@@ -91,6 +91,11 @@ final class AppState {
     /// survives the full player being dismissed and keeps counting while the book plays. Its
     /// `chapters` are refreshed on `startPlayback` and it's disarmed when the session is retired.
     let sleepTimer: SleepTimer
+    /// The current book's bookmarks (Task 6). Owned here — like `sleepTimer` — so the list survives
+    /// the bookmarks/player sheet being dismissed. `startPlayback` points it at the active client +
+    /// now-playing item and reconciles it from `me()`; `retireCurrentSession` clears it. IN-MEMORY +
+    /// `me()`-sourced (not persisted to LibraryCache) — see `Bookmarks`' caching-decision note.
+    let bookmarks = Bookmarks()
     let cache: LibraryCacheStore
     let coverStore: CoverStore
 
@@ -966,6 +971,24 @@ final class AppState {
                 lastUpdate: entry.lastUpdate ?? now)
         }
         try? cache.upsertProgressBatch(batch)
+        // Reuse the same `me()` payload to keep the now-playing book's bookmarks fresh (Task 6):
+        // `me().bookmarks[]` is the source of truth, filtered to the playing item. Cheap, and
+        // ignored by the store when no book is playing (`nowPlayingItemID` nil) or the item differs.
+        if let itemID = nowPlayingItemID {
+            bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID)
+        }
+    }
+
+    /// Loads the now-playing book's bookmarks from `GET /api/me`'s `bookmarks[]`, filtered to
+    /// `itemID` (Task 6). Driven from `startPlayback` so the player shows existing bookmarks the
+    /// moment a book opens — `refreshProgress` (Home appear/refresh) keeps them fresh thereafter,
+    /// reusing its own `me()` call. Best-effort: an absent/failed `me()` leaves the list untouched.
+    /// Guards against a connection switch or a new book started during the round-trip.
+    func refreshBookmarks(forItemID itemID: String) async {
+        guard let client, let connectionID = activeConnectionID else { return }
+        guard let me = try? await client.me() else { return }
+        guard connectionID == activeConnectionID, nowPlayingItemID == itemID else { return }
+        bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID)
     }
 
     /// Retire the current session completely (ordering matters: flush → detach sync callback →
@@ -987,6 +1010,8 @@ final class AppState {
         // Retiring the book cancels any armed sleep timer (it was scoped to that book).
         sleepTimer.turnOff()
         sleepTimer.chapters = []
+        // The bookmarks were scoped to that book too — drop them and the writer/item pointers.
+        bookmarks.clear()
     }
 
     func startPlayback(itemID: String) async {
@@ -1019,6 +1044,10 @@ final class AppState {
             // book's boundaries. A fresh book starts with no armed timer.
             sleepTimer.chapters = envelope.session.chapters
             sleepTimer.turnOff()
+            // Point the bookmarks store at this session's client + item, then load the existing
+            // bookmarks from `me()` (best-effort, detached — the player is playable immediately).
+            bookmarks.configure(writer: client, itemID: itemID)
+            Task { await refreshBookmarks(forItemID: itemID) }
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }

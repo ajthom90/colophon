@@ -29,6 +29,7 @@ struct FullPlayerView: View {
     @State private var scrubbing = false
     @State private var scrubTime: Double = 0
     @State private var showingChapters = false
+    @State private var showingBookmarks = false
 
     var body: some View {
         // `PlayerModel` holds no persistent state, so recreating it per body is correct — its
@@ -200,12 +201,13 @@ struct FullPlayerView: View {
 
     private func secondaryControls(model: PlayerModel) -> some View {
         VStack(spacing: 14) {
-            // The shared secondary glass cluster. Task 5 adds the sleep timer; bookmarks (T6),
-            // speed (T7), and up-next queue (T8) join this same `GlassEffectContainer` as further
-            // `.buttonStyle(.glass)` members — one cluster, never glass-on-glass.
+            // The shared secondary glass cluster. Task 5 adds the sleep timer; bookmarks (T6) join
+            // it here; speed (T7) and up-next queue (T8) join this same `GlassEffectContainer` as
+            // further `.buttonStyle(.glass)` members — one cluster, never glass-on-glass.
             GlassEffectContainer(spacing: 16) {
                 HStack(spacing: 16) {
                     SleepTimerView(timer: app.sleepTimer, hasChapters: !model.chapters.isEmpty)
+                    bookmarkButton
                 }
             }
             .controlSize(.large)
@@ -225,5 +227,26 @@ struct FullPlayerView: View {
             .accessibilityLabel("Show Chapters")
         }
         .padding(.top, 18)
+    }
+
+    /// The bookmark control — a `.buttonStyle(.glass)` member of the secondary cluster (NOT its own
+    /// glass surface), opening the native `BookmarksView` sheet (list + create-at-current-time).
+    ///
+    /// The bookmarks sheet is attached HERE (on the button), not on the root `VStack`, on purpose:
+    /// the Chapters sheet already lives on the root view, and two `.sheet(isPresented:)` modifiers on
+    /// the SAME view conflict — only the first presents (verified live via idb: the second tap was a
+    /// no-op). Hanging this sheet off a distinct subview lets both present independently.
+    private var bookmarkButton: some View {
+        Button {
+            showingBookmarks = true
+        } label: {
+            Image(systemName: "bookmark")
+        }
+        .buttonStyle(.glass)
+        .fontDesign(.default)
+        .accessibilityLabel("Bookmarks")
+        .sheet(isPresented: $showingBookmarks) {
+            BookmarksView()
+        }
     }
 }
