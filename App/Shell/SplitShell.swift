@@ -119,20 +119,36 @@ struct SplitShell: View {
         // caller mounts conditionally, as `PhoneShell` does, resets that caller's state on pop).
         // This stack's root never changes shape once a sidebar row is selected, so it's a stable
         // registration point.
+        // The destinations are registered on each stack's ROOT CONTENT VIEW, INSIDE the
+        // `NavigationStack` — NOT on the `NavigationStack` value itself. In a `NavigationSplitView`
+        // a `navigationDestination` attached to the outside of a column's stack is treated as a
+        // COLUMN destination and targets the next column; the detail column has no next column, so
+        // a `CoverCard` tap dead-ends ("There is no next column after the detail column"). Placing
+        // it on the stack's root content pushes within the detail column, matching how `HomeView`/
+        // `SearchView` self-register (they're the unconditional root of their own stacks). The
+        // root content is still the stable registration point — it never changes shape once a
+        // sidebar row is selected — so the "don't self-register on a conditionally-mounted view"
+        // rule the browse views' doc comments describe is honored.
         switch selection {
         case .search:
             NavigationStack { SearchView() }
         case .library(let library):
-            NavigationStack { LibraryGridView(library: library) }
-                .itemDetailDestination()
+            NavigationStack {
+                LibraryGridView(library: library)
+                    .itemDetailDestination()
+            }
         case .series(let library):
-            NavigationStack { SeriesListView(library: library) }
-                .navigationDestination(for: SeriesSummary.self) { SeriesDetailView(library: library, series: $0) }
-                .itemDetailDestination()
+            NavigationStack {
+                SeriesListView(library: library)
+                    .navigationDestination(for: SeriesSummary.self) { SeriesDetailView(library: library, series: $0) }
+                    .itemDetailDestination()
+            }
         case .authors(let library):
-            NavigationStack { AuthorsListView(library: library) }
-                .navigationDestination(for: AuthorSummary.self) { AuthorDetailView(library: library, author: $0) }
-                .itemDetailDestination()
+            NavigationStack {
+                AuthorsListView(library: library)
+                    .navigationDestination(for: AuthorSummary.self) { AuthorDetailView(library: library, author: $0) }
+                    .itemDetailDestination()
+            }
         case .home, .none:
             NavigationStack { HomeView() }
         }
