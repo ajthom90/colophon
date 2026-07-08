@@ -239,22 +239,41 @@ public struct ShelfAuthorEntity: Decodable, Sendable, Identifiable {
 }
 
 /// Podcast episode shelf entities (`continue-listening`/`newest-episodes`/`listen-again` on a
-/// podcast library — shelf `type` `"episode"`) are source-verified against ABS 2.35.1
-/// (`libraryFilters.js` attaches a `recentEpisode` object onto the podcast's `LibraryItem`
-/// before it's pushed onto the shelf) but NOT live-captured: this dev stack seeds a book library
-/// only. Every field is optional; M1c-c should tighten this against a real podcast fixture.
+/// podcast library — shelf `type` `"episode"`) — LIVE-CAPTURED (M1c-c Task 1,
+/// `podcast-personalized.json`). ABS's `libraryFilters.js` attaches a `recentEpisode` object onto
+/// the podcast's `LibraryItem` before it's pushed onto the shelf, so the entity itself is the
+/// PODCAST library item (`id` = podcast item id, `media` = podcast media) with the shelf's episode
+/// riding in `recentEpisode`.
+///
+/// Live corrections over the M1c-a source-only guess: `id` is always present (it's the podcast
+/// library-item id, NOT the episode id — the episode id lives at `recentEpisode.id`), so it's
+/// non-optional to match `ShelfBookEntity`/`ShelfAuthorEntity`. `RecentEpisodeRef` gained the
+/// fields the live projection actually carries — `libraryItemId` (the podcast id, for the 3-part
+/// `cachedProgress` PK join), `episodeType`, `index`, `pubDate`, `guid`, `description`, `duration`.
+/// `season`/`episode` are STRINGS (verified: `"1"`, not `1`); `index` and `duration` come back
+/// `null` in this shelf projection (present on the full item), so both stay optional.
 public struct ShelfEpisodeEntity: Decodable, Sendable {
-    public let id: String?
+    /// The PODCAST library-item id (the shelf entity is the podcast, not the episode).
+    public let id: String
     public let media: ShelfEntityMedia?
     public let recentEpisode: RecentEpisodeRef?
 
     public struct RecentEpisodeRef: Decodable, Sendable {
+        /// The episode id (the id used for `/play/:episodeId` and the `cachedProgress` PK).
         public let id: String?
-        public let title: String?
-        public let subtitle: String?
+        /// The owning podcast's library-item id (the `itemID` of the 3-part `cachedProgress` PK).
+        public let libraryItemId: String?
+        public let index: Int?
         public let season: String?
         public let episode: String?
+        public let episodeType: String?
+        public let title: String?
+        public let subtitle: String?
+        public let description: String?
+        public let pubDate: String?
         public let publishedAt: Int?
+        public let guid: String?
+        public let duration: Double?
     }
 }
 
@@ -357,8 +376,11 @@ public struct SearchResults: Decodable, Sendable {
     public let genres: [SearchNamedCount]?
     public let series: [SearchSeriesHit]?
     public let authors: [AuthorSummary]?
-    /// Podcast-library-only buckets (source-verified via `libraryItemsPodcastFilters.search`,
-    /// not live-captured — this dev stack seeds a book library only; M1c-c should tighten this).
+    /// Podcast-library-only buckets — LIVE-CAPTURED (M1c-c Task 1, `podcast-search.json`,
+    /// `q=on` matching both). The `podcast` bucket is verified to reuse the SAME `{libraryItem}`
+    /// wrapper as the `book` bucket (so `[SearchBookHit]` is correct); the `episodes` bucket wraps
+    /// the matched episode's PODCAST, with the matched episode in `libraryItem.recentEpisode` (see
+    /// `SearchEpisodeHit`). Book libraries omit both buckets entirely (they decode as nil).
     public let podcast: [SearchBookHit]?
     public let episodes: [SearchEpisodeHit]?
 }
@@ -396,12 +418,29 @@ public struct SearchSeriesHit: Decodable, Sendable {
     public let books: [LibraryItemSummary]?
 }
 
-/// Podcast episode search hits (source-verified only, not live-captured this milestone — see
-/// `ShelfEpisodeEntity`).
-public struct SearchEpisodeHit: Decodable, Sendable {
-    public let id: String?
-    public let libraryItemId: String?
-    public let title: String?
+/// A `episodes` search-bucket hit — LIVE-CAPTURED (M1c-c Task 1, `podcast-search.json`).
+///
+/// Live correction over the M1c-a source-only guess (`{id, libraryItemId, title}`): the real hit
+/// wraps a `libraryItem` (the matched episode's PODCAST — `mediaType: "podcast"`), and the matched
+/// episode rides in `libraryItem.recentEpisode` — `media.episodes` is EMPTY in this search
+/// projection, exactly like a personalized episode shelf entity. So the hit mirrors `SearchBookHit`
+/// (a `{libraryItem}` wrapper), not a flat episode object; read the episode from `recentEpisode`.
+public struct SearchEpisodeHit: Decodable, Sendable, Identifiable {
+    public let libraryItem: SearchEpisodeLibraryItem
+    /// The matched episode's id (falls back to the podcast id) — stable for SwiftUI `ForEach`.
+    public var id: String { libraryItem.recentEpisode?.id ?? libraryItem.id }
+}
+
+/// The `libraryItem` wrapper inside an `episodes` search hit: the matched episode's PODCAST
+/// (`id`/`media` for the podcast title + cover) plus the matched episode in `recentEpisode`
+/// (reusing `ShelfEpisodeEntity.RecentEpisodeRef`, the identical shape verified live). Lean
+/// projection — the search response's other item fields (path/ino/libraryFiles/…) are dropped by
+/// tolerant decoding.
+public struct SearchEpisodeLibraryItem: Decodable, Sendable, Identifiable {
+    /// The podcast library-item id.
+    public let id: String
+    public let media: ShelfEntityMedia
+    public let recentEpisode: ShelfEpisodeEntity.RecentEpisodeRef?
 }
 
 /// `GET /api/me` — this milestone only needs `mediaProgress` (the progress-join source for

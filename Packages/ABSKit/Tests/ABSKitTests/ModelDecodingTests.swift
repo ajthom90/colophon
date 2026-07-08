@@ -228,6 +228,99 @@ private func fixture(_ name: String) throws -> Data {
         #expect(d.media.metadata.series?.last?.name == "Real Series")
     }
 
+    // MARK: - Podcast fixtures (M1c-c Task 1 — live-captured against a real seeded podcast)
+
+    /// `podcast-personalized.json` is a live `GET /api/libraries/:podcastLib/personalized` capture
+    /// (ABS 2.35.1) for the seeded "Colophon Test Podcast": episode-typed shelves
+    /// (`continue-listening`/`newest-episodes`, shelf `type` `"episode"`) plus a `podcast`-typed
+    /// `recently-added`. Grounds `ShelfEpisodeEntity`: the entity `id` is the PODCAST item id, the
+    /// matched episode rides in `recentEpisode`, and `season`/`episode` are STRINGS.
+    @Test func decodesPodcastPersonalizedEpisodeShelves() throws {
+        let shelves = try decoder.decode([Shelf].self, from: fixture("podcast-personalized"))
+        let continueShelf = try #require(shelves.first { $0.id == "continue-listening" })
+        #expect(continueShelf.type == "episode")
+        guard case let .episode(ep) = continueShelf.entities.first else {
+            Issue.record("expected an episode shelf entity")
+            return
+        }
+        // The entity id is the PODCAST library-item id, not the episode id.
+        #expect(ep.id == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(ep.media?.metadata.title == "Colophon Test Podcast")
+        #expect(ep.media?.coverPath == "/podcasts/Colophon Test Podcast/cover.jpg")
+        // The episode itself lives in recentEpisode.
+        #expect(ep.recentEpisode?.id == "5753ddd5-fa18-4513-a0a8-2aee528f5e4d")
+        #expect(ep.recentEpisode?.libraryItemId == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(ep.recentEpisode?.title == "Episode One: Laying Plans")
+        #expect(ep.recentEpisode?.subtitle == "The opening chapter on strategy")
+        #expect(ep.recentEpisode?.season == "1")       // STRING, not Int
+        #expect(ep.recentEpisode?.episode == "1")      // STRING, not Int
+        #expect(ep.recentEpisode?.episodeType == "full")
+        #expect(ep.recentEpisode?.publishedAt == 1_736_150_400_000)
+        #expect(ep.recentEpisode?.guid == "colophon-test-ep-0001")
+        // index/duration come back null in the shelf projection — optionality verified.
+        #expect(ep.recentEpisode?.index == nil)
+        #expect(ep.recentEpisode?.duration == nil)
+
+        #expect(shelves.contains { $0.id == "newest-episodes" && $0.type == "episode" })
+        #expect(shelves.contains { $0.id == "recently-added" && $0.type == "podcast" })
+    }
+
+    /// `podcast-search.json` is a live `GET /api/libraries/:podcastLib/search?q=on` capture: `q=on`
+    /// matches both the podcast title ("Colophon") and an episode title ("Episode One"), so both
+    /// podcast-only buckets are populated. Grounds `SearchResults.podcast` (a `{libraryItem}`
+    /// wrapper, same as `book`) and the corrected `SearchEpisodeHit` (the matched episode rides in
+    /// `libraryItem.recentEpisode`, NOT a flat `{id,libraryItemId,title}` object).
+    @Test func decodesPodcastSearchBuckets() throws {
+        let r = try decoder.decode(SearchResults.self, from: fixture("podcast-search"))
+        #expect(r.podcast?.count == 1)
+        #expect(r.podcast?.first?.libraryItem.id == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(r.podcast?.first?.libraryItem.media.metadata.title == "Colophon Test Podcast")
+
+        #expect(r.episodes?.count == 1)
+        let hit = try #require(r.episodes?.first)
+        #expect(hit.libraryItem.id == "55967a7a-0b3e-4a2c-aaf9-45843286117a")  // podcast id
+        #expect(hit.libraryItem.media.metadata.title == "Colophon Test Podcast")
+        #expect(hit.libraryItem.recentEpisode?.title == "Episode One: Laying Plans")
+        #expect(hit.libraryItem.recentEpisode?.id == "5753ddd5-fa18-4513-a0a8-2aee528f5e4d")
+        // Identifiable id resolves to the matched episode id (stable for ForEach).
+        #expect(hit.id == "5753ddd5-fa18-4513-a0a8-2aee528f5e4d")
+    }
+
+    /// `me-episode-progress.json` is a live `GET /api/me` capture taken after setting per-episode
+    /// progress. Grounds `MediaProgressEntry.episodeId`: a book entry carries `episodeId: null`
+    /// (decodes nil), an episode entry carries a populated `episodeId` — the discriminator the
+    /// 3-part `cachedProgress` PK relies on ("" = book, episodeId = episode).
+    @Test func decodesMeWithEpisodeProgress() throws {
+        let me = try decoder.decode(MeUser.self, from: fixture("me-episode-progress"))
+        let progress = try #require(me.mediaProgress)
+        #expect(progress.count == 2)
+        let episodeEntry = try #require(progress.first { $0.episodeId != nil })
+        #expect(episodeEntry.libraryItemId == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(episodeEntry.episodeId == "5753ddd5-fa18-4513-a0a8-2aee528f5e4d")
+        #expect(episodeEntry.currentTime == 123.5)
+        #expect(episodeEntry.isFinished == false)
+        // The book entry has a null episodeId (decodes nil) — distinct progress row.
+        let bookEntry = try #require(progress.first { $0.episodeId == nil })
+        #expect(bookEntry.libraryItemId == "77226f9e-ad94-4b26-bf8a-bf841965ca23")
+    }
+
+    /// `episode-play.json` is a live `POST /api/items/:id/play/:episodeId` capture (the session was
+    /// closed immediately after to leave the seed clean). Confirms the episode playback envelope is
+    /// the SAME `PlaybackSession` shape as a book `/play`, with `episodeId` populated and the
+    /// episode's title/podcast surfaced as `displayTitle`/`displayAuthor`.
+    @Test func decodesEpisodePlaybackSession() throws {
+        let s = try decoder.decode(PlaybackSession.self, from: fixture("episode-play"))
+        #expect(s.id == "8c948009-d896-4e3f-aeb4-4ec53ff01c47")
+        #expect(s.libraryItemId == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(s.episodeId == "5753ddd5-fa18-4513-a0a8-2aee528f5e4d")
+        #expect(s.displayTitle == "Episode One: Laying Plans")
+        #expect(s.displayAuthor == "Colophon Dev")
+        #expect(s.duration == 465.397551)
+        #expect(s.playMethod == 0)
+        #expect(s.audioTracks.count == 1)
+        #expect(s.audioTracks.first?.contentUrl == "/api/items/55967a7a-0b3e-4a2c-aaf9-45843286117a/file/5521")
+    }
+
     @Test func deviceInfoEncodesWithDefaults() throws {
         let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
         let data = try JSONEncoder().encode(device)
