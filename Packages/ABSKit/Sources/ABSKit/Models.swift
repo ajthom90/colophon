@@ -494,6 +494,85 @@ public struct Bookmark: Codable, Sendable, Hashable, Identifiable {
     }
 }
 
+// MARK: - Podcast item detail (M1c-c Task 2)
+
+/// Full podcast-item detail from the SAME endpoint as `item(id:)` (`GET /api/items/:id?expanded=1`)
+/// — decoded into a SEPARATE type rather than folded into `LibraryItemDetail` because a podcast's
+/// `media.metadata` is a completely different shape from a book's `ExpandedItemMetadata` (podcast:
+/// `title`/`author`/`description`/`feedUrl`/`imageUrl`/…; book: `authorName`/`narratorName`/
+/// `series`/…) and only a podcast's `media` carries `episodes[]`. `ABSClient.podcastItem(id:)`
+/// hits the identical request as `item(id:)` (same URL-building helper — no duplicated fetch),
+/// just decoded against this podcast-shaped DTO. Grounded in the M1c-c Task 1 live capture
+/// (`podcast-item.json`).
+public struct PodcastDetail: Decodable, Sendable, Identifiable {
+    public let id: String
+    /// The item's owning library — optional for the same tolerant-decode reason as
+    /// `LibraryItemDetail.libraryId`.
+    public let libraryId: String?
+    public let updatedAt: Int?
+    public let media: PodcastMedia
+}
+
+public struct PodcastMedia: Decodable, Sendable {
+    public let metadata: PodcastMetadata
+    public let coverPath: String?
+    public let episodes: [PodcastEpisode]
+}
+
+/// A podcast's metadata (`media.metadata` on a podcast item) — live-verified shape, distinct from
+/// a book's `ExpandedItemMetadata`. `description` is HTML (render via `HTMLText`, not raw `Text`).
+public struct PodcastMetadata: Decodable, Sendable {
+    public let title: String?
+    public let author: String?
+    public let description: String?
+    public let releaseDate: String?
+    public let genres: [String]?
+    public let feedUrl: String?
+    public let imageUrl: String?
+    public let explicit: Bool?
+    public let language: String?
+    public let type: String?
+}
+
+/// One podcast episode from `media.episodes[]` — live-verified against `podcast-item.json`
+/// (M1c-c Task 1). `season`/`episode` are STRINGS (`"1"`, not `1` — a live correction over the
+/// M1c-a source-only guess, matching `ShelfEpisodeEntity.RecentEpisodeRef` and the `cachedEpisode`
+/// table's `season`/`episode` columns). `enclosure.length` is likewise a STRING (`"3723859"`).
+/// `audioFile`/`audioTrack` (the server's internal per-file scan metadata) are intentionally NOT
+/// modeled here — playback goes through `ABSClient.playEpisode`'s own session envelope
+/// (`audioTracks`), not the RSS enclosure or file-scan metadata; tolerant decoding drops them.
+public struct PodcastEpisode: Decodable, Sendable, Identifiable {
+    public let id: String
+    /// The owning podcast's library-item id (the `itemID` half of the 3-part `cachedProgress` PK).
+    public let libraryItemId: String?
+    public let podcastId: String?
+    /// Track index within the season/feed; `null` in the live capture (kept optional).
+    public let index: Int?
+    public let season: String?
+    public let episode: String?
+    public let episodeType: String?
+    public let title: String?
+    public let subtitle: String?
+    /// HTML — render via `HTMLText`, not raw `Text`.
+    public let description: String?
+    public let enclosure: PodcastEpisodeEnclosure?
+    public let guid: String?
+    public let pubDate: String?
+    public let publishedAt: Int?
+    /// Per-episode chapter marks, same shape as a book's global chapters; empty for this seed.
+    public let chapters: [Chapter]?
+    public let size: Int?
+    public let duration: Double?
+}
+
+/// The episode's RSS enclosure (`{url,type,length}`). `length` is a STRING in the live payload
+/// (`"3723859"`), not a JSON number — verified against `podcast-item.json`.
+public struct PodcastEpisodeEnclosure: Decodable, Sendable, Hashable {
+    public let url: String?
+    public let type: String?
+    public let length: String?
+}
+
 public struct DeviceInfo: Encodable, Sendable {
     public let deviceId: String
     public let clientName: String

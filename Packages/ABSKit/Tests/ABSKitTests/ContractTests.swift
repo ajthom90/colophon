@@ -186,4 +186,35 @@ struct ContractTests {
         #expect(results.episodes?.first?.libraryItem.recentEpisode?.title != nil,
                 "episode hit must carry the matched episode in libraryItem.recentEpisode")
     }
+
+    // MARK: - M1c-c Task 2: podcast item + episode playback
+
+    /// Live-verifies `podcastItem(id:)` against the seeded "Colophon Test Podcast" (podcast
+    /// metadata + both episodes), then plays an episode via `playEpisode` and immediately CLOSES
+    /// the session so the dev seed is left exactly as it found it (no lingering session/progress).
+    @Test func podcastItemAndEpisodePlaybackRoundTripLive() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let podcastLib = try #require(libs.first { $0.mediaType == "podcast" },
+                                      "seed must create a podcast library — run make seed")
+        let podcastPage = try await client.items(libraryID: podcastLib.id, limit: 10, page: 0)
+        let podcastItemID = try #require(podcastPage.results.first?.id)
+
+        let detail = try await client.podcastItem(id: podcastItemID)
+        #expect(detail.id == podcastItemID)
+        #expect(detail.media.metadata.title == "Colophon Test Podcast")
+        #expect(detail.media.episodes.count == 2)
+        let episode = try #require(detail.media.episodes.first)
+
+        let device = DeviceInfo(deviceId: "contract-test", clientVersion: "0.1.0", model: "test")
+        let envelope = try await client.playEpisode(itemID: podcastItemID, episodeId: episode.id, deviceInfo: device)
+        let session = envelope.session
+        #expect(session.episodeId == episode.id)
+        #expect(session.libraryItemId == podcastItemID)
+        #expect(!session.audioTracks.isEmpty)
+
+        // Leave the seed clean: close the session immediately (no sync — avoid leaving progress).
+        try await client.closeSession(id: session.id, currentTime: session.startTime,
+                                      timeListened: 0, duration: session.duration)
+    }
 }

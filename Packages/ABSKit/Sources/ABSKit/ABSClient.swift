@@ -64,10 +64,23 @@ public final class ABSClient: Sendable {
     /// `ItemDetailView`. `include=progress` is harmless to the socket-patch path (it only reads
     /// id/library/title/author/duration) and load-bearing for the detail view's Resume state.
     public func item(id: String) async throws -> LibraryItemDetail {
+        try await authorizedSend(itemDetailRequest(id: id), as: LibraryItemDetail.self)
+    }
+
+    /// Fetches the SAME `GET /api/items/:id?expanded=1&include=progress` endpoint as `item(id:)`
+    /// (identical request-building — no duplicated fetch), decoded against the podcast-shaped
+    /// `PodcastDetail` instead of the book-shaped `LibraryItemDetail`: a podcast's `media.metadata`
+    /// is a different shape from a book's, and only a podcast's `media` carries `episodes[]`.
+    /// Callers pick this vs. `item(id:)` based on the library's/item's `mediaType`.
+    public func podcastItem(id: String) async throws -> PodcastDetail {
+        try await authorizedSend(itemDetailRequest(id: id), as: PodcastDetail.self)
+    }
+
+    private func itemDetailRequest(id: String) -> URLRequest {
         var comps = URLComponents(url: baseURL.appending(path: "api/items/\(id)"),
                                   resolvingAgainstBaseURL: false)!
         comps.queryItems = [.init(name: "expanded", value: "1"), .init(name: "include", value: "progress")]
-        return try await authorizedSend(URLRequest(url: comps.url!), as: LibraryItemDetail.self)
+        return URLRequest(url: comps.url!)
     }
 
     /// `GET /api/libraries/:id/personalized?limit=` — home-screen shelves (Continue Listening,
@@ -197,20 +210,50 @@ extension ABSClient {
     static let supportedMimeTypes = ["audio/mpeg", "audio/mp4", "audio/aac", "audio/flac", "audio/x-m4b"]
 
     public func startPlayback(itemID: String, deviceInfo: DeviceInfo) async throws -> PlaybackSessionEnvelope {
-        struct PlayRequest: Encodable {
-            let deviceInfo: DeviceInfo
-            let mediaPlayer: String
-            let supportedMimeTypes: [String]
-            let forceDirectPlay: Bool
-            let forceTranscode: Bool
-        }
-        var req = URLRequest(url: baseURL.appending(path: "api/items/\(itemID)/play"))
+        let req = try playRequest(path: "api/items/\(itemID)/play", deviceInfo: deviceInfo,
+                                  forceDirectPlay: false, forceTranscode: false)
+        return try await sendPlayRequest(req)
+    }
+
+    /// `POST /api/items/:id/play/:episodeId` — episode playback through the SAME envelope shape
+    /// as book `startPlayback` (session id, audioTracks, chapters, currentTime — verified live,
+    /// M1c-c Task 1's `episode-play.json`). Mirrors `startPlayback`'s request-building exactly
+    /// (deviceInfo body, header, decode), just against the episode-scoped path, and threads
+    /// `forceDirectPlay`/`forceTranscode` through for the HLS/direct-play rules.
+    public func playEpisode(
+        itemID: String,
+        episodeId: String,
+        deviceInfo: DeviceInfo,
+        forceDirectPlay: Bool = false,
+        forceTranscode: Bool = false
+    ) async throws -> PlaybackSessionEnvelope {
+        let req = try playRequest(path: "api/items/\(itemID)/play/\(episodeId)", deviceInfo: deviceInfo,
+                                  forceDirectPlay: forceDirectPlay, forceTranscode: forceTranscode)
+        return try await sendPlayRequest(req)
+    }
+
+    private struct PlayRequest: Encodable {
+        let deviceInfo: DeviceInfo
+        let mediaPlayer: String
+        let supportedMimeTypes: [String]
+        let forceDirectPlay: Bool
+        let forceTranscode: Bool
+    }
+
+    private func playRequest(
+        path: String, deviceInfo: DeviceInfo, forceDirectPlay: Bool, forceTranscode: Bool
+    ) throws -> URLRequest {
+        var req = URLRequest(url: baseURL.appending(path: path))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try ABSAPI.encoder.encode(PlayRequest(
             deviceInfo: deviceInfo, mediaPlayer: "AVPlayer",
             supportedMimeTypes: Self.supportedMimeTypes,
-            forceDirectPlay: false, forceTranscode: false))
+            forceDirectPlay: forceDirectPlay, forceTranscode: forceTranscode))
+        return req
+    }
+
+    private func sendPlayRequest(_ req: URLRequest) async throws -> PlaybackSessionEnvelope {
         let data = try await authorizedData(req)
         let session = try ABSAPI.decoder.decode(PlaybackSession.self, from: data)
         return PlaybackSessionEnvelope(session: session, rawData: data)

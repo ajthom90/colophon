@@ -33,6 +33,42 @@ import ABSKitTestSupport
         #expect(body["forceTranscode"] as? Bool == false)
     }
 
+    /// `POST /api/items/:id/play/:episodeId` — mirrors `startPlayback`'s request-building
+    /// (deviceInfo body, header, decode) but hits the episode-scoped path and threads
+    /// `forceDirectPlay`/`forceTranscode` through (both default `false`, matching book playback's
+    /// hardcoded behavior). Reuses the SAME `PlaybackSessionEnvelope`/`PlaybackSession` decode
+    /// target as the book path — no parallel episode-only session type.
+    @Test func playEpisodePostsToEpisodeScopedPathAndReusesSessionEnvelope() async throws {
+        let (client, transport) = try await makeSUT()
+        await transport.enqueue(status: 200, json: sessionJSON)
+        let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
+        let envelope = try await client.playEpisode(itemID: "li_1", episodeId: "ep_1", deviceInfo: device)
+        #expect(envelope.session.id == "ses_1")
+        let req = await transport.recorded.first
+        #expect(req?.url?.absoluteString == "http://abs.test:13378/api/items/li_1/play/ep_1")
+        #expect(req?.httpMethod == "POST")
+        let body = try JSONSerialization.jsonObject(with: req?.httpBody ?? Data()) as! [String: Any]
+        #expect((body["deviceInfo"] as? [String: Any])?["deviceId"] as? String == "dev-1")
+        #expect(body["mediaPlayer"] as? String == "AVPlayer")
+        #expect((body["supportedMimeTypes"] as? [String])?.contains("audio/mpeg") == true)
+        #expect(body["forceDirectPlay"] as? Bool == false)
+        #expect(body["forceTranscode"] as? Bool == false)
+    }
+
+    /// `forceDirectPlay`/`forceTranscode` thread through to the request body (unlike book
+    /// `startPlayback`, which hardcodes both `false`) — needed for the HLS/direct-play rules.
+    @Test func playEpisodeThreadsForceFlags() async throws {
+        let (client, transport) = try await makeSUT()
+        await transport.enqueue(status: 200, json: sessionJSON)
+        let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
+        _ = try await client.playEpisode(
+            itemID: "li_1", episodeId: "ep_1", deviceInfo: device,
+            forceDirectPlay: true, forceTranscode: false)
+        let req = await transport.recorded.first
+        let body = try JSONSerialization.jsonObject(with: req?.httpBody ?? Data()) as! [String: Any]
+        #expect(body["forceDirectPlay"] as? Bool == true)
+    }
+
     @Test func syncPostsPayload() async throws {
         let (client, transport) = try await makeSUT()
         await transport.enqueue(status: 200, json: "{}")

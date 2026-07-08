@@ -321,6 +321,52 @@ private func fixture(_ name: String) throws -> Data {
         #expect(s.audioTracks.first?.contentUrl == "/api/items/55967a7a-0b3e-4a2c-aaf9-45843286117a/file/5521")
     }
 
+    /// `podcast-item.json` is a live `GET /api/items/:id?expanded=1` capture (ABS 2.35.1) for the
+    /// seeded "Colophon Test Podcast" — grounds `PodcastDetail`/`PodcastMedia`/`PodcastMetadata`/
+    /// `PodcastEpisode` (Task 2's `podcastItem(id:)` DTO). Confirms the podcast metadata shape
+    /// (title/author/description(HTML)/feedUrl/imageUrl — distinct from a book's `ExpandedItemMetadata`)
+    /// and both episodes' fields, incl. `season`/`episode` as STRINGS (Task 1 correction) and
+    /// `enclosure.length` as a STRING (verified live: `"3723859"`, not a number).
+    @Test func decodesPodcastItemDetail() throws {
+        let d = try decoder.decode(PodcastDetail.self, from: fixture("podcast-item"))
+        #expect(d.id == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(d.libraryId == "4a4e1fe0-81f5-4671-9d96-397afe13a500")
+        #expect(d.media.metadata.title == "Colophon Test Podcast")
+        #expect(d.media.metadata.author == "Colophon Dev")
+        #expect(d.media.metadata.description?.contains("public-domain") == true)
+        #expect(d.media.metadata.feedUrl == "http://host.docker.internal:8199/feed.xml")
+        #expect(d.media.metadata.imageUrl == "http://host.docker.internal:8199/cover.jpg")
+        #expect(d.media.metadata.type == "episodic")
+        #expect(d.media.coverPath == "/podcasts/Colophon Test Podcast/cover.jpg")
+
+        #expect(d.media.episodes.count == 2)
+        let first = try #require(d.media.episodes.first { $0.id == "5753ddd5-fa18-4513-a0a8-2aee528f5e4d" })
+        #expect(first.libraryItemId == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
+        #expect(first.podcastId == "a32b9370-e007-4557-a855-5dbb7d9a4e43")
+        #expect(first.season == "1")       // STRING, not Int
+        #expect(first.episode == "1")      // STRING, not Int
+        #expect(first.episodeType == "full")
+        #expect(first.title == "Episode One: Laying Plans")
+        #expect(first.subtitle == "The opening chapter on strategy")
+        #expect(first.description?.contains("first") == true)
+        #expect(first.guid == "colophon-test-ep-0001")
+        #expect(first.pubDate == "Mon, 06 Jan 2025 08:00:00 GMT")
+        #expect(first.publishedAt == 1_736_150_400_000)
+        #expect(first.index == nil)        // null in this live capture
+        #expect(first.duration == 465.397551)
+        #expect(first.size == 3_724_390)
+        #expect(first.chapters?.isEmpty == true)
+        #expect(first.enclosure?.url == "http://host.docker.internal:8199/episode-1.mp3")
+        #expect(first.enclosure?.type == "audio/mpeg")
+        #expect(first.enclosure?.length == "3723859")  // STRING, not a number
+
+        let second = try #require(d.media.episodes.first { $0.id == "6388539d-a9cd-4ae2-932f-099bc4cf2327" })
+        #expect(second.season == "1")
+        #expect(second.episode == "2")
+        #expect(second.title == "Episode Two: Attack by Stratagem")
+        #expect(second.duration == 506.827755)
+    }
+
     @Test func deviceInfoEncodesWithDefaults() throws {
         let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
         let data = try JSONEncoder().encode(device)
