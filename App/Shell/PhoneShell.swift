@@ -53,7 +53,7 @@ struct PhoneShell: View {
                 NavigationStack { DownloadsPlaceholder() }
             }
             Tab("Search", systemImage: "magnifyingglass", role: .search) {
-                NavigationStack { SearchPlaceholder() }
+                NavigationStack { SearchView() }
             }
         }
         .phoneTabChrome { MiniPlayerBar { showingFullPlayer = true } }

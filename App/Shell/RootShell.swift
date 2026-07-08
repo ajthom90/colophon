@@ -32,18 +32,6 @@ struct RootShell: View {
 
 // MARK: - Placeholders (filled by later M1c-a tasks)
 
-/// Search surface placeholder — the FTS5 ⨯ server blend lands in Task 10.
-struct SearchPlaceholder: View {
-    var body: some View {
-        ContentUnavailableView {
-            Label("Search — M1c-a Task 10", systemImage: "magnifyingglass")
-        } description: {
-            Text("Blended local and server search arrives in a later task.")
-        }
-        .navigationTitle("Search")
-    }
-}
-
 /// Downloads tab stub — offline downloads are a later-milestone (M2) feature.
 struct DownloadsPlaceholder: View {
     var body: some View {

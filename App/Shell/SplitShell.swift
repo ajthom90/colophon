@@ -101,7 +101,7 @@ struct SplitShell: View {
         // registration point.
         switch selection {
         case .search:
-            NavigationStack { SearchPlaceholder() }
+            NavigationStack { SearchView() }
         case .library(let library):
             NavigationStack { LibraryGridView(library: library) }
         case .series(let library):
