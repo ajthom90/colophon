@@ -225,6 +225,14 @@ final class AppState {
     /// `retireCurrentSession` (handle nil) and both await `client.startPlayback`; if response A
     /// lands after B, the user hears the wrong item and B's server session leaks open.
     private var isStartingPlayback = false
+    /// First-advance-wins reentrancy guard for `advanceToNext` (Task 8). Without it a reentrant
+    /// advance — the book-finished signal firing while the user taps Play Next, or a double-tap —
+    /// would peek/consume the queue a second time while the first advance's `startPlayback` is
+    /// mid-flight; `startPlayback`'s own `isStartingPlayback` guard then silently drops the second,
+    /// so a peeked/popped item would be LOST (and the empty branch would `retireCurrentSession`
+    /// twice → a double `/close`). Held across the whole async body so only one advance runs at a
+    /// time; combined with peek-then-commit, a superseded advance leaves the queue untouched.
+    private var isAdvancing = false
     /// Reentrancy guard for `activateConnection`'s synchronous section — see its doc comment.
     private var activatingConnectionID: String?
     /// The background probe kicked off by the most recent `activateConnection` call — see its
@@ -1129,33 +1137,50 @@ final class AppState {
 
     /// Advance past the current book — driven by the book-finished signal (`playback.onBookFinished`,
     /// wired in `init`) AND the player's manual Next action. The CORE DECISION is the pure, unit-tested
-    /// `PlaybackQueue.nextPlayable(validConnectionIDs:)`: it pops the front entry, DROPPING any whose
-    /// owning connection was signed out / removed (guarding the removed-connection hazard — the entry
-    /// would be unreachable), and hands back the next playable one or `nil`.
+    /// `PlaybackQueue.peekNextPlayable(validConnectionIDs:)`: it drops any leading entry whose owning
+    /// connection can't play (signed out / removed — the item is unreachable) and returns the next
+    /// playable one WITHOUT consuming it (peek-then-commit), or `nil` to stop.
     ///
-    /// - Non-empty → start the next entry's book. `startPlayback` retires the finished session itself
-    ///   (flush → close), so this doesn't double-retire; when the entry belongs to a DIFFERENT
-    ///   connection than the active one, it's activated first so the new /play session opens on it.
-    /// - Empty (or only dead entries) → just `retireCurrentSession()` (stop): the finished book's
-    ///   session is closed and nothing new plays.
+    /// - First-advance-wins: a reentrant advance (book-finished racing a Play Next tap, or a
+    ///   double-tap) bails immediately, so the queue is never peeked/consumed twice.
+    /// - Non-empty → start the next entry's book, then COMMIT (remove it) only once `startPlayback`
+    ///   actually opened it. If `startPlayback` bails (a connection that can't authenticate), the
+    ///   entry STAYS queued (not lost) and the finished session is retired here so it's never left
+    ///   dangling open. When the entry belongs to a DIFFERENT connection than the active one, that
+    ///   connection is activated first so the new /play session opens on it.
+    /// - Empty (or only dead entries) → `retireCurrentSession()` (stop): the finished book's session
+    ///   is closed and nothing new plays.
     func advanceToNext() async {
-        // The still-valid connections — an entry whose connection was removed isn't in this set, so
-        // `nextPlayable` drops it. (Freshly read so a just-removed connection is reflected.)
-        let valid = Set(((try? cache.connections()) ?? []).map(\.id))
-        guard let next = queue.nextPlayable(validConnectionIDs: valid) else {
+        guard !isAdvancing else { return }
+        isAdvancing = true
+        defer { isAdvancing = false }
+
+        // Connections that can PLAY right now: they exist in the cache AND aren't flagged
+        // `needsSignIn` (signed out / rejected). Peeking against this set drops an unreachable
+        // entry and skips to the next genuinely-playable one rather than stalling on it. Freshly
+        // read so a just-removed / just-signed-out connection is reflected.
+        let playable = Set(((try? cache.connections()) ?? []).map(\.id)).subtracting(needsSignIn)
+        guard let next = queue.peekNextPlayable(validConnectionIDs: playable) else {
             // Nothing playable left: stop cleanly (close the finished session, tear down playback).
             await retireCurrentSession()
             return
         }
         // A queued item may belong to a different connection than the active one — activate it so
         // `startPlayback`'s `self.client` / owner point at the right server. (In v1's single-server
-        // flow the entry's connection is usually the active one, so this is skipped.) `startPlayback`
-        // retires the current session before opening the next; if the connection can't authenticate
-        // (needs sign-in), `startPlayback` no-ops and the entry is simply dropped.
+        // flow the entry's connection is usually the active one, so this is skipped.)
         if next.connectionID != activeConnectionID {
             await activateConnection(next.connectionID)
         }
         await startPlayback(itemID: next.itemID)
+        if nowPlayingItemID == next.itemID {
+            queue.remove(next)            // COMMIT: it actually started → drop it from the queue
+        } else {
+            // `startPlayback` bailed (e.g. the connection can't authenticate): the entry is LEFT
+            // queued by the peek above, so it isn't lost. But `startPlayback` bails BEFORE its own
+            // retire, so the finished session could still be open — retire it here (idempotent: a
+            // no-op if already retired) so nothing is left dangling.
+            await retireCurrentSession()
+        }
     }
 
     /// Scene backgrounding: flush accumulated listened-time WITHOUT pausing — background

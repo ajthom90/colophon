@@ -3,7 +3,7 @@ import Foundation
 @testable import Colophon
 
 /// Pure, audio-free proof for `PlaybackQueue` (Task 8) — the up-next queue's mutations and, most
-/// importantly, the `nextPlayable(validConnectionIDs:)` ADVANCE DECISION (dequeue the front, drop
+/// importantly, the `peekNextPlayable(validConnectionIDs:)` ADVANCE DECISION (return the front, drop
 /// entries whose connection is gone). No `PlaybackController`, no network — the queue is the whole
 /// unit under test. `AppState`'s wiring of this decision to real playback is proven separately in
 /// `AppStateTests` (the `advanceToNext*` tests).
@@ -47,41 +47,50 @@ struct PlaybackQueueTests {
         #expect(queue.isEmpty)
     }
 
-    // MARK: - The advance decision (nextPlayable)
+    // MARK: - The advance decision (peekNextPlayable — peek-then-commit)
 
-    @Test func nextPlayablePopsFrontAndReturnsIt() {
+    /// Peek returns the front playable entry but LEAVES it in the queue (peek-then-commit); it's
+    /// only removed once the caller has actually started it via `remove(_:)`.
+    @Test func peekReturnsFrontWithoutConsuming_commitRemovesIt() {
         let queue = PlaybackQueue()
         queue.addToQueue(entry("A"))
         queue.addToQueue(entry("B"))
 
-        let next = queue.nextPlayable(validConnectionIDs: ["C1"])
+        let next = queue.peekNextPlayable(validConnectionIDs: ["C1"])
         #expect(next?.itemID == "A")
-        #expect(queue.entries.map(\.itemID) == ["B"])   // A popped, B remains
+        #expect(queue.entries.map(\.itemID) == ["A", "B"])   // NOT consumed by the peek
+
+        // A repeated peek (e.g. a superseded advance) still returns A — it wasn't lost.
+        #expect(queue.peekNextPlayable(validConnectionIDs: ["C1"])?.itemID == "A")
+
+        // The commit — only after the caller actually started A — drops it.
+        queue.remove(next!)
+        #expect(queue.entries.map(\.itemID) == ["B"])
     }
 
-    @Test func nextPlayableReturnsNilWhenEmpty() {
+    @Test func peekReturnsNilWhenEmpty() {
         let queue = PlaybackQueue()
-        #expect(queue.nextPlayable(validConnectionIDs: ["C1"]) == nil)
+        #expect(queue.peekNextPlayable(validConnectionIDs: ["C1"]) == nil)
     }
 
     /// The removed-connection guard: leading entries whose connection isn't in the valid set are
-    /// DROPPED, and the first entry from a still-valid connection is returned (its dead predecessors
-    /// removed from the queue). If nothing playable remains, returns nil.
+    /// DROPPED (unreachable), and the first entry from a still-playable connection is returned —
+    /// but NOT consumed (it stays until committed). If nothing playable remains, returns nil.
     @Test func queuedItemFromRemovedConnectionIsSkippedOrDropped() {
         let queue = PlaybackQueue()
         queue.addToQueue(entry("A", connection: "GONE"))    // owning connection removed
         queue.addToQueue(entry("B", connection: "GONE"))    // ditto
         queue.addToQueue(entry("C", connection: "C1"))      // still valid
 
-        // Only C1 is valid → A and B are dropped, C is returned.
-        let next = queue.nextPlayable(validConnectionIDs: ["C1"])
+        // Only C1 is valid → A and B are dropped, C is returned (left in place).
+        let next = queue.peekNextPlayable(validConnectionIDs: ["C1"])
         #expect(next?.itemID == "C")
-        #expect(queue.isEmpty)                               // A, B dropped and C popped
+        #expect(queue.entries.map(\.itemID) == ["C"])        // A, B dropped; C peeked, not consumed
 
-        // A queue of ONLY dead entries yields nil (→ the caller stops).
+        // A queue of ONLY dead entries yields nil (→ the caller stops) and drains them.
         let deadOnly = PlaybackQueue()
         deadOnly.addToQueue(entry("X", connection: "GONE"))
-        #expect(deadOnly.nextPlayable(validConnectionIDs: ["C1"]) == nil)
+        #expect(deadOnly.peekNextPlayable(validConnectionIDs: ["C1"]) == nil)
         #expect(deadOnly.isEmpty)
     }
 

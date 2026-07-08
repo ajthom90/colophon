@@ -596,6 +596,41 @@ struct AppStateTests {
         #expect(!app.queue.entries.contains { $0.itemID == "i2" })
     }
 
+    /// CONCURRENCY REGRESSION (Task 8): two advances firing near-simultaneously — the book-finished
+    /// signal racing a manual Play Next, or a double-tap — must consume EXACTLY ONE queued item and
+    /// leave the other queued, never silently dropping it. RED without the first-advance-wins guard +
+    /// peek-then-commit: the original code popped the front on EACH advance, but `startPlayback`'s
+    /// own guard dropped the second, losing that popped item (queue ended empty, i3 gone).
+    @Test func concurrentAdvanceDoesNotDropQueuedItem() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbers for the ONE advance
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i2 (the single advance)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+        app.addToQueue(itemID: "i2", title: "Second", author: "Auth")
+        app.addToQueue(itemID: "i3", title: "Third", author: "Auth")
+        #expect(app.queue.entries.map(\.itemID) == ["i2", "i3"])
+
+        // Fire two advances near-simultaneously. The first sets the in-flight flag before its first
+        // await; the second bails at the guard, so the queue is peeked/consumed exactly once.
+        async let a: Void = app.advanceToNext()
+        async let b: Void = app.advanceToNext()
+        _ = await (a, b)
+
+        #expect(app.queue.entries.map(\.itemID) == ["i3"])   // i2 consumed ONCE; i3 REMAINS (not lost)
+        #expect(app.nowPlayingItemID == "i2")
+        // Exactly two /play requests total: i1's initial open + i2's single advance — no third.
+        let plays = await transport.recorded.compactMap { $0.url?.path }.filter { $0.contains("/play") }
+        #expect(plays.count == 2)
+    }
+
     /// Removing a connection drops its queued entries (Task 8's removed-connection handling): a
     /// book queued from a connection that's then forgotten doesn't linger in the up-next queue.
     @Test func removeConnectionDropsItsQueuedEntries() async throws {

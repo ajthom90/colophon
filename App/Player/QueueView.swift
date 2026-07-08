@@ -30,7 +30,13 @@ struct QueueView: View {
                     }
                     #endif
                 }
-                .safeAreaInset(edge: .bottom) { actionBar }
+                // The action bar (Clear + the prominent Play Next) is shown ONLY when the queue is
+                // non-empty. A prominent "Play Next" offered on an EMPTY queue would halt the current
+                // book (advance → nothing next → stop) — a HIG foot-gun Music/Podcasts avoid — so it
+                // simply isn't presented when there's nothing up next.
+                .safeAreaInset(edge: .bottom) {
+                    if !app.queue.isEmpty { actionBar }
+                }
         }
         .presentationDetents([.medium, .large])
         .presentationDragIndicator(.visible)

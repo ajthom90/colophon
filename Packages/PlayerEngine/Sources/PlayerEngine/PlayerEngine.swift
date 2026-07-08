@@ -42,6 +42,11 @@ public final class PlaybackController {
     private var lastTickGlobalTime: TimeInterval = 0
     private var syncInFlight = false
     private let nowPlaying = NowPlayingUpdater()
+    /// One-shot latch so `onBookFinished` fires AT MOST ONCE per loaded session — hardens the
+    /// AppState queue-advance against any double book-end from AVFoundation (a stale
+    /// `didPlayToEndTime` notification, or a seek-to-end re-triggering the last item). Reset in
+    /// `load()` when a fresh session is installed.
+    private var didFireBookFinished = false
 
     /// The per-step wait the sleep-timer fade ramp awaits between volume decrements. Injectable so
     /// `fadeOutAndPause` is deterministic and instant in tests (inject a no-op) instead of burning
@@ -67,8 +72,11 @@ public final class PlaybackController {
             guard let self, wasLast else { return }
             self.globalTime = self.totalDuration
             self.pause()
-            // Surface the BOOK-finished signal AFTER pausing/parking globalTime, so a listener
-            // (AppState's queue advance) sees a consistent finished state. Nil in the no-queue case.
+            // Fire the BOOK-finished signal AT MOST ONCE per session (the latch), AFTER pausing /
+            // parking globalTime so a listener (AppState's queue advance) sees a consistent finished
+            // state. The latch resets in `load()`; nil callback in the no-queue case.
+            guard !self.didFireBookFinished else { return }
+            self.didFireBookFinished = true
             self.onBookFinished?()
         }
     }
@@ -76,6 +84,7 @@ public final class PlaybackController {
     public func load(session: PlaybackSession, trackURLs: [URL]) {
         timeline = BookTimeline(tracks: session.audioTracks)
         totalDuration = timeline.totalDuration
+        didFireBookFinished = false   // fresh session → re-arm the one-shot book-finished latch
         title = session.displayTitle ?? "Untitled"
         author = session.displayAuthor ?? ""
         sync = SessionSyncController()
