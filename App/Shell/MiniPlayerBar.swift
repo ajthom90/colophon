@@ -1,7 +1,8 @@
 import SwiftUI
 import PlayerEngine
 
-/// A live session worth showing transport for. Mirrors `PlayerBarView`'s existing gate.
+/// A live session worth showing transport for. Mirrors the legacy `PlayerBarView`'s gate
+/// (removed in M1c-a wrap-up once the shell's own transport superseded it).
 private func hasActiveSession(_ playback: PlaybackController) -> Bool {
     playback.totalDuration > 0
 }

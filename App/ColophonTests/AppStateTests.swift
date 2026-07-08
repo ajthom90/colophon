@@ -577,7 +577,10 @@ struct AppStateTests {
         let transport = MockTransport()
         await transport.enqueue(status: 200, json: "{}")   // the surviving call's /api/authorize
         let tokenStore = GatedTokenStore()
-        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+        // GatedTokenStore.save is non-throwing (only tokens(for:) gates); the concrete type here
+        // (not the `throws`-declaring TokenStore existential) makes `try` a no-op the compiler
+        // correctly flags.
+        await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
         let sockets = SocketConstructionCounter()
         let app = AppState(
             transportProvider: { transport },

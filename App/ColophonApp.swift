@@ -24,8 +24,8 @@ struct ColophonApp: App {
     @Environment(\.scenePhase) private var scenePhase
     /// Single source of truth for typography (Global Constraints: `colophon.typeface`, "serif"
     /// default | "sans"). Applied outermost in the `WindowGroup` content's modifier chain, so it
-    /// reaches every view in the tree — including content injected by later modifiers like
-    /// `PlayerBarView`'s `safeAreaInset` — AND again on the macOS `Settings` scene below, since a
+    /// reaches every view in the tree — including content injected by later modifiers like the
+    /// shell's `TransportBar` `safeAreaInset` — AND again on the macOS `Settings` scene below, since a
     /// `Settings` scene does not inherit modifiers from the `WindowGroup` scene. Per-view
     /// `.fontDesign(.serif)` modifiers were removed everywhere else in `App/Views/*`; do not
     /// reintroduce them.
@@ -72,7 +72,18 @@ struct ColophonApp: App {
                 #endif
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .background { app.flushForBackground() }
+                if phase == .background {
+                    app.flushForBackground()
+                } else if phase == .active, app.activeConnectionID != nil {
+                    // Backgrounding a live connection for a while (podcast switch, phone lock,
+                    // Mac App Switcher) and coming back must not leave Home's progress pill
+                    // showing a stale percentage until the user happens to pull-to-refresh —
+                    // this is the same `me()` join HomeView runs on appear, just re-armed on
+                    // foreground. Guarded on `activeConnectionID` so it's a no-op at first
+                    // launch (no connection yet) and while disconnected/switching; cheap single
+                    // request, no full shelves refetch.
+                    Task { await app.refreshProgress() }
+                }
             }
             #if DEBUG && os(macOS)
             .background(PerfSpikeAutoOpener())
