@@ -287,3 +287,20 @@ public struct CachedProgress: Codable, FetchableRecord, PersistableRecord, Senda
         case connectionID, itemID, episodeID, currentTime, isFinished, lastUpdate
     }
 }
+
+public extension Array where Element == CachedProgress {
+    /// Indexes a connection's progress rows by `itemID` — the merge rule shared by every
+    /// progress-pill surface (Home shelves, the library grid, and M1c-a Task 9's author/series
+    /// detail grids): on a collision (a podcast item with several episode rows, or a stale vs.
+    /// fresh update), the book-style row (`episodeID` empty) wins over an episode row, else the
+    /// newest `lastUpdate` wins. Pulled out of each view's `observeProgress` so the rule is
+    /// defined once and is independently testable.
+    func indexedByItem() -> [String: CachedProgress] {
+        Dictionary(map { ($0.itemID, $0) }) { lhs, rhs in
+            if lhs.episodeID.isEmpty != rhs.episodeID.isEmpty {
+                return lhs.episodeID.isEmpty ? lhs : rhs
+            }
+            return lhs.lastUpdate >= rhs.lastUpdate ? lhs : rhs
+        }
+    }
+}

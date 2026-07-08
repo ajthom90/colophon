@@ -1,4 +1,5 @@
 import SwiftUI
+import ABSKit
 import LibraryCache
 
 /// iPad & Mac shell: a `NavigationSplitView` with a system-glass sidebar (Home, each library,
@@ -14,11 +15,17 @@ struct SplitShell: View {
     // back to Home in the detail column.
     @State private var selection: SidebarItem? = .home
     @State private var libraries: [CachedLibrary] = []
+    /// Library IDs whose sidebar row is collapsed (Series/Authors hidden). Empty by default —
+    /// every library's browse rows start expanded, since the dev fixture has exactly one library
+    /// and hiding its only children by default would bury Task 9's entry points.
+    @State private var collapsedLibraryIDs: Set<String> = []
 
     enum SidebarItem: Hashable {
         case home
         case search
         case library(CachedLibrary)
+        case series(CachedLibrary)
+        case authors(CachedLibrary)
     }
 
     var body: some View {
@@ -28,12 +35,24 @@ struct SplitShell: View {
                     Label("Home", systemImage: "house").tag(SidebarItem.home)
                     Label("Search", systemImage: "magnifyingglass").tag(SidebarItem.search)
                 }
+                // Series/Authors nest UNDER each library (an outline/disclosure row, à la Music's
+                // Library sidebar nesting Playlists/Artists/Albums) rather than as flat top-level
+                // rows — this is what "under the active library" means for a sidebar that lists
+                // every library, not just a single active one. `DisclosureGroup` inside a
+                // `List(selection:)` is the standard SwiftUI hierarchical-sidebar idiom (Mail/Notes):
+                // the nested `Label`s keep participating in the same single-selection binding via
+                // their own `.tag`.
                 Section("Libraries") {
                     ForEach(libraries) { library in
-                        Label(library.name,
-                              systemImage: library.mediaType == "podcast"
-                                ? "antenna.radiowaves.left.and.right" : "books.vertical")
-                            .tag(SidebarItem.library(library))
+                        DisclosureGroup(isExpanded: expansionBinding(for: library)) {
+                            Label("Series", systemImage: "square.stack").tag(SidebarItem.series(library))
+                            Label("Authors", systemImage: "person.2").tag(SidebarItem.authors(library))
+                        } label: {
+                            Label(library.name,
+                                  systemImage: library.mediaType == "podcast"
+                                    ? "antenna.radiowaves.left.and.right" : "books.vertical")
+                                .tag(SidebarItem.library(library))
+                        }
                     }
                 }
             }
@@ -59,17 +78,38 @@ struct SplitShell: View {
         }
     }
 
+    private func expansionBinding(for library: CachedLibrary) -> Binding<Bool> {
+        Binding(
+            get: { !collapsedLibraryIDs.contains(library.id) },
+            set: { expanded in
+                if expanded { collapsedLibraryIDs.remove(library.id) } else { collapsedLibraryIDs.insert(library.id) }
+            })
+    }
+
     @ViewBuilder
     private var detailColumn: some View {
         // Each case owns its own `NavigationStack` so the detail column shows a title bar and
         // resets cleanly on selection change. `LibraryGridView` plays a tapped book directly (no
-        // push), so no `navigationDestination` is needed here. The sidebar already lists every
+        // push), so no `navigationDestination` is needed there. The sidebar already lists every
         // library, so the grid is given no in-tab picker (`siblings` defaults empty).
+        //
+        // `.series`/`.authors` register their push destination HERE, at the `NavigationStack`'s
+        // literal, unconditional root — not inside `SeriesListView`/`AuthorsListView` themselves
+        // (see those views' doc comments: a destination self-registered on a view that some OTHER
+        // caller mounts conditionally, as `PhoneShell` does, resets that caller's state on pop).
+        // This stack's root never changes shape once a sidebar row is selected, so it's a stable
+        // registration point.
         switch selection {
         case .search:
             NavigationStack { SearchPlaceholder() }
         case .library(let library):
             NavigationStack { LibraryGridView(library: library) }
+        case .series(let library):
+            NavigationStack { SeriesListView(library: library) }
+                .navigationDestination(for: SeriesSummary.self) { SeriesDetailView(library: library, series: $0) }
+        case .authors(let library):
+            NavigationStack { AuthorsListView(library: library) }
+                .navigationDestination(for: AuthorSummary.self) { AuthorDetailView(library: library, author: $0) }
         case .home, .none:
             NavigationStack { HomeView() }
         }

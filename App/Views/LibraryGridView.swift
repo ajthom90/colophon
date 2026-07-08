@@ -207,12 +207,7 @@ struct LibraryGridView: View {
         progressByItem = [:]
         do {
             for try await rows in app.cache.observeProgress(connectionID: library.connectionID) {
-                progressByItem = Dictionary(rows.map { ($0.itemID, $0) }) { lhs, rhs in
-                    if lhs.episodeID.isEmpty != rhs.episodeID.isEmpty {
-                        return lhs.episodeID.isEmpty ? lhs : rhs
-                    }
-                    return lhs.lastUpdate >= rhs.lastUpdate ? lhs : rhs
-                }
+                progressByItem = rows.indexedByItem()
             }
         } catch {
             // Best-effort live pills; the grid still paints without progress.

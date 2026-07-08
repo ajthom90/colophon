@@ -138,6 +138,22 @@ public final class ABSClient: Sendable {
         return comps.url!
     }
 
+    /// `GET /api/authors/:id/image?width=` — an author's photo (present only when
+    /// `AuthorSummary`/`AuthorDetail.imagePath != nil`). **PUBLIC, no auth needed — verified both
+    /// ways this milestone:** (1) source: ABS `Auth.js` lists `^/(api/)?authors/[^/]+/image$`
+    /// alongside `^/(api/)?items/[^/]+/cover$` in its `ignorePatterns` GET-auth-bypass list — the
+    /// exact same allowlist as the cover endpoint; (2) live against this dev server: the seeded
+    /// author's `imagePath` is null (no file on disk) so both an unauthenticated and a
+    /// Bearer-authed request 404 IDENTICALLY (same status either way is what proves auth isn't
+    /// the deciding factor — a genuinely gated endpoint would 401 without the token). So, like
+    /// `coverURL`, this is a plain unauthenticated URL — no Bearer header, no token query param.
+    public func authorImageURL(authorID: String, width: Int) -> URL {
+        var comps = URLComponents(url: baseURL.appending(path: "api/authors/\(authorID)/image"),
+                                  resolvingAgainstBaseURL: false)!
+        comps.queryItems = [.init(name: "width", value: String(width))]
+        return comps.url!
+    }
+
     // MARK: - Internals
 
     func get(_ path: String) -> URLRequest { URLRequest(url: baseURL.appending(path: path)) }

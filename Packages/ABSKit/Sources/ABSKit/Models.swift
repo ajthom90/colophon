@@ -250,7 +250,11 @@ public struct FilterSeries: Decodable, Sendable, Identifiable, Hashable {
 /// `seriesFilters.getFilteredSeries` maps each series' books via `LibraryItem.toOldJSONMinified()`,
 /// the same minified shape as `LibraryItemSummary`. A richer seed (M1c-c) would strengthen this
 /// to a live-captured non-empty fixture.
-public struct SeriesSummary: Decodable, Sendable, Identifiable {
+///
+/// `Hashable` (all stored properties already are) so Task 9's `SeriesListView` can push
+/// `SeriesDetailView` via the codebase's standard `NavigationLink(value:)` +
+/// `navigationDestination(for:)` pattern, matching `AuthorSummary` and `CachedLibrary`.
+public struct SeriesSummary: Decodable, Sendable, Identifiable, Hashable {
     public let id: String
     public let name: String
     public let books: [LibraryItemSummary]?
