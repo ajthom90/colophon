@@ -157,6 +157,30 @@ struct ItemDetailView: View {
             .controlSize(.large)
             .fontDesign(.default)
 
+            // Up-next queue affordances (Task 8) — native, opaque (never glass): enqueue this book
+            // to play right after the current one, or at the end of the queue. Enabled only while a
+            // book is playing (there's a "current book" to queue after); `AppState` scopes the entry
+            // to the active connection.
+            HStack(spacing: 12) {
+                Button {
+                    app.playNext(itemID: route.itemID, title: displayTitle, author: displayAuthor)
+                } label: {
+                    Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+                        .frame(maxWidth: .infinity)
+                }
+                Button {
+                    app.addToQueue(itemID: route.itemID, title: displayTitle, author: displayAuthor)
+                } label: {
+                    Label("Add to Queue", systemImage: "text.append")
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
+            .font(.subheadline.weight(.medium))
+            .fontDesign(.default)
+            .disabled(app.nowPlayingItemID == nil)
+
             if let fraction = progressFraction {
                 VStack(spacing: 4) {
                     ProgressView(value: fraction)

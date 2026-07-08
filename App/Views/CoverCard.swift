@@ -14,6 +14,7 @@ import LibraryCache
 /// `ItemDetailView` (via `ItemDetailRoute` — the Play/Resume action lives in the detail); the
 /// destination is registered at each browse stack's stable root (`.itemDetailDestination()`).
 struct CoverCard: View {
+    @Environment(AppState.self) private var app
     let itemID: String
     let updatedAt: Int?
     let title: String
@@ -82,6 +83,23 @@ struct CoverCard: View {
             .frame(width: Self.width, alignment: .leading)
         }
         .buttonStyle(.plain)
+        .contextMenu {
+            // Up-next queue affordances (Task 8) — native context-menu actions on a browse card.
+            // Enabled only while a book is playing (there's a "current book" to queue after). The
+            // guard is per-BUTTON, not on the card, so it never disables tap-through to the detail.
+            Button {
+                app.playNext(itemID: itemID, title: title, author: author)
+            } label: {
+                Label("Play Next", systemImage: "text.line.first.and.arrowtriangle.forward")
+            }
+            .disabled(app.nowPlayingItemID == nil)
+            Button {
+                app.addToQueue(itemID: itemID, title: title, author: author)
+            } label: {
+                Label("Add to Queue", systemImage: "text.append")
+            }
+            .disabled(app.nowPlayingItemID == nil)
+        }
     }
 }
 

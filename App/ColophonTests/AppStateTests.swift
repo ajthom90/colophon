@@ -504,6 +504,116 @@ struct AppStateTests {
         #expect(app.playback.isPlaying == true)           // the switch left the player alone
     }
 
+    // MARK: - Up-next queue advance (Task 8)
+
+    /// `advanceToNext` with a non-empty queue pops the FRONT entry, closes the finished session, and
+    /// starts the next book: the queue drops the played entry (deterministic), and a `/play` for the
+    /// next item id is issued. (Multi-book A→B advance can't be shown live — the seed has one book —
+    /// so this is the unit proof of the deliverable.)
+    @Test func advanceToNextPlaysFrontOfQueueThenRemovesIt() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbs me(i1)/flush
+        await transport.enqueue(status: 200, json: "{}")              // /close i1 on retire
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i2 (advance target)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+
+        app.addToQueue(itemID: "i2", title: "Second", author: "Auth")
+        app.addToQueue(itemID: "i3", title: "Third", author: "Auth")
+        #expect(app.queue.entries.map(\.itemID) == ["i2", "i3"])
+
+        await app.advanceToNext()
+
+        // The front (i2) was popped; i3 remains — the core decision, fully deterministic.
+        #expect(app.queue.entries.map(\.itemID) == ["i3"])
+        // And a /play for i2 was issued (advance handed the front to startPlayback).
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.contains("/items/i2/play") })
+        #expect(app.nowPlayingItemID == "i2")
+    }
+
+    /// `advanceToNext` with an EMPTY queue just retires the current session and stops — nothing new
+    /// plays (no second `/play`), playback halts, and the now-playing item clears.
+    @Test func advanceToNextWithEmptyQueueStops() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbs me(i1)/flush
+        await transport.enqueue(status: 200, json: "{}")              // /close i1 on retire (stop)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+        #expect(app.playback.isPlaying == true)
+        #expect(app.queue.isEmpty)
+
+        await app.advanceToNext()
+
+        #expect(app.nowPlayingItemID == nil)          // finished session retired
+        #expect(app.playback.isPlaying == false)      // stopped, nothing new started
+        // Only i1's /play was ever issued — the empty queue produced no advance play.
+        let plays = await transport.recorded.compactMap { $0.url?.path }.filter { $0.contains("/play") }
+        #expect(plays.count == 1)
+    }
+
+    /// The book-finished signal (`playback.onBookFinished`, emitted by PlayerEngine when the last
+    /// track ends — see `PlaybackControllerTests.bookFinishedFiresOnlyOnLastItem`) is wired by
+    /// `AppState` to `advanceToNext`. Firing it drains the queue front. (The PlayerEngine→AppState
+    /// callback is proven in the engine suite; this proves AppState's end of the wire.)
+    @Test func bookFinishedSignalTriggersAdvance() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i1
+        await transport.enqueue(status: 200, json: "{}")              // absorbers for the advance
+        await transport.enqueue(status: 200, json: "{}")
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play i2 (advance target)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        await app.startPlayback(itemID: "i1")
+        app.addToQueue(itemID: "i2", title: "Second", author: "Auth")
+        #expect(app.playback.onBookFinished != nil)   // AppState wired the signal in init
+
+        // Fire the wired book-finished signal; it spawns the detached advance.
+        app.playback.onBookFinished?()
+
+        // Await the advance draining the front (the pop is synchronous once the Task runs).
+        for _ in 0..<1000 where app.queue.entries.contains(where: { $0.itemID == "i2" }) {
+            await Task.yield()
+        }
+        #expect(!app.queue.entries.contains { $0.itemID == "i2" })
+    }
+
+    /// Removing a connection drops its queued entries (Task 8's removed-connection handling): a
+    /// book queued from a connection that's then forgotten doesn't linger in the up-next queue.
+    @Test func removeConnectionDropsItsQueuedEntries() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        app.addToQueue(itemID: "i9", title: "Queued", author: nil)
+        #expect(app.queue.entries.count == 1)
+
+        await app.removeConnection(cid)
+
+        #expect(app.queue.isEmpty)   // the removed connection's queued entry was dropped
+    }
+
     /// Signing out of the connection that OWNS the playing session retires it first: the `/play`
     /// that opened the session is followed by a `/close` that tears it down server-side.
     @Test func signOutOfOwnerRetiresSession() async throws {

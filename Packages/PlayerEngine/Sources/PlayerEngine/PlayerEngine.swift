@@ -27,6 +27,14 @@ public final class PlaybackController {
     /// Return true if the payload reached the server (controller then resets the delta).
     public var onSyncDue: ((SyncPayload) async -> Bool)?
 
+    /// Fired ONCE when the current BOOK finishes — the backend played its LAST track to the end
+    /// (`onItemFinished` with `wasLast == true`). This is the BOOK-level end signal (distinct from
+    /// AVQueuePlayer's per-track sequencing, which stays inside the backend). `AppState` wires this
+    /// to `advanceToNext()` (Task 8's up-next queue) so a finished book auto-advances to the next
+    /// queued item — or stops when the queue is empty. The controller also pauses + parks
+    /// `globalTime` at `totalDuration` before invoking it, so the UI reads "finished" either way.
+    public var onBookFinished: (() -> Void)?
+
     private let backend: PlayerBackend
     private let now: @Sendable () -> Date
     private var timeline = BookTimeline(tracks: [])
@@ -59,6 +67,9 @@ public final class PlaybackController {
             guard let self, wasLast else { return }
             self.globalTime = self.totalDuration
             self.pause()
+            // Surface the BOOK-finished signal AFTER pausing/parking globalTime, so a listener
+            // (AppState's queue advance) sees a consistent finished state. Nil in the no-queue case.
+            self.onBookFinished?()
         }
     }
 

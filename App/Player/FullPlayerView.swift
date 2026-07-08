@@ -30,6 +30,7 @@ struct FullPlayerView: View {
     @State private var scrubTime: Double = 0
     @State private var showingChapters = false
     @State private var showingBookmarks = false
+    @State private var showingQueue = false
 
     var body: some View {
         // `PlayerModel` holds no persistent state, so recreating it per body is correct — its
@@ -197,18 +198,19 @@ struct FullPlayerView: View {
         }
     }
 
-    // MARK: - Secondary controls (sleep timer + bookmarks + speed + Chapters; queue lands in Task 8)
+    // MARK: - Secondary controls (sleep timer + bookmarks + speed + up-next queue, + Chapters)
 
     private func secondaryControls(model: PlayerModel) -> some View {
         VStack(spacing: 14) {
-            // The shared secondary glass cluster. Task 5 adds the sleep timer; bookmarks (T6) and
-            // speed (T7) join it here; up-next queue (T8) joins this same `GlassEffectContainer` as
-            // a further `.buttonStyle(.glass)` member — one cluster, never glass-on-glass.
+            // The shared secondary glass cluster. Task 5 added the sleep timer; bookmarks (T6),
+            // speed (T7), and the up-next queue (T8) join it here — each a `.buttonStyle(.glass)`
+            // member of this ONE `GlassEffectContainer`, never glass-on-glass.
             GlassEffectContainer(spacing: 16) {
                 HStack(spacing: 16) {
                     SleepTimerView(timer: app.sleepTimer, hasChapters: !model.chapters.isEmpty)
                     bookmarkButton
                     SpeedControl(model: model)
+                    queueButton
                 }
             }
             .controlSize(.large)
@@ -248,6 +250,25 @@ struct FullPlayerView: View {
         .accessibilityLabel("Bookmarks")
         .sheet(isPresented: $showingBookmarks) {
             BookmarksView()
+        }
+    }
+
+    /// The up-next queue control (Task 8) — a `.buttonStyle(.glass)` member of the secondary cluster
+    /// (NOT its own glass surface), opening the native `QueueView` sheet (reorderable list + Play
+    /// Next + Clear). Its sheet is attached HERE (on the button), not the root `VStack`, for the same
+    /// reason `bookmarkButton`'s is — two `.sheet(isPresented:)` on ONE view conflict; hanging each
+    /// off a distinct subview lets Chapters / Bookmarks / Queue all present independently.
+    private var queueButton: some View {
+        Button {
+            showingQueue = true
+        } label: {
+            Image(systemName: "text.line.first.and.arrowtriangle.forward")
+        }
+        .buttonStyle(.glass)
+        .fontDesign(.default)
+        .accessibilityLabel("Up Next")
+        .sheet(isPresented: $showingQueue) {
+            QueueView()
         }
     }
 }

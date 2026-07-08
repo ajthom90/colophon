@@ -93,6 +93,26 @@ final class ClockBox: @unchecked Sendable {
         #expect(controller.isPlaying == true)
     }
 
+    // MARK: - Book-finished signal (Task 8 — the PlayerEngine→AppState wiring)
+
+    /// The LAST track finishing fires `onBookFinished` exactly once (the signal AppState wires to
+    /// its up-next queue advance), and only for the book-level end — a mid-book track boundary
+    /// (`wasLast == false`) must NOT fire it.
+    @Test func bookFinishedFiresOnlyOnLastItem() {
+        let (controller, backend, _) = makeSUT()
+        var fired = 0
+        controller.onBookFinished = { fired += 1 }
+
+        backend.onItemFinished?(0, false)   // a mid-book track boundary — not the book end
+        #expect(fired == 0)
+
+        backend.moveTo(index: 2, offset: 4.9)
+        backend.onItemFinished?(2, true)    // the last track played to its end → book finished
+        #expect(fired == 1)
+        #expect(controller.isPlaying == false)                     // paused as part of finishing
+        #expect(controller.globalTime == controller.totalDuration) // parked at the end
+    }
+
     @Test func syncsAreSerialized() async {
         let (controller, backend, clock) = makeSUT()
         var inFlight = 0, maxInFlight = 0, calls = 0

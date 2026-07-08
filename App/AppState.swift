@@ -96,6 +96,12 @@ final class AppState {
     /// now-playing item and reconciles it from `me()`; `retireCurrentSession` clears it. IN-MEMORY +
     /// `me()`-sourced (not persisted to LibraryCache) — see `Bookmarks`' caching-decision note.
     let bookmarks = Bookmarks()
+    /// The up-next queue (Task 8) — books to play AFTER the current one. Owned here (like
+    /// `sleepTimer`/`bookmarks`) so it survives the player/queue sheet being dismissed. IN-MEMORY
+    /// for v1 (persistence/Continuity is post-v1). `startPlayback`'s book-finished signal and the
+    /// player's Next action both drain it via `advanceToNext`; browse surfaces enqueue via
+    /// `playNext`/`addToQueue`; signing out / removing a connection drops that connection's entries.
+    let queue = PlaybackQueue()
     let cache: LibraryCacheStore
     let coverStore: CoverStore
 
@@ -282,6 +288,14 @@ final class AppState {
         // array and flashes `ConnectView` for one frame before `.task` runs `loadConnections()`,
         // even when connections already exist on disk.
         connections = (try? cache.connections()) ?? []
+        // Wire the BOOK-finished signal (Task 8): when the current book plays to its end, advance
+        // to the next queued item (or stop if the queue is empty). Set once here — `advanceToNext`
+        // always consults the CURRENT queue/state, so this survives every `startPlayback`. Detached
+        // because the callback fires synchronously from the (MainActor) controller and the advance
+        // is async; `[weak self]` avoids a retain cycle (AppState owns `playback`).
+        playback.onBookFinished = { [weak self] in
+            Task { await self?.advanceToNext() }
+        }
     }
 
     var deviceInfo: DeviceInfo {
@@ -690,6 +704,10 @@ final class AppState {
         }
         await tokenStore.clear(for: id)
         needsSignIn.insert(id)
+        // Drop this connection's up-next entries (Task 8): a signed-out / removed connection can't
+        // play, so its queued books shouldn't linger. `advanceToNext`'s valid-connection guard is
+        // the defense-in-depth backstop; this keeps the visible queue honest immediately.
+        queue.removeEntries(connectionID: id)
         loadConnections()
     }
 
@@ -1090,6 +1108,54 @@ final class AppState {
         playback.setRate(Float(rate))
         guard let connectionID = playingConnectionID, let itemID = nowPlayingItemID else { return }
         try? cache.setPlaybackRate(rate, connectionID: connectionID, itemID: itemID)
+    }
+
+    // MARK: - Up-next queue (Task 8)
+
+    /// Enqueue a browse item at the FRONT of the up-next queue ("Play Next"). Scoped to the active
+    /// connection (the surface the user is browsing owns the item); a no-op with no active
+    /// connection. The minimal display payload rides along so `QueueView` paints without a fetch.
+    func playNext(itemID: String, title: String, author: String?) {
+        guard let connectionID = activeConnectionID else { return }
+        queue.playNext(QueueEntry(itemID: itemID, connectionID: connectionID, title: title, author: author))
+    }
+
+    /// Enqueue a browse item at the END of the up-next queue ("Add to Queue"). Same scoping as
+    /// `playNext`.
+    func addToQueue(itemID: String, title: String, author: String?) {
+        guard let connectionID = activeConnectionID else { return }
+        queue.addToQueue(QueueEntry(itemID: itemID, connectionID: connectionID, title: title, author: author))
+    }
+
+    /// Advance past the current book — driven by the book-finished signal (`playback.onBookFinished`,
+    /// wired in `init`) AND the player's manual Next action. The CORE DECISION is the pure, unit-tested
+    /// `PlaybackQueue.nextPlayable(validConnectionIDs:)`: it pops the front entry, DROPPING any whose
+    /// owning connection was signed out / removed (guarding the removed-connection hazard — the entry
+    /// would be unreachable), and hands back the next playable one or `nil`.
+    ///
+    /// - Non-empty → start the next entry's book. `startPlayback` retires the finished session itself
+    ///   (flush → close), so this doesn't double-retire; when the entry belongs to a DIFFERENT
+    ///   connection than the active one, it's activated first so the new /play session opens on it.
+    /// - Empty (or only dead entries) → just `retireCurrentSession()` (stop): the finished book's
+    ///   session is closed and nothing new plays.
+    func advanceToNext() async {
+        // The still-valid connections — an entry whose connection was removed isn't in this set, so
+        // `nextPlayable` drops it. (Freshly read so a just-removed connection is reflected.)
+        let valid = Set(((try? cache.connections()) ?? []).map(\.id))
+        guard let next = queue.nextPlayable(validConnectionIDs: valid) else {
+            // Nothing playable left: stop cleanly (close the finished session, tear down playback).
+            await retireCurrentSession()
+            return
+        }
+        // A queued item may belong to a different connection than the active one — activate it so
+        // `startPlayback`'s `self.client` / owner point at the right server. (In v1's single-server
+        // flow the entry's connection is usually the active one, so this is skipped.) `startPlayback`
+        // retires the current session before opening the next; if the connection can't authenticate
+        // (needs sign-in), `startPlayback` no-ops and the entry is simply dropped.
+        if next.connectionID != activeConnectionID {
+            await activateConnection(next.connectionID)
+        }
+        await startPlayback(itemID: next.itemID)
     }
 
     /// Scene backgrounding: flush accumulated listened-time WITHOUT pausing — background
