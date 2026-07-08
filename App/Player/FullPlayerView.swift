@@ -103,7 +103,16 @@ struct FullPlayerView: View {
 
     // MARK: - Dismiss bar
 
+    @ViewBuilder
     private var dismissBar: some View {
+        #if os(macOS)
+        // Task 9 follow-up B: on macOS the full player is a dedicated `Window` whose native
+        // traffic-light close IS the dismissal — the chevron-down "Close Player" is an iOS idiom
+        // (redundant, and there's no `.fullScreenCover`/sheet to dismiss here), so it's hidden. A
+        // small top spacer keeps the artwork off the window's title bar. The chevron stays on
+        // iPhone (`.fullScreenCover`) / iPad (`.sheet`), where it's the correct dismissal.
+        Color.clear.frame(height: 8)
+        #else
         HStack {
             Button { dismiss() } label: {
                 Image(systemName: "chevron.down")
@@ -118,6 +127,7 @@ struct FullPlayerView: View {
         }
         .padding(.horizontal, 16)
         .padding(.top, 8)
+        #endif
     }
 
     // MARK: - Artwork (opaque)

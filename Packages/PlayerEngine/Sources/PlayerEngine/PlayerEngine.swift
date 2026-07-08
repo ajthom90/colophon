@@ -12,7 +12,20 @@ public final class PlaybackController {
     public private(set) var totalDuration: TimeInterval = 0
     public private(set) var title = ""
     public private(set) var author = ""
-    public var rate: Float = 1.0 { didSet { backend.playbackRate = rate } }
+    /// The current book's chapters (GLOBAL book seconds), taken straight from the loaded session —
+    /// the source `NowPlayingUpdater` reads to advertise the current chapter (title + number/count)
+    /// on the lock screen / Control Center / Now Playing menu. Set in `load()`. The full player
+    /// reads chapters from `AppState.nowPlayingChapters` separately; this is the engine's own copy
+    /// so the now-playing surface stays self-contained.
+    public private(set) var chapters: [Chapter] = []
+    /// The current book's cover-art bytes for the now-playing surface. `AppState` loads these from
+    /// its disk cover cache in `startPlayback` and hands them here via `setNowPlayingArtwork`;
+    /// `NowPlayingUpdater` builds the platform `MPMediaItemArtwork`. `nil` until the app supplies the
+    /// cover (or when a book has none) — the now-playing artwork stays empty rather than stale.
+    public private(set) var artworkData: Data?
+    // Reflect a live rate change onto the now-playing surface immediately (not just on the next
+    // tick's `updateElapsed`), so Control Center / the Now Playing menu show the new speed at once.
+    public var rate: Float = 1.0 { didSet { backend.playbackRate = rate; nowPlaying.update(controller: self) } }
     public var muted = false { didSet { backend.volume = muted ? 0 : 1 } }
     /// Seconds a single skip-forward/back jumps — the Settings-driven `colophon.skipInterval`
     /// preference (choices 10/15/30/45/60; default 30). The shell's `MiniPlayerBar`/`TransportBar`
@@ -87,6 +100,8 @@ public final class PlaybackController {
         didFireBookFinished = false   // fresh session → re-arm the one-shot book-finished latch
         title = session.displayTitle ?? "Untitled"
         author = session.displayAuthor ?? ""
+        chapters = session.chapters          // now-playing chapter number/title source (Task 9)
+        artworkData = nil                    // fresh book → drop the previous cover until AppState resupplies
         sync = SessionSyncController()
         syncInFlight = false
         let start = timeline.position(at: session.startTime)
@@ -144,6 +159,24 @@ public final class PlaybackController {
     public func togglePlayPause() { isPlaying ? pause() : play() }
     public func skip(_ seconds: Double) { seek(toGlobal: globalTime + seconds) }
     public func setRate(_ newRate: Float) { rate = newRate }
+
+    /// Supply (or clear) the now-playing cover art for the CURRENT book — called by `AppState` once
+    /// it has loaded the cover bytes from its cache. Pushes an immediate now-playing refresh so the
+    /// lock screen / Control Center / Now Playing menu shows the artwork as soon as it's available.
+    public func setNowPlayingArtwork(_ data: Data?) {
+        artworkData = data
+        nowPlaying.update(controller: self)
+    }
+
+    /// Re-advertise the current `skipInterval` to the lock-screen / Control-Center / media-key
+    /// remote-command center mid-session (Task 9 follow-up A). `load()` configures the skip commands
+    /// once, reading the interval in force when the book opened; a live Settings change
+    /// (`ColophonApp`'s `onChange(of: skipInterval)`) sets `skipInterval` here and calls this so the
+    /// advertised `MPSkipIntervalCommand.preferredIntervals` update WITHOUT reloading the session.
+    /// The skip HANDLERS read `skipInterval` live, so the jump distance already follows the setting.
+    public func refreshRemoteSkipInterval() {
+        nowPlaying.refreshSkipInterval(controller: self)
+    }
 
     public func seek(toGlobal target: TimeInterval) {
         let position = timeline.position(at: target)

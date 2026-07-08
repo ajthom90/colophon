@@ -95,8 +95,13 @@ struct ColophonApp: App {
             .background(PerfSpikeAutoOpener())
             #endif
             .onChange(of: skipInterval) { _, newValue in
-                // Live-apply the Settings change to the running session's transport (glyph + jump).
+                // Live-apply the Settings change to the running session's transport (glyph + jump)…
                 app.playback.skipInterval = newValue
+                // …and re-advertise it to the lock-screen / Control-Center / media-key remote
+                // commands so their skip buttons reflect the new interval mid-session (Task 9
+                // follow-up A). `NowPlayingUpdater.configure` only advertised `preferredIntervals`
+                // at `load()`; this re-pushes them without reloading the book.
+                app.playback.refreshRemoteSkipInterval()
             }
             .fontDesign(typeface == "serif" ? .serif : .default)
         }

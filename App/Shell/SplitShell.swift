@@ -161,6 +161,14 @@ struct PlaybackCommands: Commands {
 
     var body: some Commands {
         CommandMenu("Playback") {
+            // Show Player (⌘0): open the dedicated player Window (the same `PlayerWindowScene` the
+            // transport's expand affordance opens). Lives in a child View because `openWindow` is an
+            // `@Environment` value only a View can read, not a `Commands` struct. Session-guarded
+            // like the rest — no point opening an empty player with nothing loaded.
+            ShowPlayerButton(disabled: !hasSession)
+
+            Divider()
+
             // No `.keyboardShortcut(.space, ...)` here on purpose: AppKit resolves menu
             // key-equivalents in sendEvent before a focused field editor sees the key, so a
             // bare-Space shortcut would hijack Space typed into the sidebar's `.searchable`
@@ -227,6 +235,20 @@ struct PlaybackCommands: Commands {
             ?? rates.firstIndex(of: 1.0) ?? 0
         let target = min(max(nearest + delta, 0), rates.count - 1)
         app.playback.setRate(Float(rates[target]))
+    }
+}
+
+/// The "Show Player" menu item's action needs `@Environment(\.openWindow)`, which only a `View` can
+/// read — not the `PlaybackCommands` `Commands` struct — so it lives here and is embedded in the
+/// Playback menu. Opens the dedicated Mac player Window (`PlayerWindowScene`).
+private struct ShowPlayerButton: View {
+    @Environment(\.openWindow) private var openWindow
+    let disabled: Bool
+
+    var body: some View {
+        Button("Show Player") { openWindow(id: PlayerWindowScene.id) }
+            .keyboardShortcut("0", modifiers: .command)
+            .disabled(disabled)
     }
 }
 #endif

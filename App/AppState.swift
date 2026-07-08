@@ -1081,6 +1081,11 @@ final class AppState {
             // bookmarks from `me()` (best-effort, detached — the player is playable immediately).
             bookmarks.configure(writer: client, itemID: itemID)
             Task { await refreshBookmarks(forItemID: itemID) }
+            // Now-playing artwork (Task 9): load this book's cover bytes (through the same disk
+            // cover cache `CachedCoverView` uses) and hand them to the controller so the lock
+            // screen / Control Center / Now Playing menu show the cover. Detached + best-effort —
+            // playback is audible immediately regardless. `owner` is this session's connection.
+            if let owner { Task { await loadNowPlayingArtwork(itemID: itemID, connectionID: owner) } }
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }
@@ -1102,6 +1107,22 @@ final class AppState {
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    /// Loads the now-playing book's cover bytes (through the disk-backed `CoverStore`, the same
+    /// cache `CachedCoverView` uses) and hands them to the `PlaybackController` for the lock-screen /
+    /// Control-Center / Now-Playing-menu artwork (Task 9). Best-effort: a fetch/decode failure just
+    /// leaves the now-playing surface without art. Guards against the book changing during the fetch
+    /// so a slow cover for a superseded book never overwrites the current one's artwork.
+    private func loadNowPlayingArtwork(itemID: String, connectionID: String) async {
+        guard let client else { return }
+        let coverURL = client.coverURL(itemID: itemID, width: 600, updatedAt: nil)
+        guard let data = try? await coverStore.coverData(
+            connectionID: connectionID, itemID: itemID, updatedAt: nil,
+            fetch: { try await URLSession.shared.data(from: coverURL).0 }
+        ) else { return }
+        guard nowPlayingItemID == itemID else { return }
+        playback.setNowPlayingArtwork(data)
     }
 
     /// The `SpeedControl` write path (Task 7): applies `rate` to the LIVE `PlaybackController`
