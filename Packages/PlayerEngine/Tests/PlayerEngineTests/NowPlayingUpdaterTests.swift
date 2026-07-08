@@ -95,9 +95,15 @@ private func makeChapteredController() -> (PlaybackController, FakePlayerBackend
     /// skip-by-interval behaviour of the handlers is device-verified (remote-command targets can't be
     /// fired via public API), while `isEnabled` is the unit-observable proxy for "the wiring is present".
     @Test func mediaKeysWirePreviousAndNextTrack() {
-        let (controller, _) = makeChapteredController()   // load() → configure() ran
         let center = MPRemoteCommandCenter.shared()
-        #expect(center.previousTrackCommand.isEnabled)
+        // Force the OPPOSITE of what configure() should set FIRST, so the post-configure assertions
+        // are load-bearing (isEnabled defaults to true on the singleton, which would otherwise make
+        // the enable-side pass even if configure() didn't touch these commands).
+        center.previousTrackCommand.isEnabled = false
+        center.nextTrackCommand.isEnabled = false
+
+        let (controller, _) = makeChapteredController()   // load() → configure() ran → re-enables
+        #expect(center.previousTrackCommand.isEnabled)    // proves configure() enabled them
         #expect(center.nextTrackCommand.isEnabled)
 
         controller.unload()                               // → clear()

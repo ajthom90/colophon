@@ -220,10 +220,10 @@ struct ItemDetailView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("About")
                 .font(.title3.weight(.semibold))
-            // HTML rendered as formatted text (see `HTMLText`); falls back to the raw string until
-            // the parse task populates `formattedDescription`. The app's serif body font + secondary
-            // colour + line-limit/expand still apply — the parsed string's own font/colour are stripped.
-            Text(formattedDescription ?? AttributedString(description))
+            // HTML rendered as formatted text (see `HTMLText`); the fallback runs the SAME safe,
+            // synchronous strip for the frame before the cache task populates — never raw tags. The
+            // app's serif body font + secondary colour + line-limit/expand still apply.
+            Text(formattedDescription ?? HTMLText.attributed(fromHTML: description))
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .lineLimit(descriptionExpanded ? nil : 4)

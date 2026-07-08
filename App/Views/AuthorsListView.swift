@@ -178,8 +178,9 @@ struct AuthorDetailView: View {
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 if let description = detail?.description, !description.isEmpty {
-                    // HTML bio rendered as formatted text (see `HTMLText`); raw fallback until parsed.
-                    Text(formattedDescription ?? AttributedString(description))
+                    // HTML bio as formatted text (see `HTMLText`); the fallback runs the same safe
+                    // synchronous strip — never raw tags — for the frame before the cache populates.
+                    Text(formattedDescription ?? HTMLText.attributed(fromHTML: description))
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .lineLimit(6)

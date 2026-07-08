@@ -33,10 +33,13 @@ private struct NowPlayingArtwork: View {
     }
 }
 
-/// The transport control cluster — the ONE Liquid Glass element on the docked transport / full
-/// player. A single tinted `.glassProminent` primary (play/pause) plus `.glass` skip buttons,
-/// clustered in ONE `GlassEffectContainer`. Labels are forced back to SF (`.fontDesign(.default)`)
-/// so the root serif toggle never reaches the controls.
+/// The transport control cluster — the primary glass group on the docked transport / full player:
+/// a single tinted `.glassProminent` primary (play/pause) plus `.glass` skip buttons, clustered in
+/// ONE `GlassEffectContainer`. (The docked `TransportBar` also carries a couple of standalone
+/// `.glass` secondary buttons — bookmarks, expand — alongside this cluster; that's still one
+/// prominent control per surface and no glass-on-glass, since the bar's own background is a plain
+/// material.) Labels are forced back to SF (`.fontDesign(.default)`) so the root serif toggle never
+/// reaches the controls.
 ///
 /// NOTE: this cluster is used on surfaces whose background is a plain material or opaque content
 /// (the Mac/iPad `TransportBar`, the `FullPlayerView`) — NOT inside the iPhone tab-bar bottom
