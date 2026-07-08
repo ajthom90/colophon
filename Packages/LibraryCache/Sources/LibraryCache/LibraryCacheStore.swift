@@ -223,9 +223,10 @@ public struct LibraryCacheStore: Sendable {
     // MARK: - v3: per-book playback-rate preference
 
     /// Sets (or, with `rate: nil`, clears back to "no per-book rate") this book's persisted
-    /// playback rate. Always a full-row upsert — currently just `playbackRate`, but written this
-    /// way so a future sibling per-book pref landing on this same row doesn't need a second write
-    /// path.
+    /// playback rate. Currently a full-row upsert, which is safe ONLY because `playbackRate` is the
+    /// sole non-key column. ⚠️ When a sibling per-book pref is added to `cachedItemPref`, this MUST
+    /// become a read-modify-write (or a single-column update), or it will NULL that sibling column
+    /// on every rate change.
     public func setPlaybackRate(_ rate: Double?, connectionID: String, itemID: String) throws {
         try pool.write { db in
             try CachedItemPref(connectionID: connectionID, itemID: itemID, playbackRate: rate).upsert(db)
