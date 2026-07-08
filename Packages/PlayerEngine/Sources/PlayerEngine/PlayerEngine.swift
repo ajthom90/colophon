@@ -35,9 +35,25 @@ public final class PlaybackController {
     private var syncInFlight = false
     private let nowPlaying = NowPlayingUpdater()
 
-    public init(backend: PlayerBackend, now: @escaping @Sendable () -> Date = Date.init) {
+    /// The per-step wait the sleep-timer fade ramp awaits between volume decrements. Injectable so
+    /// `fadeOutAndPause` is deterministic and instant in tests (inject a no-op) instead of burning
+    /// the real ~5s. The production default is a genuine `Task.sleep`.
+    private let sleepForFade: @Sendable (TimeInterval) async -> Void
+    /// The in-flight fade ramp (Task 5's sleep-timer fire), so a fresh fade or a user `play()`
+    /// cancels it. `internal` (not `private`) so the engine's `fadeRampReachesZeroThenPauses` test
+    /// can `await fadeTask?.value` for a deterministic ramp completion.
+    var fadeTask: Task<Void, Never>?
+
+    public init(
+        backend: PlayerBackend,
+        now: @escaping @Sendable () -> Date = Date.init,
+        sleepForFade: @escaping @Sendable (TimeInterval) async -> Void = { seconds in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000))
+        }
+    ) {
         self.backend = backend
         self.now = now
+        self.sleepForFade = sleepForFade
         backend.onTick = { [weak self] in self?.tick() }
         backend.onItemFinished = { [weak self] index, wasLast in
             guard let self, wasLast else { return }
@@ -61,7 +77,43 @@ public final class PlaybackController {
         configureAudioSession()
     }
 
-    public func play() { backend.play(); isPlaying = true; nowPlaying.update(controller: self) }
+    public func play() {
+        // A user-initiated play always aborts an in-flight sleep-timer fade AND restores audible
+        // volume: without the restore, resuming right after a fade left the book silent (volume
+        // parked at 0). `muted` (the E2E/CI safety switch) still wins.
+        fadeTask?.cancel(); fadeTask = nil
+        backend.volume = muted ? 0 : 1
+        backend.play(); isPlaying = true; nowPlaying.update(controller: self)
+    }
+
+    /// Sleep-timer FIRE hook (Task 5): smoothly ramp the backend volume to 0 over `duration`
+    /// seconds in `steps` increments, THEN `pause()` — so the book fades out rather than cutting
+    /// off, and the pause is what the timer's UI/state observes. Order is guaranteed (volume hits 0
+    /// before the pause). Fire-and-forget: it kicks off the ramp on `fadeTask` and returns, so the
+    /// caller (`SleepTimer.fire`) stays synchronous; the wait between steps goes through the
+    /// injected `sleepForFade` seam, so tests run it instantly and deterministically. A no-op if
+    /// nothing is playing. Volume is restored on the next `play()`.
+    public func fadeOutAndPause(over duration: TimeInterval, steps: Int = 20) {
+        fadeTask?.cancel()
+        guard isPlaying else { fadeTask = nil; return }
+        let startVolume: Float = muted ? 0 : backend.volume
+        let sleepStep = sleepForFade
+        let stepCount = max(steps, 1)
+        fadeTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            if duration > 0 {
+                for step in 1...stepCount {
+                    if Task.isCancelled { return }
+                    let remainingFraction = Float(stepCount - step) / Float(stepCount)
+                    self.backend.volume = startVolume * remainingFraction
+                    await sleepStep(duration / Double(stepCount))
+                }
+            }
+            if Task.isCancelled { return }
+            self.backend.volume = 0
+            self.pause()
+        }
+    }
 
     public func pause() {
         backend.pause(); isPlaying = false

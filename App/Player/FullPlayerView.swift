@@ -196,35 +196,34 @@ struct FullPlayerView: View {
         }
     }
 
-    // MARK: - Secondary controls (Chapters now; sleep/bookmark/speed/queue land in Tasks 5–8)
+    // MARK: - Secondary controls (sleep timer + Chapters; bookmarks/speed/queue land in Tasks 6–8)
 
     private func secondaryControls(model: PlayerModel) -> some View {
-        // Task 3 wires only the Chapters affordance. The sleep timer (T5), bookmarks (T6), speed
-        // (T7), and up-next queue (T8) share this secondary cluster — they'll join the same
-        // `GlassEffectContainer` as `.buttonStyle(.glass)` controls. Placeholder row below:
-        //
-        //   GlassEffectContainer(spacing: 16) {
-        //       HStack(spacing: 28) {
-        //           Button { … } label: { Image(systemName: "moon.zzz") }      // SleepTimer  (T5)
-        //           Button { … } label: { Image(systemName: "bookmark") }       // Bookmarks   (T6)
-        //           Button { … } label: { Image(systemName: "speedometer") }    // Speed       (T7)
-        //           Button { … } label: { Image(systemName: "list.bullet.indent") } // Queue   (T8)
-        //       }
-        //       .buttonStyle(.glass)
-        //   }
-        //
-        Button {
-            showingChapters = true
-        } label: {
-            Label("Chapters", systemImage: "list.bullet")
-                .font(.subheadline.weight(.medium))
+        VStack(spacing: 14) {
+            // The shared secondary glass cluster. Task 5 adds the sleep timer; bookmarks (T6),
+            // speed (T7), and up-next queue (T8) join this same `GlassEffectContainer` as further
+            // `.buttonStyle(.glass)` members — one cluster, never glass-on-glass.
+            GlassEffectContainer(spacing: 16) {
+                HStack(spacing: 16) {
+                    SleepTimerView(timer: app.sleepTimer, hasChapters: !model.chapters.isEmpty)
+                }
+            }
+            .controlSize(.large)
+
+            // Chapters affordance (Task 3) — opaque text, not part of the glass cluster.
+            Button {
+                showingChapters = true
+            } label: {
+                Label("Chapters", systemImage: "list.bullet")
+                    .font(.subheadline.weight(.medium))
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.white.opacity(0.85))
+            .fontDesign(.default)
+            .disabled(model.chapters.isEmpty)
+            .opacity(model.chapters.isEmpty ? 0 : 1)
+            .accessibilityLabel("Show Chapters")
         }
-        .buttonStyle(.plain)
-        .foregroundStyle(.white.opacity(0.85))
-        .fontDesign(.default)
-        .padding(.top, 20)
-        .disabled(model.chapters.isEmpty)
-        .opacity(model.chapters.isEmpty ? 0 : 1)
-        .accessibilityLabel("Show Chapters")
+        .padding(.top, 18)
     }
 }

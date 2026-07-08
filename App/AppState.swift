@@ -87,6 +87,10 @@ final class AppState {
     /// handles it.
     private(set) var refreshBanner: (libraryID: String, message: String)?
     let playback = PlaybackController(backend: AVQueuePlayerBackend())
+    /// The audiobook sleep timer (Task 5). Owned here — NOT by the player view — so an armed timer
+    /// survives the full player being dismissed and keeps counting while the book plays. Its
+    /// `chapters` are refreshed on `startPlayback` and it's disarmed when the session is retired.
+    let sleepTimer: SleepTimer
     let cache: LibraryCacheStore
     let coverStore: CoverStore
 
@@ -252,6 +256,9 @@ final class AppState {
         self.transport = transportProvider()
         self.oidcTransport = oidcTransportProvider?()
         self.tokenStore = tokenStore ?? KeychainTokenStore()
+        // `playback` is initialized at its declaration, so it's already live here; the timer
+        // captures only that controller (not `self`), keeping init capture-free.
+        self.sleepTimer = SleepTimer(host: playback)
         self.socketFactory = socketFactory ?? { url, tokenProvider in
             SocketService(serverURL: url, tokenProvider: tokenProvider)
         }
@@ -977,6 +984,9 @@ final class AppState {
         playingConnectionID = nil
         nowPlayingItemID = nil
         nowPlayingChapters = []
+        // Retiring the book cancels any armed sleep timer (it was scoped to that book).
+        sleepTimer.turnOff()
+        sleepTimer.chapters = []
     }
 
     func startPlayback(itemID: String) async {
@@ -1005,6 +1015,10 @@ final class AppState {
             // Surface this book's chapters (global seconds) to the full player. Cleared in
             // `retireCurrentSession`; the mini-bar/transport don't consume these.
             nowPlayingChapters = envelope.session.chapters
+            // Hand the same chapters to the sleep timer so its End-of-Chapter mode can find this
+            // book's boundaries. A fresh book starts with no armed timer.
+            sleepTimer.chapters = envelope.session.chapters
+            sleepTimer.turnOff()
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }

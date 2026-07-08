@@ -116,4 +116,46 @@ final class ClockBox: @unchecked Sendable {
         controller.muted = false
         #expect(backend.volume == 1)
     }
+
+    // MARK: - Sleep-timer fade hook (Task 5)
+
+    /// The fade ramp steps the backend volume down to exactly 0 over the injected duration and
+    /// THEN pauses — order matters (the book fades out before playback stops, never a hard cut).
+    /// The injected instant `sleepForFade` keeps this deterministic with no real 5s wait.
+    @Test func fadeRampReachesZeroThenPauses() async {
+        let clock = ClockBox(Date(timeIntervalSince1970: 1_000_000))
+        let backend = FakePlayerBackend()
+        // Instant per-step wait — no real sleeps.
+        let controller = PlaybackController(backend: backend, now: { clock.now }, sleepForFade: { _ in })
+        controller.load(session: makeSession(), trackURLs: [
+            URL(string: "https://t/1")!, URL(string: "https://t/2")!, URL(string: "https://t/3")!,
+        ])
+        controller.play()
+        #expect(controller.isPlaying == true)
+
+        controller.fadeOutAndPause(over: 5, steps: 10)
+        await controller.fadeTask?.value
+
+        #expect(controller.isPlaying == false)
+        #expect(backend.volume == 0)
+        // Prove ordering: the volume reached 0 strictly before the pause was issued.
+        let zeroIndex = backend.events.lastIndex(of: "vol:0.0")
+        let pauseIndex = backend.events.lastIndex(of: "pause")
+        #expect(zeroIndex != nil && pauseIndex != nil)
+        #expect((zeroIndex ?? .max) < (pauseIndex ?? .min))
+    }
+
+    /// A no-op when nothing is playing (never pauses an already-paused/idle controller).
+    @Test func fadeIsNoOpWhenNotPlaying() async {
+        let clock = ClockBox(Date(timeIntervalSince1970: 1_000_000))
+        let backend = FakePlayerBackend()
+        let controller = PlaybackController(backend: backend, now: { clock.now }, sleepForFade: { _ in })
+        controller.load(session: makeSession(), trackURLs: [
+            URL(string: "https://t/1")!, URL(string: "https://t/2")!, URL(string: "https://t/3")!,
+        ])
+        // never played
+        controller.fadeOutAndPause(over: 5, steps: 10)
+        await controller.fadeTask?.value
+        #expect(controller.isPlaying == false)
+    }
 }
