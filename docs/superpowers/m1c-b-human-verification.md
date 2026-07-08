@@ -46,6 +46,15 @@ Legend: **Do** = the action to perform · **Expect** = the pass criterion.
   (e.g. 30 → 15). Return to the lock screen / Control Center **without** reopening the book.
 - **Expect:** The lock-screen skip buttons now advertise the **new** interval (e.g. "15") and skip by
   that amount — no need to restart the book. (Follow-up A.)
+- **Do (chapter advances while playing):** Start near the END of a chapter and just **let it play**
+  across the boundary into the next chapter — do NOT tap anything. Watch the lock screen / Control
+  Center / Now Playing menu.
+- **Expect:** The displayed **chapter title updates to the new chapter on its own** as playback
+  crosses the boundary (it must NOT stay frozen on the previous chapter until you next tap something).
+- **Do (now-playing clears on stop):** Let a book **finish** with an empty up-next queue, OR sign out
+  / disconnect / switch accounts while a book is loaded.
+- **Expect:** The now-playing entry **disappears** from the lock screen / Control Center / Now Playing
+  menu — no zombie card for the retired book, and its play/pause no longer does anything.
 - **Do (Mac):** With a book playing, open the **Now Playing** menu-bar item (and Control Center on
   macOS). Try the keyboard media keys (F8/play-pause).
 - **Expect:** The Now Playing item shows the book/chapter, author, and cover art, and its controls

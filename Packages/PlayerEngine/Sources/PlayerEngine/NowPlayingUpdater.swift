@@ -1,4 +1,5 @@
 import Foundation
+import ABSKit
 import MediaPlayer
 #if os(macOS)
 import AppKit
@@ -14,6 +15,19 @@ final class NowPlayingUpdater {
     /// `nil` on a fresh book), keyed by `Data` equality.
     private var cachedArtwork: MPMediaItemArtwork?
     private var cachedArtworkData: Data?
+
+    /// The chapter index last written to the now-playing surface, so the per-tick `updateElapsed`
+    /// refreshes the chapter fields ONLY when the book crosses into a new chapter (not every tick).
+    /// Re-established by `update()` on every discrete action and reset by `clear()`.
+    private var lastChapterIndex: Int?
+    /// Test seam: how many times a TICK (`updateElapsed`) refreshed the chapter fields because the
+    /// chapter index changed. Lets `NowPlayingUpdaterTests` assert a boundary crossing refreshes
+    /// exactly once without reading the shared `MPNowPlayingInfoCenter` singleton. Not incremented by
+    /// `update()` (the discrete-action path).
+    private(set) var chapterRefreshCount = 0
+    /// Test seam: how many times `clear()` ran (on `PlaybackController.unload`) — the retire path
+    /// that tears down the now-playing surface. Unit-testable proxy for "nowPlayingInfo was cleared".
+    private(set) var clearCount = 0
 
     func configure(controller: PlaybackController) {
         let center = MPRemoteCommandCenter.shared()
@@ -80,16 +94,12 @@ final class NowPlayingUpdater {
         ]
         info[MPNowPlayingInfoPropertyMediaType] = MPNowPlayingInfoMediaType.audio.rawValue
         // Current CHAPTER (Task 9): reflect the book's chapter position on the lock screen /
-        // Control Center / Now Playing menu via the API's dedicated chapter fields, and surface the
-        // chapter's TITLE as the prominent now-playing title (book title is preserved as the album
-        // above). No chapters → the book title stays the title and the chapter fields are omitted.
-        if let index = chapterIndex(for: controller) {
-            info[MPNowPlayingInfoPropertyChapterNumber] = NSNumber(value: index)
-            info[MPNowPlayingInfoPropertyChapterCount] = NSNumber(value: controller.chapters.count)
-            if let chapterTitle = controller.chapters[index].title, !chapterTitle.isEmpty {
-                info[MPMediaItemPropertyTitle] = chapterTitle
-            }
-        }
+        // Control Center / Now Playing menu via the API's dedicated chapter fields + title. Record
+        // the index so the per-tick `updateElapsed` knows when a natural playback crossing needs a
+        // chapter refresh.
+        let index = chapterIndex(for: controller)
+        applyChapterInfo(&info, controller: controller, index: index)
+        lastChapterIndex = index
         // Cover artwork (Task 9): built from the bytes AppState hands the controller via
         // `setNowPlayingArtwork`, cached so this hot path doesn't re-decode the image each call.
         if let artwork = artwork(for: controller) {
@@ -114,13 +124,59 @@ final class NowPlayingUpdater {
         center.skipBackwardCommand.preferredIntervals = [interval]
     }
 
-    /// Index of the chapter containing the current global time (`start ≤ t`), or `nil` when the book
-    /// has no chapters. Chapters arrive from the server in start order (global seconds).
+    /// Tear down the now-playing surface when the session is retired (book finished / disconnect /
+    /// account switch). Without this, `MPNowPlayingInfoCenter.nowPlayingInfo` keeps showing the
+    /// retired book's cover/chapter/title on the Lock Screen / Control Center / Now Playing menu,
+    /// with play/pause still wired to a torn-down backend (tapping Play would drive a dead
+    /// controller). Clears the info dict AND removes the remote-command targets. Called by
+    /// `PlaybackController.unload()`.
+    func clear() {
+        clearCount += 1
+        lastChapterIndex = nil
+        cachedArtwork = nil
+        cachedArtworkData = nil
+        let center = MPRemoteCommandCenter.shared()
+        center.playCommand.removeTarget(nil)
+        center.pauseCommand.removeTarget(nil)
+        center.togglePlayPauseCommand.removeTarget(nil)
+        center.skipForwardCommand.removeTarget(nil)
+        center.skipBackwardCommand.removeTarget(nil)
+        center.changePlaybackPositionCommand.removeTarget(nil)
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        #if os(macOS)
+        MPNowPlayingInfoCenter.default().playbackState = .stopped
+        #endif
+    }
+
+    /// Writes the current-chapter fields (number/count) and the now-playing title into `info` — the
+    /// chapter TITLE when there is one (Apple Books' audiobook convention; the book title stays the
+    /// album), else the book title, and removes the chapter fields entirely when there are no
+    /// chapters. Shared by the full `update` and the per-tick chapter-change refresh so both agree.
+    private func applyChapterInfo(_ info: inout [String: Any], controller: PlaybackController, index: Int?) {
+        guard let index, index < controller.chapters.count else {
+            info.removeValue(forKey: MPNowPlayingInfoPropertyChapterNumber)
+            info.removeValue(forKey: MPNowPlayingInfoPropertyChapterCount)
+            info[MPMediaItemPropertyTitle] = controller.title
+            return
+        }
+        info[MPNowPlayingInfoPropertyChapterNumber] = NSNumber(value: index)
+        info[MPNowPlayingInfoPropertyChapterCount] = NSNumber(value: controller.chapters.count)
+        let chapterTitle = controller.chapters[index].title
+        info[MPMediaItemPropertyTitle] = (chapterTitle?.isEmpty == false) ? chapterTitle : controller.title
+    }
+
+    /// The chapter index for the controller's current global time — the instance convenience over
+    /// the pure static below.
     private func chapterIndex(for controller: PlaybackController) -> Int? {
-        let chapters = controller.chapters
+        Self.chapterIndex(at: controller.globalTime, in: controller.chapters)
+    }
+
+    /// Index of the chapter containing `time` (`start ≤ time`), or `nil` when there are no chapters.
+    /// Pure + `nonisolated` so it's directly unit-testable for boundary correctness. Chapters arrive
+    /// from the server in start order (global seconds).
+    nonisolated static func chapterIndex(at time: TimeInterval, in chapters: [Chapter]) -> Int? {
         guard !chapters.isEmpty else { return nil }
-        let t = controller.globalTime
-        return chapters.lastIndex { $0.start <= t } ?? 0
+        return chapters.lastIndex { $0.start <= time } ?? 0
     }
 
     /// The cover artwork for the current book, rebuilt only when `controller.artworkData` changes
@@ -154,6 +210,17 @@ final class NowPlayingUpdater {
         var info = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
         info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = controller.globalTime
         info[MPNowPlayingInfoPropertyPlaybackRate] = controller.isPlaying ? controller.rate : 0
+        // A book playing straight across a chapter boundary emits no discrete action (no
+        // play/pause/seek), so the chapter would freeze on the Lock Screen / Control Center at
+        // whatever it was at the last action. `tick()` drives this method, so refresh the chapter
+        // fields + title HERE — but ONLY when the chapter index actually changes, keeping the common
+        // per-tick path just time+rate (the artwork is never rebuilt on a tick).
+        let index = chapterIndex(for: controller)
+        if index != lastChapterIndex {
+            lastChapterIndex = index
+            chapterRefreshCount += 1
+            applyChapterInfo(&info, controller: controller, index: index)
+        }
         MPNowPlayingInfoCenter.default().nowPlayingInfo = info
     }
 }

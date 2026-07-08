@@ -54,7 +54,9 @@ public final class PlaybackController {
     private var sync = SessionSyncController()
     private var lastTickGlobalTime: TimeInterval = 0
     private var syncInFlight = false
-    private let nowPlaying = NowPlayingUpdater()
+    // `internal` (not `private`) so `NowPlayingUpdaterTests` can inspect its test-seam counters
+    // (`chapterRefreshCount`, `clearCount`) — production callers never touch it directly.
+    let nowPlaying = NowPlayingUpdater()
     /// One-shot latch so `onBookFinished` fires AT MOST ONCE per loaded session — hardens the
     /// AppState queue-advance against any double book-end from AVFoundation (a stale
     /// `didPlayToEndTime` notification, or a seek-to-end re-triggering the last item). Reset in
@@ -174,7 +176,10 @@ public final class PlaybackController {
     /// (`ColophonApp`'s `onChange(of: skipInterval)`) sets `skipInterval` here and calls this so the
     /// advertised `MPSkipIntervalCommand.preferredIntervals` update WITHOUT reloading the session.
     /// The skip HANDLERS read `skipInterval` live, so the jump distance already follows the setting.
+    /// Guarded on an active session (`totalDuration > 0`): with no book loaded there's nothing on the
+    /// remote-command surface to re-advertise to.
     public func refreshRemoteSkipInterval() {
+        guard totalDuration > 0 else { return }
         nowPlaying.refreshSkipInterval(controller: self)
     }
 
@@ -186,7 +191,10 @@ public final class PlaybackController {
         nowPlaying.update(controller: self)
     }
 
-    public func unload() { backend.teardown(); isPlaying = false }
+    // Tear down the now-playing surface with the backend: `retireCurrentSession` calls this, so a
+    // finished/retired book stops showing on the Lock Screen / Control Center / Now Playing menu and
+    // its remote commands stop driving the (now dead) controller.
+    public func unload() { backend.teardown(); isPlaying = false; nowPlaying.clear() }
 
     /// Flush any accumulated listened-time to the server WITHOUT pausing playback —
     /// used on scene backgrounding, where background audio must keep playing.
