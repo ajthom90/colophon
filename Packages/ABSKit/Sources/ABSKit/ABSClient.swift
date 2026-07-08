@@ -249,6 +249,38 @@ extension ABSClient {
         baseURL.appending(path: "public/session/\(sessionID)/track/\(trackIndex)")
     }
 
+    /// `POST /api/me/item/:id/bookmark` `{time,title}` — creates a bookmark at `time` (whole
+    /// seconds) with `title`; returns the created `Bookmark` (verified live this session, incl.
+    /// `Tests/ABSKitTests/Fixtures/bookmark.json`, a real captured-then-deleted server response).
+    public func createBookmark(itemID: String, time: Int, title: String) async throws -> Bookmark {
+        try await sendBookmarkMutation(method: "POST", itemID: itemID, time: time, title: title)
+    }
+
+    /// `PATCH /api/me/item/:id/bookmark` `{time,title}` — the server matches the bookmark to
+    /// rename by its `time` value (there is no separate id — verified live); returns the updated
+    /// `Bookmark`.
+    public func updateBookmark(itemID: String, time: Int, title: String) async throws -> Bookmark {
+        try await sendBookmarkMutation(method: "PATCH", itemID: itemID, time: time, title: title)
+    }
+
+    /// `DELETE /api/me/item/:id/bookmark/:time` — unlike create/update, `time` is part of the
+    /// PATH here, not a JSON body (verified live). 200 with no body worth decoding.
+    public func deleteBookmark(itemID: String, time: Int) async throws {
+        var req = URLRequest(url: baseURL.appending(path: "api/me/item/\(itemID)/bookmark/\(time)"))
+        req.httpMethod = "DELETE"
+        _ = try await authorizedData(req)
+    }
+
+    private struct BookmarkRequest: Encodable { let time: Int; let title: String }
+
+    private func sendBookmarkMutation(method: String, itemID: String, time: Int, title: String) async throws -> Bookmark {
+        var req = URLRequest(url: baseURL.appending(path: "api/me/item/\(itemID)/bookmark"))
+        req.httpMethod = method
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try ABSAPI.encoder.encode(BookmarkRequest(time: time, title: title))
+        return try await authorizedSend(req, as: Bookmark.self)
+    }
+
     private func postSessionPayload(path: String, currentTime: Double, timeListened: Double, duration: Double) async throws {
         var req = URLRequest(url: baseURL.appending(path: path))
         req.httpMethod = "POST"

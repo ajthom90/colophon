@@ -383,15 +383,31 @@ public struct MediaProgressEntry: Decodable, Sendable, Hashable {
     public let lastUpdate: Int?
 }
 
-/// Source-verified shape (`User.createBookmark`, ABS 2.35.1): `{libraryItemId, time, title,
-/// createdAt}` — no `id` field; bookmarks are keyed by `libraryItemId`+`time`, not a UUID.
-/// Live-captured non-empty in `me.json` by creating (then deleting, to leave the dev seed
-/// unchanged) a real bookmark against the dev server during fixture capture.
-public struct Bookmark: Decodable, Sendable, Hashable {
+/// Verified live (ABS 2.35.1, M1c-b Task 1): `POST`/`PATCH /api/me/item/:id/bookmark` and the
+/// `bookmarks[]` entries on `GET /api/me` all share this shape — `{libraryItemId, time, title,
+/// createdAt}`, no server-assigned `id` field; bookmarks are keyed by `libraryItemId`+`time`.
+/// `time` decodes as `Double` (not `Int`) because it's a plain JS number with no schema-enforced
+/// integrality: sending an integer `time` round-trips as an integer (`bookmark.json`'s captured
+/// fixture), but sending a fractional `time` (verified live this session) round-trips fractional
+/// too — `ABSClient.createBookmark`/`updateBookmark` only ever send whole seconds, but a tolerant
+/// decode must not reject a bookmark some OTHER client created with sub-second precision.
+/// `Identifiable` (`id` derived from `libraryItemId`+`time`, the server's own composite key) lets
+/// SwiftUI's `List`/`ForEach` key bookmark rows without a synthesized UUID that would change
+/// every reconcile-from-`/api/me` refresh.
+public struct Bookmark: Codable, Sendable, Hashable, Identifiable {
     public let libraryItemId: String
     public let time: Double?
     public let title: String?
     public let createdAt: Int?
+
+    public var id: String { "\(libraryItemId)#\(time.map { String($0) } ?? "nil")" }
+
+    public init(libraryItemId: String, time: Double?, title: String?, createdAt: Int?) {
+        self.libraryItemId = libraryItemId
+        self.time = time
+        self.title = title
+        self.createdAt = createdAt
+    }
 }
 
 public struct DeviceInfo: Encodable, Sendable {

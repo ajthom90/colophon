@@ -47,13 +47,14 @@ struct PhoneShell: View {
                         selectedLibraryID: $selectedLibraryID,
                         browseMode: $browseMode,
                         initializedConnectionID: $initializedConnectionID)
+                        .accountMenu()
                 }
             }
             Tab("Downloads", systemImage: "arrow.down.circle") {
-                NavigationStack { DownloadsPlaceholder() }
+                NavigationStack { DownloadsPlaceholder().accountMenu() }
             }
             Tab("Search", systemImage: "magnifyingglass", role: .search) {
-                NavigationStack { SearchView() }
+                NavigationStack { SearchView().accountMenu() }
             }
         }
         .phoneTabChrome { MiniPlayerBar { showingFullPlayer = true } }

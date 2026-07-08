@@ -163,6 +163,19 @@ private func fixture(_ name: String) throws -> Data {
         #expect(me.bookmarks?.first?.time == 100.5)
     }
 
+    /// `Tests/ABSKitTests/Fixtures/bookmark.json` is a REAL response captured live this session:
+    /// `POST /api/me/item/77226f9e-ad94-4b26-bf8a-bf841965ca23/bookmark {"time":142,"title":
+    /// "Interesting chapter"}` against the dev server, then the bookmark was DELETEd again to
+    /// leave the seed clean (see `ABSClient.createBookmark`/`deleteBookmark`).
+    @Test func decodesCreatedBookmarkFixture() throws {
+        let b = try decoder.decode(Bookmark.self, from: fixture("bookmark"))
+        #expect(b.libraryItemId == "77226f9e-ad94-4b26-bf8a-bf841965ca23")
+        #expect(b.time == 142)
+        #expect(b.title == "Interesting chapter")
+        #expect(b.createdAt == 1_783_509_180_098)
+        #expect(b.id == "77226f9e-ad94-4b26-bf8a-bf841965ca23#142.0")
+    }
+
     @Test func deviceInfoEncodesWithDefaults() throws {
         let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
         let data = try JSONEncoder().encode(device)

@@ -105,4 +105,31 @@ struct ContractTests {
         #expect(me.username == "root")
         #expect(me.mediaProgress?.isEmpty == false)
     }
+
+    // MARK: - Task 1: bookmark create/update/delete round trip
+
+    /// Live create→patch→delete against the real server, then confirms via `/api/me` that the
+    /// bookmark is gone — leaves the dev seed exactly as it found it (no bookmarks).
+    @Test func bookmarkCreateUpdateDeleteRoundTripsLive() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let page = try await client.items(libraryID: libs[0].id, limit: 1, page: 0)
+        let itemID = page.results[0].id
+
+        let created = try await client.createBookmark(itemID: itemID, time: 77, title: "Contract test")
+        #expect(created.libraryItemId == itemID)
+        #expect(created.time == 77)
+        #expect(created.title == "Contract test")
+
+        let updated = try await client.updateBookmark(itemID: itemID, time: 77, title: "Contract test renamed")
+        #expect(updated.title == "Contract test renamed")
+
+        let meBeforeDelete = try await client.me()
+        #expect(meBeforeDelete.bookmarks?.contains { $0.libraryItemId == itemID && $0.time == 77 } == true)
+
+        try await client.deleteBookmark(itemID: itemID, time: 77)
+
+        let meAfterDelete = try await client.me()
+        #expect(meAfterDelete.bookmarks?.contains { $0.libraryItemId == itemID && $0.time == 77 } != true)
+    }
 }
