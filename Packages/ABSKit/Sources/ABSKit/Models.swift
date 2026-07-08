@@ -116,10 +116,12 @@ public struct ExpandedItemMetadata: Decodable, Sendable {
 
 /// One entry of a book's `metadata.series` — the series identity plus this book's `sequence`
 /// within it (e.g. `"1"`, `"2.5"`, or absent). `sequence` is a string, not a number: ABS stores
-/// fractional/lettered sequences.
+/// fractional/lettered sequences. `id`/`name` are optional so a malformed/future series element
+/// degrades to "no series label" instead of failing the whole `LibraryItemDetail` decode (the
+/// enclosing `series: [SeriesRef]?` is meant to be tolerant); the UI guards on a non-empty `name`.
 public struct SeriesRef: Decodable, Sendable, Identifiable, Hashable {
-    public let id: String
-    public let name: String
+    public let id: String?
+    public let name: String?
     public let sequence: String?
 }
 

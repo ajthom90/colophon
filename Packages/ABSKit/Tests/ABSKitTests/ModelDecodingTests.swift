@@ -202,6 +202,32 @@ private func fixture(_ name: String) throws -> Data {
         #expect(d.userMediaProgress?.isFinished == false)
     }
 
+    /// A malformed/partial `metadata.series` element (missing `id` AND `name`) must NOT fail the
+    /// whole `LibraryItemDetail` decode — `SeriesRef.id`/`name` are optional so a bad series entry
+    /// just drops its label. Proves the tolerant-decode contract of `series: [SeriesRef]?`.
+    @Test func tolerantSeriesRefDoesNotFailItemDecode() throws {
+        let json = Data("""
+        {
+          "id": "item-1",
+          "libraryId": "lib-1",
+          "media": {
+            "metadata": {
+              "title": "Partial Book",
+              "series": [ { "sequence": "3" }, { "id": "s2", "name": "Real Series" } ]
+            }
+          }
+        }
+        """.utf8)
+        let d = try decoder.decode(LibraryItemDetail.self, from: json)
+        #expect(d.id == "item-1")
+        #expect(d.media.metadata.title == "Partial Book")
+        // First element decoded with nil id/name (label-less); the second kept its real name.
+        #expect(d.media.metadata.series?.count == 2)
+        #expect(d.media.metadata.series?.first?.name == nil)
+        #expect(d.media.metadata.series?.first?.sequence == "3")
+        #expect(d.media.metadata.series?.last?.name == "Real Series")
+    }
+
     @Test func deviceInfoEncodesWithDefaults() throws {
         let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
         let data = try JSONEncoder().encode(device)

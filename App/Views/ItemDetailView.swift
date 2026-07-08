@@ -69,8 +69,8 @@ struct ItemDetailView: View {
                     ProgressView().controlSize(.large)
                         .frame(maxWidth: .infinity)
                         .padding(.top, 8)
-                } else if case .failed = state, detail == nil, cachedDetail == nil {
-                    detailsUnavailable
+                } else if case .failed(let message) = state, detail == nil, cachedDetail == nil {
+                    detailsUnavailable(message)
                 }
             }
             .padding(.bottom, 32)
@@ -253,11 +253,16 @@ struct ItemDetailView: View {
         }
     }
 
-    private var detailsUnavailable: some View {
+    /// The `.failed` message rendered verbatim (a real network/server error), falling back to the
+    /// friendly offline copy for the `"offline"` sentinel or an empty message.
+    private func detailsUnavailable(_ message: String) -> some View {
         VStack(spacing: 8) {
-            Text("Full details are unavailable offline.")
+            Text(message.isEmpty || message == "offline"
+                 ? "Full details are unavailable offline."
+                 : message)
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
+                .multilineTextAlignment(.center)
             Button("Retry") { Task { await load() } }
                 .buttonStyle(.bordered)
         }
@@ -279,9 +284,9 @@ struct ItemDetailView: View {
 
     /// The series name + this book's sequence, when present (empty seed values → nil).
     private var seriesLabel: String? {
-        if let ref = detail?.media.metadata.series?.first {
-            if let seq = ref.sequence, !seq.isEmpty { return "\(ref.name) · Book \(seq)" }
-            return ref.name
+        if let ref = detail?.media.metadata.series?.first, let name = ref.name, !name.isEmpty {
+            if let seq = ref.sequence, !seq.isEmpty { return "\(name) · Book \(seq)" }
+            return name
         }
         if let name = detail?.media.metadata.seriesName, !name.isEmpty { return name }
         return nil
