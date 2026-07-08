@@ -956,6 +956,10 @@ final class AppState {
     /// server's own `lastUpdate`, falling back to wall-clock only when the server omits it.
     func refreshProgress() async {
         guard let client, let connectionID = activeConnectionID else { return }
+        // Snapshot the bookmarks generation BEFORE the me() fetch: a mutation that lands during the
+        // round-trip bumps it, so the (now-stale) snapshot below is dropped rather than clobbering
+        // the just-confirmed create/rename/delete.
+        let bookmarkGeneration = bookmarks.generation
         guard let me = try? await client.me() else { return }
         // A connection switch during the me() round-trip must never write server-A progress under
         // server-B's ID.
@@ -975,7 +979,8 @@ final class AppState {
         // `me().bookmarks[]` is the source of truth, filtered to the playing item. Cheap, and
         // ignored by the store when no book is playing (`nowPlayingItemID` nil) or the item differs.
         if let itemID = nowPlayingItemID {
-            bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID)
+            bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID,
+                                expectedGeneration: bookmarkGeneration)
         }
     }
 
@@ -986,9 +991,11 @@ final class AppState {
     /// Guards against a connection switch or a new book started during the round-trip.
     func refreshBookmarks(forItemID itemID: String) async {
         guard let client, let connectionID = activeConnectionID else { return }
+        let bookmarkGeneration = bookmarks.generation
         guard let me = try? await client.me() else { return }
         guard connectionID == activeConnectionID, nowPlayingItemID == itemID else { return }
-        bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID)
+        bookmarks.reconcile(from: me.bookmarks ?? [], forItemID: itemID,
+                            expectedGeneration: bookmarkGeneration)
     }
 
     /// Retire the current session completely (ordering matters: flush → detach sync callback →

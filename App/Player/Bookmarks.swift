@@ -45,6 +45,14 @@ final class Bookmarks {
     /// Transient error surfaced by `BookmarksView` (an alert) after a failed server op + rollback.
     var errorMessage: String?
 
+    /// Monotonic "local state has moved on" counter — bumped on `configure`/`clear` and on every
+    /// optimistic mutation. It's the staleness guard for `reconcile`: bookmarks carry no `lastUpdate`
+    /// (unlike `mediaProgress`, whose last-write-wins uses one), so this counter is the clean analog.
+    /// `AppState` snapshots it BEFORE its `me()` fetch and hands it back to `reconcile`, which drops a
+    /// snapshot whose generation is stale — so a `me()` in flight before a create/rename/delete that
+    /// lands AFTER the mutation's server confirm can't silently erase/resurrect/revert it.
+    private(set) var generation = 0
+
     /// The now-playing item these bookmarks belong to, and the client to mutate them through —
     /// both set by `AppState.startPlayback` via `configure`, cleared on `retireCurrentSession`.
     private var itemID: String?
@@ -53,12 +61,14 @@ final class Bookmarks {
     init() {}
 
     /// Point the store at the active session's client + item. Clears any stale list from a
-    /// previous book; the fresh list arrives via `reconcile` once `me()` returns.
+    /// previous book; the fresh list arrives via `reconcile` once `me()` returns. Bumps `generation`
+    /// so any `me()` snapshot whose fetch began under the previous book is dropped as stale.
     func configure(writer: BookmarkWriting, itemID: String) {
         self.writer = writer
         self.itemID = itemID
         items = []
         errorMessage = nil
+        generation &+= 1
     }
 
     /// Empty the store when the session is retired (book closed / signed out).
@@ -67,13 +77,21 @@ final class Bookmarks {
         itemID = nil
         items = []
         errorMessage = nil
+        generation &+= 1
     }
 
     /// Replace the list from `GET /api/me`'s `bookmarks[]`, filtered to `forItemID` and sorted by
-    /// time. Called on session start and on `refreshProgress` while a book is playing. A stale
-    /// `me()` for a DIFFERENT book than the one currently configured is ignored.
-    func reconcile(from all: [Bookmark], forItemID: String) {
+    /// time. Called on session start and on `refreshProgress` while a book is playing.
+    ///
+    /// Two staleness guards: (1) a `me()` for a DIFFERENT book than the one currently configured is
+    /// ignored (`forItemID == itemID`); (2) when `expectedGeneration` is supplied — `AppState`
+    /// snapshots `generation` BEFORE its `me()` fetch and passes it here — a snapshot that predates a
+    /// local mutation (which bumped `generation`) is dropped, so it can't erase/resurrect/revert a
+    /// just-confirmed create/rename/delete. `nil` (tests/callers that don't race) applies uncondi-
+    /// tionally when the item matches.
+    func reconcile(from all: [Bookmark], forItemID: String, expectedGeneration: Int? = nil) {
         guard forItemID == itemID else { return }
+        if let expectedGeneration, expectedGeneration != generation { return }
         items = Self.sorted(all.filter { $0.libraryItemId == forItemID })
     }
 
@@ -81,45 +99,61 @@ final class Bookmarks {
 
     /// Create a bookmark at `time` (fractional seconds — passed straight through to the server,
     /// which keys bookmarks by exact time). No-op if one already exists at that exact time.
+    ///
+    /// The captured `capturedItemID` guards every write to `items` after the `await`: if the user
+    /// switched to another book (or retired the session) while the POST was in flight, the confirm/
+    /// rollback must NOT land the row in the list the UI now shows for a DIFFERENT book.
     func create(atTime time: Double, title: String) async {
-        guard let writer, let itemID else { return }
+        guard let writer, let capturedItemID = itemID else { return }
         guard !items.contains(where: { $0.time == time }) else { return }
-        upsert(Bookmark(libraryItemId: itemID, time: time, title: title, createdAt: nil))
+        beginLocalMutation()
+        upsert(Bookmark(libraryItemId: capturedItemID, time: time, title: title, createdAt: nil))
         do {
-            let created = try await writer.createBookmark(itemID: itemID, time: time, title: title)
-            upsert(created)                              // confirm with the server's canonical row
+            let created = try await writer.createBookmark(itemID: capturedItemID, time: time, title: title)
+            guard itemID == capturedItemID else { return }   // book switched mid-flight — don't leak
+            upsert(created)                                  // confirm with the server's canonical row
         } catch {
-            remove(matchingTime: time)                   // roll back the optimistic insert
+            guard itemID == capturedItemID else { return }
+            remove(matchingTime: time)                       // roll back the optimistic insert
             errorMessage = Self.message(error)
         }
     }
 
     /// Rename a bookmark (PATCH, keyed by its exact `time`).
     func rename(_ bookmark: Bookmark, to newTitle: String) async {
-        guard let writer, let itemID, let time = bookmark.time else { return }
-        upsert(Bookmark(libraryItemId: itemID, time: time, title: newTitle, createdAt: bookmark.createdAt))
+        guard let writer, let capturedItemID = itemID, let time = bookmark.time else { return }
+        beginLocalMutation()
+        upsert(Bookmark(libraryItemId: capturedItemID, time: time, title: newTitle, createdAt: bookmark.createdAt))
         do {
-            let updated = try await writer.updateBookmark(itemID: itemID, time: time, title: newTitle)
+            let updated = try await writer.updateBookmark(itemID: capturedItemID, time: time, title: newTitle)
+            guard itemID == capturedItemID else { return }
             upsert(updated)
         } catch {
-            upsert(bookmark)                             // roll back to the pre-rename row
+            guard itemID == capturedItemID else { return }
+            upsert(bookmark)                                 // roll back to the pre-rename row
             errorMessage = Self.message(error)
         }
     }
 
     /// Delete a bookmark (DELETE, keyed by its exact `time`).
     func delete(_ bookmark: Bookmark) async {
-        guard let writer, let itemID, let time = bookmark.time else { return }
+        guard let writer, let capturedItemID = itemID, let time = bookmark.time else { return }
+        beginLocalMutation()
         remove(matchingTime: time)
         do {
-            try await writer.deleteBookmark(itemID: itemID, time: time)
+            try await writer.deleteBookmark(itemID: capturedItemID, time: time)
         } catch {
-            upsert(bookmark)                             // roll back the optimistic removal
+            guard itemID == capturedItemID else { return }
+            upsert(bookmark)                                 // roll back the optimistic removal
             errorMessage = Self.message(error)
         }
     }
 
     // MARK: - List helpers
+
+    /// Mark the local list as having moved on (a new optimistic edit): bumps `generation` so any
+    /// `me()` snapshot captured before this edit is dropped by `reconcile` as stale.
+    private func beginLocalMutation() { generation &+= 1 }
 
     /// Insert-or-replace by `time` (the server's composite key), keeping the list time-sorted.
     private func upsert(_ bookmark: Bookmark) {
