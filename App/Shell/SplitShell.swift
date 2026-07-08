@@ -52,14 +52,19 @@ struct SplitShell: View {
                 // their own `.tag`.
                 Section("Libraries") {
                     ForEach(libraries) { library in
-                        DisclosureGroup(isExpanded: expansionBinding(for: library)) {
-                            Label("Series", systemImage: "square.stack").tag(SidebarItem.series(library))
-                            Label("Authors", systemImage: "person.2").tag(SidebarItem.authors(library))
-                        } label: {
-                            Label(library.name,
-                                  systemImage: library.mediaType == "podcast"
-                                    ? "antenna.radiowaves.left.and.right" : "books.vertical")
+                        if library.mediaType == "podcast" {
+                            // Podcasts have no Series/Authors (book concepts) — a plain row that
+                            // browses the podcast grid, no disclosure children.
+                            Label(library.name, systemImage: "antenna.radiowaves.left.and.right")
                                 .tag(SidebarItem.library(library))
+                        } else {
+                            DisclosureGroup(isExpanded: expansionBinding(for: library)) {
+                                Label("Series", systemImage: "square.stack").tag(SidebarItem.series(library))
+                                Label("Authors", systemImage: "person.2").tag(SidebarItem.authors(library))
+                            } label: {
+                                Label(library.name, systemImage: "books.vertical")
+                                    .tag(SidebarItem.library(library))
+                            }
                         }
                     }
                 }

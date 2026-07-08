@@ -25,20 +25,6 @@ extension View {
     }
 }
 
-/// How the episode list is ordered — surfaced via the toolbar sort `Menu`. `.season` additionally
-/// forces season `Section`s even for a single-season feed.
-private enum EpisodeSort: String, CaseIterable, Identifiable {
-    case newest, oldest, season
-    var id: String { rawValue }
-    var label: String {
-        switch self {
-        case .newest: return "Newest First"
-        case .oldest: return "Oldest First"
-        case .season: return "By Season"
-        }
-    }
-}
-
 /// The native podcast page, à la Apple Podcasts. OPAQUE content throughout (cover, header, HTML
 /// description, episode rows); the only Liquid Glass is the system toolbar the nav chrome provides
 /// (which hosts the sort `Menu`). There is intentionally no `.glassProminent` primary yet — a
@@ -162,15 +148,13 @@ struct PodcastDetailView: View {
     private var content: some View {
         if episodes.isEmpty {
             statusRow.listRowSeparator(.hidden)
-        } else if shouldGroupBySeason {
-            ForEach(groupedSections) { section in
+        } else {
+            // Grouping + sort live in the pure, unit-tested `PodcastEpisodeOrganizer` (a flat feed
+            // comes back as a single "Episodes" section) so this view just renders sections.
+            ForEach(PodcastEpisodeOrganizer.sections(episodes, sort: sort)) { section in
                 Section(section.title) {
                     ForEach(section.episodes) { episodeRow($0) }
                 }
-            }
-        } else {
-            Section("Episodes") {
-                ForEach(sortedEpisodes(episodes)) { episodeRow($0) }
             }
         }
     }
@@ -225,71 +209,6 @@ struct PodcastDetailView: View {
                 Label("Sort", systemImage: "arrow.up.arrow.down")
             }
         }
-    }
-
-    // MARK: - Grouping / sorting
-
-    /// Distinct non-empty season values, in first-seen order.
-    private var seasons: [String] {
-        var seen = Set<String>()
-        var order: [String] = []
-        for episode in episodes {
-            if let season = episode.season, !season.isEmpty, seen.insert(season).inserted {
-                order.append(season)
-            }
-        }
-        return order
-    }
-
-    /// Group into `Section`s when the feed spans more than one season, or when the user explicitly
-    /// sorts by season. A single-season (or season-less) feed under Newest/Oldest stays a flat list.
-    private var shouldGroupBySeason: Bool {
-        sort == .season || seasons.count > 1
-    }
-
-    /// The chosen flat ordering: newest/oldest by `publishedAt` (NULLs sort last either way); "By
-    /// Season" (used within a section) by numeric episode number, then `publishedAt` ascending.
-    private func sortedEpisodes(_ list: [CachedEpisode]) -> [CachedEpisode] {
-        switch sort {
-        case .newest:
-            return list.sorted { ($0.publishedAt ?? .min) > ($1.publishedAt ?? .min) }
-        case .oldest:
-            return list.sorted { ($0.publishedAt ?? .max) < ($1.publishedAt ?? .max) }
-        case .season:
-            return list.sorted { lhs, rhs in
-                let ln = Int(lhs.episode ?? "") ?? .max
-                let rn = Int(rhs.episode ?? "") ?? .max
-                if ln != rn { return ln < rn }
-                return (lhs.publishedAt ?? .max) < (rhs.publishedAt ?? .max)
-            }
-        }
-    }
-
-    private struct EpisodeSection: Identifiable {
-        let id: String
-        let title: String
-        let episodes: [CachedEpisode]
-    }
-
-    /// Episodes grouped by season. Season sections are ordered ascending for Oldest/By-Season and
-    /// descending for Newest; season-less episodes collect into a trailing "Episodes" section. Each
-    /// section's episodes use the same `sortedEpisodes` order as the flat list.
-    private var groupedSections: [EpisodeSection] {
-        let grouped = Dictionary(grouping: episodes.filter { !($0.season ?? "").isEmpty }) { $0.season ?? "" }
-        let ascending = (sort != .newest)
-        let keys = grouped.keys.sorted { lhs, rhs in
-            let ln = Int(lhs) ?? .max
-            let rn = Int(rhs) ?? .max
-            return ascending ? (ln < rn) : (ln > rn)
-        }
-        var sections = keys.map { key in
-            EpisodeSection(id: key, title: "Season \(key)", episodes: sortedEpisodes(grouped[key] ?? []))
-        }
-        let seasonless = episodes.filter { ($0.season ?? "").isEmpty }
-        if !seasonless.isEmpty {
-            sections.append(EpisodeSection(id: "", title: "Episodes", episodes: sortedEpisodes(seasonless)))
-        }
-        return sections
     }
 
     // MARK: - Episode playback call site (M1c-c Task 5)

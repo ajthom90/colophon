@@ -163,16 +163,24 @@ private struct LibraryTabContent: View {
 
     @ViewBuilder
     private func content(for library: CachedLibrary) -> some View {
-        switch browseMode {
-        case .grid:
+        if library.mediaType == "podcast" {
+            // Podcasts have no Series/Authors (book concepts) — only the podcast grid, and NO
+            // "Browse by" menu (nothing to switch to). The grid keeps its own library picker.
+            // Guarding here (not just on the mode switch) means a stale `browseMode` carried from a
+            // book library can never render Series/Authors for a podcast library.
             LibraryGridView(library: library, siblings: libraries, onSelectLibrary: { selectedLibraryID = $0.id })
-                .toolbar { browseByMenu }
-        case .series:
-            SeriesListView(library: library)
-                .toolbar { browseByMenu }
-        case .authors:
-            AuthorsListView(library: library)
-                .toolbar { browseByMenu }
+        } else {
+            switch browseMode {
+            case .grid:
+                LibraryGridView(library: library, siblings: libraries, onSelectLibrary: { selectedLibraryID = $0.id })
+                    .toolbar { browseByMenu }
+            case .series:
+                SeriesListView(library: library)
+                    .toolbar { browseByMenu }
+            case .authors:
+                AuthorsListView(library: library)
+                    .toolbar { browseByMenu }
+            }
         }
     }
 
