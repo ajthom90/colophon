@@ -49,6 +49,9 @@ struct ItemDetailView: View {
     @State private var state: LoadState = .idle
     @State private var showingChapters = false
     @State private var descriptionExpanded = false
+    /// The HTML description parsed into an `AttributedString` ONCE (see `HTMLText`) — populated by
+    /// `.task(id: displayDescription)`, never per `body`. Nil until parsed / when there's no description.
+    @State private var formattedDescription: AttributedString?
 
     private enum LoadState: Equatable { case idle, loading, loaded, failed(String) }
 
@@ -85,6 +88,15 @@ struct ItemDetailView: View {
         }
         .task(id: route.itemID) { await load() }
         .task(id: app.activeConnectionID) { await observeProgress() }
+        .task(id: displayDescription) {
+            // Parse the HTML description ONCE per value on the main actor (NSAttributedString's HTML
+            // importer is main-actor-only + expensive); the render then just reads this @State.
+            if let description = displayDescription, !description.isEmpty {
+                formattedDescription = HTMLText.attributed(fromHTML: description)
+            } else {
+                formattedDescription = nil
+            }
+        }
     }
 
     // MARK: - Hero
@@ -208,7 +220,10 @@ struct ItemDetailView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("About")
                 .font(.title3.weight(.semibold))
-            Text(description)
+            // HTML rendered as formatted text (see `HTMLText`); the fallback runs the SAME safe,
+            // synchronous strip for the frame before the cache task populates — never raw tags. The
+            // app's serif body font + secondary colour + line-limit/expand still apply.
+            Text(formattedDescription ?? HTMLText.attributed(fromHTML: description))
                 .font(.body)
                 .foregroundStyle(.secondary)
                 .lineLimit(descriptionExpanded ? nil : 4)
@@ -507,6 +522,11 @@ private struct ChapterPreviewSheet: View {
             }
         }
         .presentationDetents([.medium, .large])
+        // macOS ignores `.presentationDetents`, so without an explicit size the sheet collapses to
+        // its content's ideal size and the chapter rows get clipped. Give it a usable minimum.
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 520)
+        #endif
     }
 
     /// h:mm:ss for a chapter start (global seconds).

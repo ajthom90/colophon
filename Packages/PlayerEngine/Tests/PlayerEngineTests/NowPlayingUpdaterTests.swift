@@ -1,6 +1,7 @@
 import Foundation
 import Testing
 import ABSKit
+import MediaPlayer
 @testable import PlayerEngine
 
 /// Chapters {0–10},{10–25},{25–30} in GLOBAL seconds — the boundary fixture shared by both tests.
@@ -85,5 +86,28 @@ private func makeChapteredController() -> (PlaybackController, FakePlayerBackend
         controller.unload()
         #expect(controller.nowPlaying.clearCount == 1)
         #expect(controller.isPlaying == false)
+    }
+
+    /// `configure()` wires the hardware media keys' previous/next-TRACK remote commands (Mac F7/F9,
+    /// BT/CarPlay remotes) — enabling them so the OS routes the keys to this app — and `clear()`
+    /// (session retired) disables them again. Self-contained (establishes both states in-test) so it
+    /// stays order-independent despite the shared `MPRemoteCommandCenter` singleton; the actual
+    /// skip-by-interval behaviour of the handlers is device-verified (remote-command targets can't be
+    /// fired via public API), while `isEnabled` is the unit-observable proxy for "the wiring is present".
+    @Test func mediaKeysWirePreviousAndNextTrack() {
+        let center = MPRemoteCommandCenter.shared()
+        // Force the OPPOSITE of what configure() should set FIRST, so the post-configure assertions
+        // are load-bearing (isEnabled defaults to true on the singleton, which would otherwise make
+        // the enable-side pass even if configure() didn't touch these commands).
+        center.previousTrackCommand.isEnabled = false
+        center.nextTrackCommand.isEnabled = false
+
+        let (controller, _) = makeChapteredController()   // load() → configure() ran → re-enables
+        #expect(center.previousTrackCommand.isEnabled)    // proves configure() enabled them
+        #expect(center.nextTrackCommand.isEnabled)
+
+        controller.unload()                               // → clear()
+        #expect(center.previousTrackCommand.isEnabled == false)
+        #expect(center.nextTrackCommand.isEnabled == false)
     }
 }
