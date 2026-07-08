@@ -39,7 +39,7 @@ private struct NowPlayingArtwork: View {
 /// so the root serif toggle never reaches the controls.
 ///
 /// NOTE: this cluster is used on surfaces whose background is a plain material or opaque content
-/// (the Mac/iPad `TransportBar`, the `FullPlayerSheet`) — NOT inside the iPhone tab-bar bottom
+/// (the Mac/iPad `TransportBar`, the `FullPlayerView`) — NOT inside the iPhone tab-bar bottom
 /// accessory, which is itself system glass (glass-on-glass there would be a review violation; the
 /// `MiniPlayerBar` uses a plain button instead).
 struct TransportControls: View {
@@ -154,51 +154,6 @@ struct TransportBar: View {
     }
 }
 
-/// A minimal full-player stub presented when the iPhone mini-bar is tapped. The real player
-/// (chapters, sleep timer, bookmarks, per-book speed, queue) is M1c-b; this shows the current
-/// item's artwork, serif title/author, a scrubber, elapsed/total time, and the transport cluster.
-struct FullPlayerSheet: View {
-    @Environment(AppState.self) private var app
-    @Environment(\.dismiss) private var dismiss
-
-    var body: some View {
-        let playback = app.playback
-        VStack(spacing: 24) {
-            NowPlayingArtwork(side: 240)
-                .shadow(radius: 12, y: 6)
-            VStack(spacing: 6) {
-                Text(playback.title)
-                    .font(.title2.weight(.semibold)).multilineTextAlignment(.center).lineLimit(3)
-                if !playback.author.isEmpty {
-                    Text(playback.author)
-                        .font(.title3).foregroundStyle(.secondary).multilineTextAlignment(.center).lineLimit(2)
-                }
-            }
-            VStack(spacing: 4) {
-                Slider(
-                    value: Binding(get: { playback.globalTime },
-                                   set: { playback.seek(toGlobal: $0) }),
-                    in: 0...max(playback.totalDuration, 1))
-                HStack {
-                    Text(hms(playback.globalTime)).monospacedDigit()
-                    Spacer()
-                    Text(hms(playback.totalDuration)).monospacedDigit()
-                }
-                .font(.caption).foregroundStyle(.secondary).fontDesign(.default)
-            }
-            TransportControls(playback: playback)
-                .controlSize(.large)
-            Spacer()
-        }
-        .padding(24)
-        .presentationDragIndicator(.visible)
-        .overlay(alignment: .topTrailing) {
-            Button { dismiss() } label: {
-                Image(systemName: "chevron.down").font(.title3)
-            }
-            .buttonStyle(.plain)
-            .padding()
-            .accessibilityLabel("Close")
-        }
-    }
-}
+// The full player (`FullPlayerView`) — artwork, serif title/author, a chapter-aware scrubber,
+// the glass transport cluster, and a chapter list — now lives in `App/Player/`. The shell presents
+// it over the mini-bar (see `PhoneShell.fullPlayerPresentation`).

@@ -1,0 +1,224 @@
+import SwiftUI
+import ABSKit
+
+/// The full-screen audiobook player — the emotional center of the app. Native and opaque
+/// throughout, with Liquid Glass confined to the ONE transport cluster (`TransportControls`:
+/// a single tinted `.glassProminent` play/pause plus `.glass` skips, in one `GlassEffectContainer`).
+///
+/// Layout (a `ZStack`):
+///   (a) an immersive backdrop — the cover art, scaled to fill and blurred into the safe area via
+///       `.backgroundExtensionEffect()` (mirror-blur), under a legibility scrim;
+///   (b) the opaque content column: large rounded artwork with a shadow, serif title + author,
+///       a chapter-aware `Slider` over `0...duration` with the current chapter title and
+///       elapsed / -remaining labels (monospaced), the glass transport row, and a "Chapters" button.
+///
+/// The scrubber works directly in GLOBAL book seconds (chapters are global; `PlaybackController`
+/// maps global↔track internally). Dragging seeks only on release (editing-ended) to avoid thrashing
+/// the player with a seek per drag tick.
+///
+/// Presentation is a Task-4 concern; for now the shell presents this over the mini-bar (a
+/// `fullScreenCover` on iOS, a sheet elsewhere) — a deliberate stopgap so the player is viewable
+/// and testable today.
+struct FullPlayerView: View {
+    @Environment(AppState.self) private var app
+    @Environment(\.dismiss) private var dismiss
+
+    /// Transient scrubber state — lives here on the view, not on the (stateless) `PlayerModel`.
+    /// While `scrubbing`, the slider shows `scrubTime` and the labels track it for feedback; the
+    /// actual `seek` fires once, on release.
+    @State private var scrubbing = false
+    @State private var scrubTime: Double = 0
+    @State private var showingChapters = false
+
+    var body: some View {
+        // `PlayerModel` holds no persistent state, so recreating it per body is correct — its
+        // property reads hit the observed `PlaybackController`/`AppState`, so the view still
+        // updates as playback ticks.
+        let model = PlayerModel(app: app)
+        // The time the UI should reflect right now: the drag target while scrubbing, else live.
+        let displayTime = scrubbing ? scrubTime : model.currentTime
+        let displayChapterTitle = PlayerModel.chapter(at: displayTime, in: model.chapters)?.title
+
+        ZStack {
+            backdrop
+            VStack(spacing: 0) {
+                dismissBar
+                Spacer(minLength: 8)
+                artwork(model: model)
+                    .padding(.horizontal, 32)
+                Spacer(minLength: 20)
+                titleBlock(model: model)
+                    .padding(.horizontal, 32)
+                Spacer(minLength: 20)
+                scrubber(model: model, displayTime: displayTime, chapterTitle: displayChapterTitle)
+                    .padding(.horizontal, 28)
+                Spacer(minLength: 22)
+                TransportControls(playback: model.playback)
+                    .controlSize(.large)
+                secondaryControls(model: model)
+                Spacer(minLength: 12)
+            }
+            .padding(.bottom, 16)
+        }
+        .sheet(isPresented: $showingChapters) {
+            ChapterListView()
+        }
+    }
+
+    // MARK: - Backdrop (immersive mirror-blur cover)
+
+    @ViewBuilder
+    private var backdrop: some View {
+        Group {
+            if let id = app.nowPlayingItemID {
+                CachedCoverView(itemID: id, updatedAt: nil)
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                Rectangle().fill(.quaternary)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .clipped()
+        .blur(radius: 60)
+        .backgroundExtensionEffect()
+        .overlay(scrim)
+        .ignoresSafeArea()
+    }
+
+    /// A dark, slightly graded scrim so the opaque foreground stays legible over any cover.
+    private var scrim: some View {
+        LinearGradient(
+            colors: [.black.opacity(0.35), .black.opacity(0.55)],
+            startPoint: .top, endPoint: .bottom)
+        .background(.ultraThinMaterial)
+    }
+
+    // MARK: - Dismiss bar
+
+    private var dismissBar: some View {
+        HStack {
+            Button { dismiss() } label: {
+                Image(systemName: "chevron.down")
+                    .font(.title3.weight(.semibold))
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .fontDesign(.default)
+            .accessibilityLabel("Close Player")
+            Spacer()
+        }
+        .padding(.horizontal, 16)
+        .padding(.top, 8)
+    }
+
+    // MARK: - Artwork (opaque)
+
+    @ViewBuilder
+    private func artwork(model: PlayerModel) -> some View {
+        Group {
+            if let id = app.nowPlayingItemID {
+                CachedCoverView(itemID: id, updatedAt: nil)
+                    .aspectRatio(1, contentMode: .fit)
+            } else {
+                RoundedRectangle(cornerRadius: 16).fill(.quaternary).aspectRatio(1, contentMode: .fit)
+            }
+        }
+        .frame(maxWidth: 340)
+        .clipShape(RoundedRectangle(cornerRadius: 16))
+        .shadow(color: .black.opacity(0.4), radius: 24, y: 12)
+    }
+
+    // MARK: - Title / author (opaque, serif via the app-wide fontDesign)
+
+    private func titleBlock(model: PlayerModel) -> some View {
+        VStack(spacing: 6) {
+            Text(model.title)
+                .font(.title2.weight(.semibold))
+                .multilineTextAlignment(.center)
+                .lineLimit(2)
+                .foregroundStyle(.white)
+            if !model.author.isEmpty {
+                Text(model.author)
+                    .font(.title3)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(1)
+                    .foregroundStyle(.white.opacity(0.75))
+            }
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    // MARK: - Chapter-aware scrubber (opaque)
+
+    private func scrubber(model: PlayerModel, displayTime: Double, chapterTitle: String?) -> some View {
+        VStack(spacing: 6) {
+            if let chapterTitle, !chapterTitle.isEmpty {
+                Text(chapterTitle)
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.white.opacity(0.85))
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity)
+            }
+            Slider(
+                value: Binding(
+                    get: { scrubbing ? scrubTime : model.currentTime },
+                    set: { scrubTime = $0 }
+                ),
+                in: 0...max(model.duration, 1),
+                onEditingChanged: { editing in
+                    if editing {
+                        // Seed the drag from the live position so there's no jump on grab.
+                        scrubTime = model.currentTime
+                        scrubbing = true
+                    } else {
+                        model.seek(toGlobal: scrubTime)
+                        scrubbing = false
+                    }
+                }
+            )
+            .tint(.white)
+            HStack {
+                Text(PlayerModel.timeString(displayTime))
+                Spacer()
+                Text("-" + PlayerModel.timeString(max(model.duration - displayTime, 0)))
+            }
+            .font(.caption)
+            .monospacedDigit()
+            .foregroundStyle(.white.opacity(0.75))
+            .fontDesign(.default)
+        }
+    }
+
+    // MARK: - Secondary controls (Chapters now; sleep/bookmark/speed/queue land in Tasks 5–8)
+
+    private func secondaryControls(model: PlayerModel) -> some View {
+        // Task 3 wires only the Chapters affordance. The sleep timer (T5), bookmarks (T6), speed
+        // (T7), and up-next queue (T8) share this secondary cluster — they'll join the same
+        // `GlassEffectContainer` as `.buttonStyle(.glass)` controls. Placeholder row below:
+        //
+        //   GlassEffectContainer(spacing: 16) {
+        //       HStack(spacing: 28) {
+        //           Button { … } label: { Image(systemName: "moon.zzz") }      // SleepTimer  (T5)
+        //           Button { … } label: { Image(systemName: "bookmark") }       // Bookmarks   (T6)
+        //           Button { … } label: { Image(systemName: "speedometer") }    // Speed       (T7)
+        //           Button { … } label: { Image(systemName: "list.bullet.indent") } // Queue   (T8)
+        //       }
+        //       .buttonStyle(.glass)
+        //   }
+        //
+        Button {
+            showingChapters = true
+        } label: {
+            Label("Chapters", systemImage: "list.bullet")
+                .font(.subheadline.weight(.medium))
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.white.opacity(0.85))
+        .fontDesign(.default)
+        .padding(.top, 20)
+        .disabled(model.chapters.isEmpty)
+        .opacity(model.chapters.isEmpty ? 0 : 1)
+        .accessibilityLabel("Show Chapters")
+    }
+}

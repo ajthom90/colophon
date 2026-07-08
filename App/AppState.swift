@@ -148,6 +148,12 @@ final class AppState {
     /// `playingConnectionID` when `startPlayback` succeeds and cleared when the session is retired.
     /// Read-only to the UI (private setter).
     private(set) var nowPlayingItemID: String?
+    /// The currently-playing book's chapters (GLOBAL book seconds, `{id,start,end,title}`), taken
+    /// straight from the /play envelope's `session.chapters`. This is the ONLY surface the full
+    /// player (`PlayerModel`/`FullPlayerView`/`ChapterListView`) reads chapters from — the mini-bar
+    /// and transport don't need them. Set alongside `nowPlayingItemID` when `startPlayback`
+    /// succeeds and cleared (to `[]`) when the session is retired. Read-only to the UI.
+    private(set) var nowPlayingChapters: [Chapter] = []
     /// Last library ID `refreshItems` was asked to page — recorded so a future first-run/
     /// offline flow (M1b) can resume browsing the last-viewed library without a live server.
     private(set) var activeLibraryID: String?
@@ -962,6 +968,7 @@ final class AppState {
         sessionHandle = nil
         playingConnectionID = nil
         nowPlayingItemID = nil
+        nowPlayingChapters = []
     }
 
     func startPlayback(itemID: String) async {
@@ -987,6 +994,9 @@ final class AppState {
             // holds its own client, captured above — independent of `self.client`).
             playingConnectionID = owner
             nowPlayingItemID = itemID
+            // Surface this book's chapters (global seconds) to the full player. Cleared in
+            // `retireCurrentSession`; the mini-bar/transport don't consume these.
+            nowPlayingChapters = envelope.session.chapters
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }

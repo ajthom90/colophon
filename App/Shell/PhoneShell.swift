@@ -58,7 +58,23 @@ struct PhoneShell: View {
             }
         }
         .phoneTabChrome { MiniPlayerBar { showingFullPlayer = true } }
-        .sheet(isPresented: $showingFullPlayer) { FullPlayerSheet() }
+        .fullPlayerPresentation(isPresented: $showingFullPlayer)
+    }
+}
+
+private extension View {
+    /// Task-3 stopgap presentation of `FullPlayerView` over the tab shell: an iOS `fullScreenCover`
+    /// (edge-to-edge, so the immersive `backgroundExtensionEffect` backdrop reaches the safe area),
+    /// falling back to a `sheet` on the macOS target (where `fullScreenCover` is unavailable and
+    /// `PhoneShell` is never actually shown — `RootShell` routes the Mac to `SplitShell`). The real
+    /// per-platform presentation (iPad sheet/inspector, Mac Window) is Task 4.
+    @ViewBuilder
+    func fullPlayerPresentation(isPresented: Binding<Bool>) -> some View {
+        #if os(iOS)
+        self.fullScreenCover(isPresented: isPresented) { FullPlayerView() }
+        #else
+        self.sheet(isPresented: isPresented) { FullPlayerView() }
+        #endif
     }
 }
 
