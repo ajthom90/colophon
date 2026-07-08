@@ -108,7 +108,7 @@ import ABSKitTestSupport
         #expect(json?["title"] as? String == "Renamed")
     }
 
-    @Test func deleteBookmarkSendsTimeInPathNotBody() async throws {
+    @Test func deleteBookmarkSendsWholeTimeInPathWithoutTrailingZero() async throws {
         let (client, transport, _) = try await makeSUT()
         await transport.enqueue(status: 200, json: "{}")
         try await client.deleteBookmark(itemID: "li_1", time: 142)
@@ -117,5 +117,28 @@ import ABSKitTestSupport
         #expect(req?.httpMethod == "DELETE")
         #expect(req?.url?.absoluteString == "http://abs.test:13378/api/me/item/li_1/bookmark/142")
         #expect(req?.httpBody == nil)
+    }
+
+    /// Regression guard for the Int-truncation bug: a fractional `time` MUST keep its decimal in
+    /// the DELETE path (`/bookmark/55.7`, not `/bookmark/55`) — the server 404s on a truncated
+    /// key (verified live in `ContractTests.bookmarkFractionalTimeRoundTripsLive`).
+    @Test func deleteBookmarkKeepsFractionalTimeInPath() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: "{}")
+        try await client.deleteBookmark(itemID: "li_1", time: 55.7)
+
+        let req = await transport.recorded.first
+        #expect(req?.url?.absoluteString == "http://abs.test:13378/api/me/item/li_1/bookmark/55.7")
+    }
+
+    @Test func createBookmarkSendsFractionalTimeInBody() async throws {
+        let (client, transport, _) = try await makeSUT()
+        await transport.enqueue(status: 200, json: #"{"libraryItemId":"li_1","time":55.7,"title":"Ch. 3","createdAt":1700000000000}"#)
+        let bookmark = try await client.createBookmark(itemID: "li_1", time: 55.7, title: "Ch. 3")
+        #expect(bookmark.time == 55.7)
+
+        let body = try #require(await transport.recorded.first?.httpBody)
+        let json = try JSONSerialization.jsonObject(with: body) as? [String: Any]
+        #expect(json?["time"] as? Double == 55.7)
     }
 }

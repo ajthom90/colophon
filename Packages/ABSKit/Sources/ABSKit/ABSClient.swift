@@ -249,31 +249,50 @@ extension ABSClient {
         baseURL.appending(path: "public/session/\(sessionID)/track/\(trackIndex)")
     }
 
-    /// `POST /api/me/item/:id/bookmark` `{time,title}` — creates a bookmark at `time` (whole
-    /// seconds) with `title`; returns the created `Bookmark` (verified live this session, incl.
-    /// `Tests/ABSKitTests/Fixtures/bookmark.json`, a real captured-then-deleted server response).
-    public func createBookmark(itemID: String, time: Int, title: String) async throws -> Bookmark {
+    /// `POST /api/me/item/:id/bookmark` `{time,title}` — creates a bookmark at `time` (fractional
+    /// SECONDS — playback positions are fractional) with `title`; returns the created `Bookmark`
+    /// (verified live this session, incl. `Tests/ABSKitTests/Fixtures/bookmark.json`, a real
+    /// captured-then-deleted server response). `time` is a `Double` so a bookmark created at the
+    /// exact current position round-trips: the server keys bookmarks by `time`, and truncating a
+    /// fractional value to an Int makes the matching PATCH/DELETE 404 (see `updateBookmark`/
+    /// `deleteBookmark`).
+    public func createBookmark(itemID: String, time: Double, title: String) async throws -> Bookmark {
         try await sendBookmarkMutation(method: "POST", itemID: itemID, time: time, title: title)
     }
 
     /// `PATCH /api/me/item/:id/bookmark` `{time,title}` — the server matches the bookmark to
     /// rename by its `time` value (there is no separate id — verified live); returns the updated
-    /// `Bookmark`.
-    public func updateBookmark(itemID: String, time: Int, title: String) async throws -> Bookmark {
+    /// `Bookmark`. `time` must be the EXACT value the bookmark was created at: PATCH `{time:55}`
+    /// against a bookmark stored at `55.7` 404s (verified live) — pass the fractional value.
+    public func updateBookmark(itemID: String, time: Double, title: String) async throws -> Bookmark {
         try await sendBookmarkMutation(method: "PATCH", itemID: itemID, time: time, title: title)
     }
 
     /// `DELETE /api/me/item/:id/bookmark/:time` — unlike create/update, `time` is part of the
-    /// PATH here, not a JSON body (verified live). 200 with no body worth decoding.
-    public func deleteBookmark(itemID: String, time: Int) async throws {
-        var req = URLRequest(url: baseURL.appending(path: "api/me/item/\(itemID)/bookmark/\(time)"))
+    /// PATH here, not a JSON body (verified live). The path segment must NUMERICALLY equal the
+    /// stored `time`: `DELETE /bookmark/55` against a bookmark stored at `55.7` 404s (Int
+    /// truncation — verified live), while the exact `/bookmark/55.7` succeeds. A whole-second
+    /// bookmark accepts either `/bookmark/55` or `/bookmark/55.0` (also verified) — this renders
+    /// whole values without a trailing `.0` (`bookmarkTimePathValue`) purely for clean URLs.
+    /// 200 with no body worth decoding.
+    public func deleteBookmark(itemID: String, time: Double) async throws {
+        let segment = Self.bookmarkTimePathValue(time)
+        var req = URLRequest(url: baseURL.appending(path: "api/me/item/\(itemID)/bookmark/\(segment)"))
         req.httpMethod = "DELETE"
         _ = try await authorizedData(req)
     }
 
-    private struct BookmarkRequest: Encodable { let time: Int; let title: String }
+    /// Renders a bookmark `time` for the DELETE path segment: whole seconds without a trailing
+    /// `.0` ("55"), fractional seconds faithfully ("55.7"). Both forms match the server's stored
+    /// value numerically; this keeps whole-second URLs clean while never truncating a fractional
+    /// bookmark to the wrong key.
+    static func bookmarkTimePathValue(_ time: Double) -> String {
+        time == time.rounded() ? String(Int(time)) : String(time)
+    }
 
-    private func sendBookmarkMutation(method: String, itemID: String, time: Int, title: String) async throws -> Bookmark {
+    private struct BookmarkRequest: Encodable { let time: Double; let title: String }
+
+    private func sendBookmarkMutation(method: String, itemID: String, time: Double, title: String) async throws -> Bookmark {
         var req = URLRequest(url: baseURL.appending(path: "api/me/item/\(itemID)/bookmark"))
         req.httpMethod = method
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")

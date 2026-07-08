@@ -132,4 +132,31 @@ struct ContractTests {
         let meAfterDelete = try await client.me()
         #expect(meAfterDelete.bookmarks?.contains { $0.libraryItemId == itemID && $0.time == 77 } != true)
     }
+
+    /// Locks the Fix-round-2 truncation fix: a bookmark created at a FRACTIONAL time (like a real
+    /// playback position) must be PATCH-able and DELETE-able at that exact value. Before the fix,
+    /// the `time: Int` write methods truncated `55.7`→`55`, so PATCH `{time:55}` and
+    /// `DELETE /bookmark/55` both 404'd against the `55.7` bookmark (verified live). Leaves the
+    /// dev seed clean.
+    @Test func bookmarkFractionalTimeRoundTripsLive() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let page = try await client.items(libraryID: libs[0].id, limit: 1, page: 0)
+        let itemID = page.results[0].id
+
+        let created = try await client.createBookmark(itemID: itemID, time: 55.7, title: "Fractional")
+        #expect(created.time == 55.7)
+
+        let updated = try await client.updateBookmark(itemID: itemID, time: 55.7, title: "Fractional renamed")
+        #expect(updated.time == 55.7)
+        #expect(updated.title == "Fractional renamed")
+
+        let meBeforeDelete = try await client.me()
+        #expect(meBeforeDelete.bookmarks?.contains { $0.libraryItemId == itemID && $0.time == 55.7 } == true)
+
+        try await client.deleteBookmark(itemID: itemID, time: 55.7)
+
+        let meAfterDelete = try await client.me()
+        #expect(meAfterDelete.bookmarks?.contains { $0.libraryItemId == itemID && $0.time == 55.7 } != true)
+    }
 }
