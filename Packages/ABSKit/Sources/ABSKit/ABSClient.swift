@@ -57,14 +57,16 @@ public final class ABSClient: Sendable {
         return try await authorizedSend(URLRequest(url: comps.url!), as: ItemsPage.self)
     }
 
-    /// Fetches one item's expanded detail (`?expanded=1` — full metadata incl. the
-    /// server-computed `authorName`, and, once modeled, chapters). Used by `AppState`'s
-    /// per-item socket patch (`apply(.itemChanged)`/`apply(.itemsChanged)`, Task 3) in place of
-    /// a coarse full-library re-page, and by M1c-b's item-detail view.
+    /// Fetches one item's expanded detail (`?expanded=1&include=progress` — full metadata incl.
+    /// the server-computed `authorName`/`narratorName`/`seriesName`, chapters, and the caller's
+    /// `userMediaProgress`). Used by `AppState`'s per-item socket patch (`apply(.itemChanged)`/
+    /// `apply(.itemsChanged)`, Task 3) in place of a coarse full-library re-page, and by M1c-b's
+    /// `ItemDetailView`. `include=progress` is harmless to the socket-patch path (it only reads
+    /// id/library/title/author/duration) and load-bearing for the detail view's Resume state.
     public func item(id: String) async throws -> LibraryItemDetail {
         var comps = URLComponents(url: baseURL.appending(path: "api/items/\(id)"),
                                   resolvingAgainstBaseURL: false)!
-        comps.queryItems = [.init(name: "expanded", value: "1")]
+        comps.queryItems = [.init(name: "expanded", value: "1"), .init(name: "include", value: "progress")]
         return try await authorizedSend(URLRequest(url: comps.url!), as: LibraryItemDetail.self)
     }
 

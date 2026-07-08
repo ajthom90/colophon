@@ -10,11 +10,10 @@ import LibraryCache
 /// duration for the fraction is a caller-supplied duration source (progress rows store
 /// `currentTime`, not duration): a shelf card passes the shelf entity's `media.duration`, and the
 /// LIBRARY GRID passes `CachedItem.duration` (always present on the grid row) — the Task 7-review
-/// fix so grid pills render, since the shelf-entity duration isn't available there. Tapping starts
-/// playback of the item (so the shelf/grid is functional and the mini-bar/transport lights up);
-/// item detail is M1c-b.
+/// fix so grid pills render, since the shelf-entity duration isn't available there. Tapping pushes
+/// `ItemDetailView` (via `ItemDetailRoute` — the Play/Resume action lives in the detail); the
+/// destination is registered at each browse stack's stable root (`.itemDetailDestination()`).
 struct CoverCard: View {
-    @Environment(AppState.self) private var app
     let itemID: String
     let updatedAt: Int?
     let title: String
@@ -38,9 +37,9 @@ struct CoverCard: View {
     }
 
     var body: some View {
-        Button {
-            Task { await app.startPlayback(itemID: itemID) }
-        } label: {
+        NavigationLink(value: ItemDetailRoute(
+            itemID: itemID, title: title, author: author, updatedAt: updatedAt, duration: duration)
+        ) {
             VStack(alignment: .leading, spacing: 6) {
                 CachedCoverView(itemID: itemID, updatedAt: updatedAt)
                     .frame(width: Self.width, height: Self.width)

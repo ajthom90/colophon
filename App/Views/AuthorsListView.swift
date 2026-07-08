@@ -122,8 +122,8 @@ private struct AuthorRow: View {
 /// their books (`GET /api/authors/:id?include=items` → `libraryItems`), reusing `ItemsCoverGrid`.
 /// The list-row's `AuthorSummary` seeds the header instantly (name/avatar/count show before the
 /// network round trip resolves) — only the description and the exact book list wait on `load()`.
-/// Tapping a book plays it directly (consistent with Home/Library), same as `CoverCard` everywhere
-/// else; item detail is M1c-b.
+/// Tapping a book pushes `ItemDetailView` (via `CoverCard` → `ItemDetailRoute`), same as everywhere
+/// else; the destination is registered at the enclosing stack's root.
 struct AuthorDetailView: View {
     @Environment(AppState.self) private var app
     let library: CachedLibrary

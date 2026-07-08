@@ -89,11 +89,12 @@ struct SplitShell: View {
     @ViewBuilder
     private var detailColumn: some View {
         // Each case owns its own `NavigationStack` so the detail column shows a title bar and
-        // resets cleanly on selection change. `LibraryGridView` plays a tapped book directly (no
-        // push), so no `navigationDestination` is needed there. The sidebar already lists every
-        // library, so the grid is given no in-tab picker (`siblings` defaults empty).
+        // resets cleanly on selection change. A `CoverCard` tap pushes `ItemDetailView` via
+        // `ItemDetailRoute`, so every stack that hosts cards registers `.itemDetailDestination()`
+        // at its literal, unconditional root (Search/Home self-register it). The sidebar already
+        // lists every library, so the grid is given no in-tab picker (`siblings` defaults empty).
         //
-        // `.series`/`.authors` register their push destination HERE, at the `NavigationStack`'s
+        // `.series`/`.authors` register their push destinations HERE, at the `NavigationStack`'s
         // literal, unconditional root — not inside `SeriesListView`/`AuthorsListView` themselves
         // (see those views' doc comments: a destination self-registered on a view that some OTHER
         // caller mounts conditionally, as `PhoneShell` does, resets that caller's state on pop).
@@ -104,12 +105,15 @@ struct SplitShell: View {
             NavigationStack { SearchView() }
         case .library(let library):
             NavigationStack { LibraryGridView(library: library) }
+                .itemDetailDestination()
         case .series(let library):
             NavigationStack { SeriesListView(library: library) }
                 .navigationDestination(for: SeriesSummary.self) { SeriesDetailView(library: library, series: $0) }
+                .itemDetailDestination()
         case .authors(let library):
             NavigationStack { AuthorsListView(library: library) }
                 .navigationDestination(for: AuthorSummary.self) { AuthorDetailView(library: library, author: $0) }
+                .itemDetailDestination()
         case .home, .none:
             NavigationStack { HomeView() }
         }

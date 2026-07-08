@@ -1,0 +1,96 @@
+{
+  "id": "77226f9e-ad94-4b26-bf8a-bf841965ca23",
+  "libraryId": "51724195-018f-4681-8c35-ae1575350473",
+  "updatedAt": 1783443751732,
+  "mediaType": "book",
+  "media": {
+    "id": "2e574e27-4b6e-4c32-bc89-299c3151928d",
+    "libraryItemId": "77226f9e-ad94-4b26-bf8a-bf841965ca23",
+    "coverPath": "/audiobooks/Sun Tzu/The Art of War/cover.jpg",
+    "duration": 4337.264399,
+    "metadata": {
+      "title": "The Art of War",
+      "subtitle": "A Strategic Classic",
+      "authors": [
+        {
+          "id": "d281b085-01a3-4472-a21c-60b272190ecb",
+          "name": "Sun Tzu"
+        }
+      ],
+      "narrators": [],
+      "series": [
+        {
+          "id": "ser_1",
+          "name": "Military Classics",
+          "sequence": "1"
+        }
+      ],
+      "genres": [
+        "History",
+        "Philosophy"
+      ],
+      "publishedYear": "2003",
+      "publishedDate": "2003-05-01",
+      "publisher": "Test Press",
+      "description": "The oldest military treatise in the world.",
+      "isbn": "9780000000001",
+      "asin": "B000TEST01",
+      "language": "English",
+      "explicit": false,
+      "abridged": false,
+      "authorName": "Sun Tzu",
+      "narratorName": "Jane Reader",
+      "seriesName": "Military Classics #1"
+    },
+    "chapters": [
+      {
+        "id": 0,
+        "start": 0,
+        "end": 506.775147,
+        "title": "1 Laying Plans - 2 Waging War"
+      },
+      {
+        "id": 1,
+        "start": 506.775147,
+        "end": 972.12009,
+        "title": "3 Attack By Stratagem - 4 Tactical Dispositions"
+      },
+      {
+        "id": 2,
+        "start": 972.12009,
+        "end": 1608.776054,
+        "title": "5 Energy - 6 Weak Points and Strong"
+      },
+      {
+        "id": 3,
+        "start": 1608.776054,
+        "end": 2139.453242,
+        "title": "7 Maneuvering - 8 Variation in Tactics"
+      },
+      {
+        "id": 4,
+        "start": 2139.453242,
+        "end": 3021.764716,
+        "title": "9 The Army on the March - 10 Terrain"
+      },
+      {
+        "id": 5,
+        "start": 3021.764716,
+        "end": 3798.280272,
+        "title": "11 The Nine Situations"
+      },
+      {
+        "id": 6,
+        "start": 3798.280272,
+        "end": 4337.264399,
+        "title": "12 The Attack By Fire - 13 The Use of Spies"
+      }
+    ]
+  },
+  "userMediaProgress": {
+    "currentTime": 30,
+    "progress": 0.006916802214528772,
+    "duration": 4337.264399,
+    "isFinished": false
+  }
+}

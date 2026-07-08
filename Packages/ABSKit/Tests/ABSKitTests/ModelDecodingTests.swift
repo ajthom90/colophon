@@ -176,6 +176,32 @@ private func fixture(_ name: String) throws -> Data {
         #expect(b.id == "77226f9e-ad94-4b26-bf8a-bf841965ca23#142.0")
     }
 
+    /// `Tests/ABSKitTests/Fixtures/item_detail.json` mirrors a live `GET /api/items/:id?expanded=1
+    /// &include=progress` capture (ABS 2.35.1) — the real item/library IDs, `media.duration`, all 7
+    /// chapters (GLOBAL seconds) and `userMediaProgress` are exactly as captured; the sparse seed
+    /// book's null metadata fields (subtitle/series/genres/publisher/isbn/asin/narrator) are filled
+    /// with representative values so this decode exercises the full expanded DTO, incl. the
+    /// per-series `sequence` the flattened `seriesName` string drops.
+    @Test func decodesExpandedItemDetailFixture() throws {
+        let d = try decoder.decode(LibraryItemDetail.self, from: fixture("item_detail"))
+        #expect(d.id == "77226f9e-ad94-4b26-bf8a-bf841965ca23")
+        #expect(d.libraryId == "51724195-018f-4681-8c35-ae1575350473")
+        #expect(d.media.duration == 4337.264399)
+        #expect(d.media.metadata.title == "The Art of War")
+        #expect(d.media.metadata.authorName == "Sun Tzu")
+        #expect(d.media.metadata.narratorName == "Jane Reader")
+        #expect(d.media.metadata.genres == ["History", "Philosophy"])
+        #expect(d.media.metadata.publisher == "Test Press")
+        #expect(d.media.metadata.isbn == "9780000000001")
+        #expect(d.media.metadata.series?.first?.name == "Military Classics")
+        #expect(d.media.metadata.series?.first?.sequence == "1")
+        #expect(d.media.chapters?.count == 7)
+        #expect(d.media.chapters?.first?.start == 0)
+        #expect(d.media.chapters?.first?.title == "1 Laying Plans - 2 Waging War")
+        #expect(d.userMediaProgress?.currentTime == 30)
+        #expect(d.userMediaProgress?.isFinished == false)
+    }
+
     @Test func deviceInfoEncodesWithDefaults() throws {
         let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
         let data = try JSONEncoder().encode(device)

@@ -124,6 +124,11 @@ private struct LibraryTabContent: View {
         .navigationDestination(for: AuthorSummary.self) { author in
             if let library = selected { AuthorDetailView(library: library, author: author) }
         }
+        // Same stable-root rationale as the Series/Authors destinations above: registered here on
+        // the Library stack's root so a `CoverCard` tap in the Grid, an author's book grid, or a
+        // series' book grid all resolve `ItemDetailRoute` (they're reached through the mode switch,
+        // so they must not self-register).
+        .itemDetailDestination()
         .task(id: app.activeConnectionID) {
             let connectionID = app.activeConnectionID
             // Only reset the browse state for a GENUINELY new connection — not on every

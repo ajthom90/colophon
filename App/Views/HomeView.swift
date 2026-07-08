@@ -29,6 +29,10 @@ struct HomeView: View {
     var body: some View {
         content
             .navigationTitle("Home")
+            // Registered on HomeView because it's the unconditional root of both shells' Home
+            // NavigationStack (PhoneShell's Home tab, SplitShell's `.home` detail) — a stable
+            // self-registration point, unlike the browse views reached through a mode switch.
+            .itemDetailDestination()
             .task(id: app.activeConnectionID) { await observeLibraries() }
             .task(id: app.activeConnectionID) { await observeProgress() }
             // Reload shelves whenever the active library appears/changes.
