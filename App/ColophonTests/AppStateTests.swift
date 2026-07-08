@@ -344,6 +344,95 @@ struct AppStateTests {
         #expect(podcastPaths.contains { $0.contains("/items/pod1") })
     }
 
+    // A minimal episode `/play/:episodeId` envelope (same shape as a book /play). `displayAuthor`
+    // is the podcast's AUTHOR field ("Colophon Dev"), distinct from the podcast TITLE the caller
+    // supplies as the now-playing author — so the override is observable.
+    private let episodePlayJSON = #"""
+    {"id":"epsess1","libraryItemId":"pod1","episodeId":"ep1",
+     "displayTitle":"Episode One: Laying Plans","displayAuthor":"Colophon Dev",
+     "duration":465.4,"startTime":0,"currentTime":0,"playMethod":0,"chapters":[],
+     "audioTracks":[{"index":1,"startOffset":0,"duration":465.4,"title":"e1.mp3",
+                     "contentUrl":"/api/items/pod1/file/1","mimeType":"audio/mpeg"}]}
+    """#
+
+    private let bookPlayJSON = #"""
+    {"id":"bksess1","libraryItemId":"book1","episodeId":null,
+     "displayTitle":"A Book","displayAuthor":"An Author",
+     "duration":100,"startTime":0,"currentTime":0,"playMethod":0,"chapters":[],
+     "audioTracks":[{"index":1,"startOffset":0,"duration":100,"title":"t.mp3",
+                     "contentUrl":"/api/items/book1/file/1","mimeType":"audio/mpeg"}]}
+    """#
+
+    /// M1c-c Task 5: `startPlayback(itemID:episodeId:)` opens the EPISODE session — it POSTs to the
+    /// episode-scoped `/api/items/:id/play/:episodeId` (via `client.playEpisode`), NOT the book
+    /// `/api/items/:id/play` — sets `nowPlayingEpisodeID`, and surfaces the episode title with the
+    /// PODCAST TITLE as the now-playing author (the show-name-as-secondary override). Reuses the
+    /// exact book session/guard wiring (no forked path).
+    @Test func episodePlaybackOpensEpisodeSessionAndTracksEpisode() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+        await transport.enqueue(status: 200, json: episodePlayJSON)
+
+        await app.startPlayback(itemID: "pod1", episodeId: "ep1", podcastTitle: "Colophon Test Podcast")
+
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        // The episode-scoped path was hit — and the book /play was NOT.
+        #expect(paths.contains { $0.hasSuffix("/items/pod1/play/ep1") })
+        #expect(!paths.contains { $0.hasSuffix("/items/pod1/play") })
+        #expect(app.nowPlayingItemID == "pod1")
+        #expect(app.nowPlayingEpisodeID == "ep1")
+        // Episode title primary; podcast TITLE (not the session's "Colophon Dev" author) secondary.
+        #expect(app.playback.title == "Episode One: Laying Plans")
+        #expect(app.playback.author == "Colophon Test Podcast")
+    }
+
+    /// The book path is unchanged by the episode extension: no `episodeId` → book `startPlayback`
+    /// (`/api/items/:id/play`), `nowPlayingEpisodeID` stays nil, and the author is the session's own
+    /// `displayAuthor` (no override).
+    @Test func bookPlaybackLeavesEpisodeIDNilAndUsesSessionAuthor() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        await transport.enqueue(status: 200, json: bookPlayJSON)
+
+        await app.startPlayback(itemID: "book1")
+
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.hasSuffix("/items/book1/play") })
+        #expect(app.nowPlayingItemID == "book1")
+        #expect(app.nowPlayingEpisodeID == nil)
+        #expect(app.playback.author == "An Author")
+    }
+
+    /// A queued EPISODE (its `QueueEntry.episodeId` set) advances through the episode path:
+    /// `advanceToNext` opens `/play/:episodeId`, sets `nowPlayingEpisodeID`, and passes the entry's
+    /// `author` (the podcast title) through as the now-playing author — then commits (drops) the entry.
+    @Test func advanceToQueuedEpisodePlaysViaEpisodePath() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        app.addToQueue(itemID: "pod1", title: "Episode One: Laying Plans",
+                       author: "Colophon Test Podcast", episodeId: "ep1")
+        #expect(app.queue.isEmpty == false)
+        await transport.enqueue(status: 200, json: episodePlayJSON)
+
+        await app.advanceToNext()
+
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.hasSuffix("/items/pod1/play/ep1") })
+        #expect(app.nowPlayingEpisodeID == "ep1")
+        #expect(app.playback.author == "Colophon Test Podcast")
+        #expect(app.queue.isEmpty)   // committed after a successful start
+    }
+
     /// The banner is tagged with the library that actually failed: fail library B's refresh and
     /// the banner's `libraryID` is B — a `LibraryItemsView` for library A (which matches on
     /// `banner.libraryID == library.id`) would not show it.

@@ -163,7 +163,8 @@ struct PodcastDetailView: View {
         EpisodeRow(
             episode: episode,
             progress: progressByEpisode[episode.episodeID],
-            onPlay: { startEpisodePlayback(episode) })
+            onPlay: { startEpisodePlayback(episode) },
+            onAddToQueue: { addEpisodeToQueue(episode) })
     }
 
     /// The loading / empty / error state, shown in place of the episode sections when there are no
@@ -211,17 +212,23 @@ struct PodcastDetailView: View {
         }
     }
 
-    // MARK: - Episode playback call site (M1c-c Task 5)
+    // MARK: - Episode playback + queue call sites (M1c-c Task 5)
 
-    /// THE single episode-play entry point — the row tap and both context-menu actions funnel here.
-    ///
-    /// ⚠️ M1c-c Task 5 points this at the shared player via `AppState.startPlayback` extended for an
-    /// `episodeId:` path (see the plan's Task 5). Until then it is intentionally INERT — it does NOT
-    /// fake playback (no partial/silent audio path); it only records the intended episode so the
-    /// wiring point is unambiguous. Do NOT add a parallel playback path elsewhere; extend this one.
+    /// THE episode-play entry point — the row tap and the context-menu "Play" funnel here. Routes to
+    /// the SHARED player via `AppState.startPlayback` extended for an `episodeId:` path (which POSTs
+    /// to `client.playEpisode` and reuses the same session/sync/guard wiring as a book). The podcast
+    /// title rides along as the now-playing author (the native show-name-as-secondary line).
     private func startEpisodePlayback(_ episode: CachedEpisode) {
-        // TODO(M1c-c Task 5): await app.startPlayback(itemID: route.itemID, episodeId: episode.episodeID)
-        NSLog("[Colophon] Episode playback pending (Task 5): item=%@ episode=%@", route.itemID, episode.episodeID)
+        Task { await app.startPlayback(itemID: route.itemID, episodeId: episode.episodeID, podcastTitle: displayTitle) }
+    }
+
+    /// The "Add to Queue" context action — enqueues THIS episode (episode title + podcast title) so
+    /// `AppState.advanceToNext` later plays it through the episode path.
+    private func addEpisodeToQueue(_ episode: CachedEpisode) {
+        app.addToQueue(itemID: route.itemID,
+                       title: episode.title ?? "Untitled Episode",
+                       author: displayTitle,
+                       episodeId: episode.episodeID)
     }
 
     // MARK: - Derived display values

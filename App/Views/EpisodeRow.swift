@@ -8,15 +8,18 @@ import LibraryCache
 /// checkmark instead of the play glyph.
 ///
 /// The WHOLE row is the play tap target (a plain-styled `Button`); a context menu offers
-/// Play / Add to Queue. Every play path funnels through the caller's single `onPlay` hook — the one
-/// call site `PodcastDetailView` leaves for M1c-c Task 5 to point at real episode playback. This row
-/// deliberately does NOT start playback itself (no forked playback path).
+/// Play / Add to Queue. The two actions are DISTINCT hooks (M1c-c Task 5): the row tap and the
+/// context-menu "Play" invoke `onPlay` (real episode playback via the shared player); "Add to Queue"
+/// invokes `onAddToQueue` (enqueues the episode into the up-next queue). This row deliberately does
+/// NOT start playback or mutate the queue itself (no forked playback path) — it only calls back.
 struct EpisodeRow: View {
     let episode: CachedEpisode
     /// The per-episode progress for THIS episode (nil = untouched), joined from `cachedProgress`.
     let progress: CachedProgress?
-    /// THE single play call site — invoked by the row tap and both context-menu actions.
+    /// Play THIS episode now — invoked by the row tap and the context-menu "Play".
     let onPlay: () -> Void
+    /// Enqueue THIS episode into the up-next queue — invoked by the context-menu "Add to Queue".
+    let onAddToQueue: () -> Void
 
     private var isFinished: Bool { progress?.isFinished ?? false }
 
@@ -67,7 +70,7 @@ struct EpisodeRow: View {
         .buttonStyle(.plain)
         .contextMenu {
             Button(action: onPlay) { Label("Play", systemImage: "play.fill") }
-            Button(action: onPlay) { Label("Add to Queue", systemImage: "text.append") }
+            Button(action: onAddToQueue) { Label("Add to Queue", systemImage: "text.append") }
         }
         .accessibilityElement(children: .combine)
         .accessibilityAddTraits(.isButton)

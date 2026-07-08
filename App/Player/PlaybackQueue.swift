@@ -16,13 +16,21 @@ struct QueueEntry: Identifiable, Equatable, Hashable, Sendable {
     let connectionID: String
     let title: String
     let author: String?
+    /// The podcast episode this entry plays, or `nil` for a book. When set, `AppState.advanceToNext`
+    /// opens it through the episode path (`startPlayback(itemID:episodeId:)` → `client.playEpisode`)
+    /// rather than the book path — the ONE field that makes an entry episode-scoped. For an episode
+    /// entry, `title` is the EPISODE title and `author` is the PODCAST title (the show name), so the
+    /// queue list renders it natively and `advanceToNext` can pass the podcast title straight through.
+    let episodeId: String?
 
-    init(id: UUID = UUID(), itemID: String, connectionID: String, title: String, author: String?) {
+    init(id: UUID = UUID(), itemID: String, connectionID: String, title: String,
+         author: String?, episodeId: String? = nil) {
         self.id = id
         self.itemID = itemID
         self.connectionID = connectionID
         self.title = title
         self.author = author
+        self.episodeId = episodeId
     }
 
     /// The item whose cover art represents this entry (covers are keyed by item id).
