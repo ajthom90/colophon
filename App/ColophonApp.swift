@@ -24,8 +24,8 @@ struct ColophonApp: App {
     @Environment(\.scenePhase) private var scenePhase
     /// Single source of truth for typography (Global Constraints: `colophon.typeface`, "serif"
     /// default | "sans"). Applied outermost in the `WindowGroup` content's modifier chain, so it
-    /// reaches every view in the tree — including content injected by later modifiers like
-    /// `PlayerBarView`'s `safeAreaInset` — AND again on the macOS `Settings` scene below, since a
+    /// reaches every view in the tree — including content injected by later modifiers like the
+    /// shell's `TransportBar` `safeAreaInset` — AND again on the macOS `Settings` scene below, since a
     /// `Settings` scene does not inherit modifiers from the `WindowGroup` scene. Per-view
     /// `.fontDesign(.serif)` modifiers were removed everywhere else in `App/Views/*`; do not
     /// reintroduce them.
@@ -40,17 +40,22 @@ struct ColophonApp: App {
     var body: some Scene {
         WindowGroup {
             Group {
-                // Boot flow: any stored connection → the `ConnectionsView` hub (which auto-resumes
-                // the last-active one, cached-first, even with the server down); otherwise the
-                // first-run `ConnectView`. `ConnectionsView` owns its own `NavigationStack` and
-                // pushes `LibrariesView` on activation.
+                // Boot flow (unchanged): any stored connection → the `ConnectionsView` hub (which
+                // auto-resumes the last-active one, cached-first, even with the server down);
+                // otherwise the first-run `ConnectView`. Once a connection is active
+                // (`phase == .connected`), the connected-phase content becomes the per-platform
+                // `RootShell` — the native Liquid Glass navigation shell, which owns its own
+                // now-playing transport (so the legacy global `PlayerBarView` inset is gone). The
+                // shell exposes Connections/Settings via its account menu, and `ConnectionsView`
+                // stays the not-yet-connected hub.
                 if app.connections.isEmpty {
                     NavigationStack { ConnectView() }
+                } else if app.phase == .connected {
+                    RootShell()
                 } else {
                     ConnectionsView()
                 }
             }
-            .safeAreaInset(edge: .bottom) { PlayerBarView() }
             .alert("Something went wrong", isPresented: Binding(
                 get: { app.errorMessage != nil },
                 set: { if !$0 { app.errorMessage = nil } })
@@ -67,13 +72,29 @@ struct ColophonApp: App {
                 #endif
             }
             .onChange(of: scenePhase) { _, phase in
-                if phase == .background { app.flushForBackground() }
+                if phase == .background {
+                    app.flushForBackground()
+                } else if phase == .active, app.activeConnectionID != nil {
+                    // Backgrounding a live connection for a while (podcast switch, phone lock,
+                    // Mac App Switcher) and coming back must not leave Home's progress pill
+                    // showing a stale percentage until the user happens to pull-to-refresh —
+                    // this is the same `me()` join HomeView runs on appear, just re-armed on
+                    // foreground. Guarded on `activeConnectionID` so it's a no-op at first
+                    // launch (no connection yet) and while disconnected/switching; cheap single
+                    // request, no full shelves refetch.
+                    Task { await app.refreshProgress() }
+                }
             }
             #if DEBUG && os(macOS)
             .background(PerfSpikeAutoOpener())
             #endif
             .fontDesign(typeface == "serif" ? .serif : .default)
         }
+        #if os(macOS)
+        // Mac keyboard transport: Space play/pause, ⌘←/⌘→ skip, speed submenu — wired to the same
+        // `PlaybackController` the shell's `TransportBar` drives. Guarded on an active session.
+        .commands { PlaybackCommands(app: app) }
+        #endif
         #if DEBUG && os(macOS)
         Window("Perf Spike", id: "perf-spike") { PerfSpikeView() }
         #endif

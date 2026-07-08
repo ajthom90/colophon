@@ -35,11 +35,14 @@ public struct LibraryCacheStore: Sendable {
 
     /// Removes a connection and every row scoped to it — the `cachedConnection` row plus its
     /// `cachedLibrary`, `cachedItem` (and, via the FTS5 `synchronize` trigger, its search-index
-    /// rows), and `cachedProgress` rows — in ONE transaction. Used by `AppState.removeConnection`
-    /// so a "forget this server" leaves no orphaned cache behind. Other connections are untouched.
+    /// rows), `cachedItemDetail`, `cachedEpisode`, and `cachedProgress` rows — in ONE
+    /// transaction. Used by `AppState.removeConnection` so a "forget this server" leaves no
+    /// orphaned cache behind. Other connections are untouched.
     public func deleteConnection(connectionID: String) throws {
         try pool.write { db in
             _ = try CachedItem.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedItemDetail.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedEpisode.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedProgress.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedLibrary.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedConnection.filter(Column("id") == connectionID).deleteAll(db)
@@ -89,11 +92,17 @@ public struct LibraryCacheStore: Sendable {
         }
     }
 
-    /// Removes a single item (and, via the FTS5 `synchronize` trigger, its search index row).
+    /// Removes a single item (and, via the FTS5 `synchronize` trigger, its search index row),
+    /// plus its `cachedItemDetail` and `cachedEpisode` rows — all in ONE transaction so no
+    /// orphaned detail/episode cache survives the item.
     public func deleteItem(connectionID: String, itemID: String) throws {
         try pool.write { db in
             _ = try CachedItem.filter(Column("connectionID") == connectionID
                                        && Column("id") == itemID).deleteAll(db)
+            _ = try CachedItemDetail.filter(Column("connectionID") == connectionID
+                                             && Column("itemID") == itemID).deleteAll(db)
+            _ = try CachedEpisode.filter(Column("connectionID") == connectionID
+                                          && Column("itemID") == itemID).deleteAll(db)
         }
     }
 
@@ -144,6 +153,17 @@ public struct LibraryCacheStore: Sendable {
         }.values(in: pool)
     }
 
+    /// Observes ALL progress rows for a connection as a live stream. The home shelves subscribe so
+    /// their per-item progress pills update the instant a socket `progressUpdated`/`progressBatch`
+    /// event — or the `me()` join — upserts `cachedProgress`, with no shelf refetch. Connection-
+    /// scoped (not per-item) because a shelf spans arbitrarily many items; the view indexes the
+    /// result by `itemID` client-side.
+    public func observeProgress(connectionID: String) -> AsyncValueObservation<[CachedProgress]> {
+        ValueObservation.tracking { db in
+            try CachedProgress.filter(Column("connectionID") == connectionID).fetchAll(db)
+        }.values(in: pool)
+    }
+
     public func searchItems(connectionID: String, query: String) throws -> [CachedItem] {
         try pool.read { db in
             guard let pattern = FTS5Pattern(matchingAllPrefixesIn: query) else { return [] }
@@ -154,6 +174,49 @@ public struct LibraryCacheStore: Sendable {
                 ORDER BY itemFTS.rank
                 """
             return try CachedItem.fetchAll(db, sql: sql, arguments: [pattern, connectionID])
+        }
+    }
+
+    // MARK: - v2: item detail + podcast episodes
+
+    /// Upserts the 1:1 heavy detail row for an item (on-demand, from `?expanded=1`).
+    public func upsertItemDetail(_ detail: CachedItemDetail) throws {
+        try pool.write { try detail.upsert($0) }
+    }
+
+    public func itemDetail(connectionID: String, itemID: String) throws -> CachedItemDetail? {
+        try pool.read {
+            try CachedItemDetail.fetchOne($0, key: ["connectionID": connectionID, "itemID": itemID])
+        }
+    }
+
+    /// Reconciles one item's full episode list against the cache, scoped to `(connectionID,
+    /// itemID)`: deletes that item's episodes absent from `episodes`, then upserts the rest — in
+    /// ONE transaction, the same replace-semantics `replaceItems` uses for library items. Other
+    /// items' episodes are untouched.
+    public func upsertEpisodes(_ episodes: [CachedEpisode], connectionID: String, itemID: String) throws {
+        try pool.write { db in
+            let ids = episodes.map(\.episodeID)
+            try CachedEpisode.filter(Column("connectionID") == connectionID
+                                      && Column("itemID") == itemID
+                                      && !ids.contains(Column("episodeID"))).deleteAll(db)
+            for episode in episodes {
+                var episode = episode
+                episode.connectionID = connectionID
+                episode.itemID = itemID
+                try episode.upsert(db)
+            }
+        }
+    }
+
+    /// Episodes for one item, newest first. NULL `publishedAt` sorts LAST here (SQLite's default
+    /// for `ORDER BY … DESC` places NULLs at the end), so episodes missing a publish date fall
+    /// below dated ones rather than jumping to the top.
+    public func episodes(connectionID: String, itemID: String) throws -> [CachedEpisode] {
+        try pool.read {
+            try CachedEpisode.filter(Column("connectionID") == connectionID && Column("itemID") == itemID)
+                .order(Column("publishedAt").desc)
+                .fetchAll($0)
         }
     }
 }

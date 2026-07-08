@@ -15,8 +15,8 @@ public final class PlaybackController {
     public var rate: Float = 1.0 { didSet { backend.playbackRate = rate } }
     public var muted = false { didSet { backend.volume = muted ? 0 : 1 } }
     /// Seconds a single skip-forward/back jumps — the Settings-driven `colophon.skipInterval`
-    /// preference (choices 10/15/30/45; default 15). `PlayerBarView`'s skip buttons read this
-    /// directly, and `load()` hands it to `NowPlayingUpdater.configure` so the lock-screen /
+    /// preference (choices 10/15/30/45; default 15). The shell's `MiniPlayerBar`/`TransportBar`
+    /// skip buttons read this directly, and `load()` hands it to `NowPlayingUpdater.configure` so the lock-screen /
     /// remote-command skip intervals match. The caller (`AppState.startPlayback`) sets it BEFORE
     /// calling `load()` on every fresh playback so `configure()` picks up the current value.
     public var skipInterval: Int = 15

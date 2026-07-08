@@ -221,3 +221,42 @@ Packages/ABSKit/Tests / LibraryCacheTests / ColophonTests     + tests per task
 - **UI verification model:** SwiftUI-heavy tasks (6–10) are gated by build + an explicit native-UI/Liquid-Glass review criterion + a live idb E2E, rather than pixel-exact plan code — the right altitude for UI, with the design report's concrete API names and structure as the spec.
 - **Known thin-fixture gaps (recorded for E2E honesty):** the seeded library has one book, one author, no series/genres/tags/narrators, no podcasts — so filter/series/author/podcast paths are partially exercised live and flagged; M1c-c seeds podcasts, and a richer book fixture (series+genres+narrator+multi-item) would strengthen T8/T9 coverage (optional seed enhancement, noted).
 - **Deferred to M1c-b/M1c-c:** item detail view, full player (chapters/sleep/bookmarks/speed/queue), podcast episode UI + playback + the podcast dev fixture, per-book speed persistence.
+
+---
+
+## M1c-a shipped reality (Task 11 wrap-up, 2026-07-07)
+
+All 10 build tasks landed, each individually reviewed and approved (`opus` reviewer on most; Task 9 self-verified by a second agent after the original implementer died mid-E2E — see `.superpowers/sdd/progress.md`). Full ledger: `.superpowers/sdd/progress.md` § "M1c-a execution ledger".
+
+### Surfaces that shipped
+- **Correctness (T1, T3, T4):** connection flows unified under one `connectionEpoch`; every connection-mutating flow guards its own post-await tail (closes the M1b-carried signOut/removeConnection stomp asymmetry and the connect-bump-before-URL-validation asymmetry). Library reconciliation is uncapped (pages to completion, 200-page/10k-item safety bound, degrade-not-wipe past it) with a per-item socket patch (`itemChanged` → one `/api/items/:id` fetch, not a full re-page). `CoverStore` dedupes concurrent in-flight fetches for the same key.
+- **Data (T2, T5):** `v2` GRDB migration (ALTER-only on `cachedItem` + new `cachedItemDetail`/`cachedEpisode` tables; v1 stays byte-frozen; delete paths purge the new tables atomically). `ABSKit` gained `personalizedShelves`, `filterData`, `series`, `authors`/`author`, `searchLibrary`, `me`, and single-item `item(id:)`, all fixture-decode-tested plus live contract tests.
+- **Native UI (T6–T10):** per-platform Liquid Glass shell (iPhone `TabView` + `tabViewBottomAccessory` mini-player with plain controls to avoid glass-on-glass; iPad/Mac `NavigationSplitView` + hand-built bottom-docked `TransportBar` + a `Playback` command menu on Mac); personalized home shelves with progress pills joined from `/api/me` (shelf entities themselves carry no progress — verified live); a library cover grid with native sort and a filterdata-driven filter sheet (filtered refresh upserts and preserves non-matching cached rows; unfiltered refresh still fully reconciles); series & authors browse (author images public, initials-avatar fallback); blended local-FTS5 instant + debounced server search with cancel-in-flight and dedup-by-id merge.
+- **Wrap-up (T11):** README Status rewritten for M1c-a reality; a `scenePhase → .active` progress refresh closes the T7-flagged staleness gap (home pill could go stale across a background→foreground cycle); the dead `PlayerBarView.swift` (superseded by the shell's own `MiniPlayerBar`/`TransportBar` since T6) deleted.
+
+### Follow-ups deferred (tracked, non-blocking)
+
+**To M1c-b (full player):**
+- Progress-pill fraction is recomputed from shelf-entity `media.duration`, which can be nil/0 (false-negative pill); T8's grid already reads `CachedItem.duration` instead — the player surfaces should do the same, and consider persisting a server-supplied progress fraction on `CachedProgress` if the socket `progressUpdated` payload carries one (T7 follow-up).
+- Item detail view; full player (chapters/sleep timer/bookmarks/speed/queue); per-book speed persistence.
+- Same-id re-activation during a signOut still runs `tokenStore.clear`/`needsSignIn.insert` against a now-live connection — the global epoch can't express per-connection intent (T1 follow-up).
+- Bare-`Space` Playback-menu shortcut can hijack a focused text field once real content with text fields exists — needs a guard when Search/detail views grow them (T6 follow-up).
+- Account menu is only reachable from the Home tab on iPhone (T6 follow-up: add to all tabs).
+
+**To M1c-c (podcasts):**
+- Search does not yet merge `results.podcast`/`results.episodes` — podcast-library search shows zero titles until M1c-c wires the podcast/episode buckets (T10, explicitly deferred).
+- `EpisodeStubCard` on Home shelves and episode/`series.books` DTOs are source-verified only — no live podcast fixture existed this milestone; tighten against a real podcast library once M1c-c seeds one (T5, T7).
+- `cachedEpisode` has no index on `publishedAt` (fine at feed scale today; revisit if a feed gets large) (T2 follow-up).
+
+**To M2 (offline downloads):** out of scope this milestone; no surface built or stubbed beyond the Downloads tab placeholder.
+
+**Source-only / graceful-degrade claims (no fixture to prove, but designed to fail soft):**
+- `authorImageURL`'s "public, no auth" claim is source-verified only (no author-image fixture); the initials-avatar fallback renders correctly if the claim is ever wrong (T9).
+- Mac `SplitShell` sidebar + bottom transport visual is code-verified but was never screenshotted (TCC blocked automated `screencapture` in the sandboxed E2E environment); a human interactive Mac launch is the recommended follow-up before the whole-branch review signs off on Mac visuals (T6).
+
+**Minor/cosmetic (no action expected):**
+- `ForEach id: \.offset` (positional identity) in a couple of shelf/list views; `observeProgress` re-indexes all rows unscoped rather than per-item (T7).
+- Serialized-suite fixtures in Settings tests duplicate `AppStateTests` fixtures (drift risk, carried from M1b).
+- The one known, accepted build warning across the whole tree is the pre-existing `PerfSpikeView.swift:44` DEBUG-only main-actor warning (documented in M1c-a Task 6/7 verification notes; untouched by any M1c-a task).
+
+No tag applied — the controller tags after the whole-branch review.

@@ -65,6 +65,104 @@ private func fixture(_ name: String) throws -> Data {
         #expect(s.audioTracks.isEmpty)
     }
 
+    @Test func decodesPersonalizedShelves() throws {
+        let shelves = try decoder.decode([Shelf].self, from: fixture("personalized"))
+        #expect(shelves.count == 3)
+        #expect(shelves[0].id == "continue-listening")
+        #expect(shelves[0].type == "book")
+        guard case let .book(entity) = shelves[0].entities.first else {
+            Issue.record("expected a book shelf entity")
+            return
+        }
+        #expect(entity.id == "77226f9e-ad94-4b26-bf8a-bf841965ca23")
+        #expect(entity.media.metadata.title == "The Art of War")
+        #expect(entity.media.metadata.authorName == "Sun Tzu")
+        #expect(entity.media.coverPath == "/audiobooks/Sun Tzu/The Art of War/cover.jpg")
+        #expect(entity.media.duration == 4337.264399)
+
+        let authorsShelf = shelves[2]
+        #expect(authorsShelf.id == "newest-authors")
+        #expect(authorsShelf.type == "authors")
+        guard case let .author(authorEntity) = authorsShelf.entities.first else {
+            Issue.record("expected an author shelf entity")
+            return
+        }
+        #expect(authorEntity.name == "Sun Tzu")
+        #expect(authorEntity.numBooks == 1)
+    }
+
+    /// A shelf entity with none of the discriminating keys (`media`/`recentEpisode`/
+    /// `name`+`numBooks`) must decode as `.unknown` — NOT silently misclassify as an all-nil
+    /// `.episode` (regression guard for the tolerant-but-not-lax discrimination).
+    @Test func unknownShelfEntityShapeFallsBackToUnknown() throws {
+        let json = #"{"id":"x","weirdField":1}"#
+        let entity = try decoder.decode(ShelfEntity.self, from: Data(json.utf8))
+        guard case .unknown = entity else {
+            Issue.record("expected .unknown, got \(entity)")
+            return
+        }
+    }
+
+    @Test func decodesFilterData() throws {
+        let f = try decoder.decode(FilterData.self, from: fixture("filterdata"))
+        #expect(f.authors.map(\.name) == ["Sun Tzu"])
+        #expect(f.genres.isEmpty)
+        #expect(f.bookCount == 1)
+        #expect(f.authorCount == 1)
+        #expect(f.seriesCount == 0)
+    }
+
+    /// This dev fixture's library has no series — asserts the empty-shape decode. Non-empty
+    /// `books` field names are source-verified only (see the doc comment on `SeriesSummary`).
+    @Test func decodesEmptySeriesList() throws {
+        let r = try decoder.decode(SeriesListResponse.self, from: fixture("series"))
+        #expect(r.results.isEmpty)
+        #expect(r.total == 0)
+    }
+
+    @Test func decodesAuthors() throws {
+        let r = try decoder.decode(AuthorsResponse.self, from: fixture("authors"))
+        #expect(r.authors.count == 1)
+        #expect(r.authors[0].name == "Sun Tzu")
+        #expect(r.authors[0].numBooks == 1)
+        #expect(r.authors[0].lastFirst == "Tzu, Sun")
+    }
+
+    @Test func decodesAuthorDetail() throws {
+        let a = try decoder.decode(AuthorDetail.self, from: fixture("author"))
+        #expect(a.name == "Sun Tzu")
+        #expect(a.libraryItems?.count == 1)
+        #expect(a.libraryItems?.first?.media.metadata.title == "The Art of War")
+    }
+
+    @Test func decodesSearchResultsWithBookMatch() throws {
+        let r = try decoder.decode(SearchResults.self, from: fixture("search-art"))
+        #expect(r.book?.count == 1)
+        #expect(r.book?.first?.libraryItem.media.metadata.title == "The Art of War")
+        #expect(r.authors?.isEmpty == true)
+    }
+
+    /// Proves the match-bucket behavior documented on `ABSClient.searchLibrary`: a query that
+    /// only matches an author name returns an EMPTY `book` bucket, with the hit surfacing in
+    /// `authors` instead.
+    @Test func decodesSearchResultsWithAuthorMatchProvesEmptyBookBucket() throws {
+        let r = try decoder.decode(SearchResults.self, from: fixture("search-sun"))
+        #expect(r.book?.isEmpty == true)
+        #expect(r.authors?.count == 1)
+        #expect(r.authors?.first?.name == "Sun Tzu")
+    }
+
+    @Test func decodesMeWithProgressAndBookmarks() throws {
+        let me = try decoder.decode(MeUser.self, from: fixture("me"))
+        #expect(me.username == "root")
+        #expect(me.mediaProgress?.count == 1)
+        #expect(me.mediaProgress?.first?.libraryItemId == "77226f9e-ad94-4b26-bf8a-bf841965ca23")
+        #expect(me.mediaProgress?.first?.currentTime == 120.5)
+        #expect(me.bookmarks?.count == 1)
+        #expect(me.bookmarks?.first?.title == "Interesting chapter")
+        #expect(me.bookmarks?.first?.time == 100.5)
+    }
+
     @Test func deviceInfoEncodesWithDefaults() throws {
         let device = DeviceInfo(deviceId: "dev-1", clientVersion: "0.1.0", model: "Mac16,1")
         let data = try JSONEncoder().encode(device)

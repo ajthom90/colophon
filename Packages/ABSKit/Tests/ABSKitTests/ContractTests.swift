@@ -62,4 +62,47 @@ struct ContractTests {
         #expect(unauthed.statusCode == 200, "seed must provide cover.jpg — re-run make seed after wiping devserver/data")
         #expect(unauthed.data.count > 1_000)                            // a real image, not an error body
     }
+
+    // MARK: - Task 5: browse, search, and me endpoints
+
+    @Test func personalizedShelvesReturnsSeededShelves() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let shelves = try await client.personalizedShelves(libraryID: libs[0].id, limit: 10)
+        #expect(!shelves.isEmpty)
+        #expect(shelves.contains { $0.id == "continue-listening" })
+    }
+
+    @Test func filterDataReflectsSeededLibrary() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let filterData = try await client.filterData(libraryID: libs[0].id)
+        #expect(filterData.bookCount == 1)
+        #expect(filterData.authors.map(\.name) == ["Sun Tzu"])
+    }
+
+    @Test func authorsIncludesSeededAuthor() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let authors = try await client.authors(libraryID: libs[0].id)
+        #expect(authors.contains { $0.name == "Sun Tzu" })
+    }
+
+    @Test func searchMatchBucketBehaviorIsLive() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let byTitle = try await client.searchLibrary(libraryID: libs[0].id, query: "art", limit: 12)
+        #expect(byTitle.book?.isEmpty == false)
+
+        let byAuthor = try await client.searchLibrary(libraryID: libs[0].id, query: "sun", limit: 12)
+        #expect(byAuthor.book?.isEmpty == true, "book bucket must NOT match author name")
+        #expect(byAuthor.authors?.isEmpty == false, "author-only match must surface in the authors bucket")
+    }
+
+    @Test func meReturnsMediaProgress() async throws {
+        let client = try await loggedInClient()
+        let me = try await client.me()
+        #expect(me.username == "root")
+        #expect(me.mediaProgress?.isEmpty == false)
+    }
 }

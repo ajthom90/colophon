@@ -9,6 +9,67 @@ import ABSRealtime
 import PlayerEngine
 import LibraryCache
 
+/// The library-browse sort options surfaced in `LibraryGridView`'s toolbar, each mapped to a
+/// verified ABS `items?sort=` key (see the plan's endpoint reference). Plain `Sendable` value type
+/// (not MainActor-isolated) so it can travel into the client request off the main actor.
+nonisolated enum LibrarySort: String, CaseIterable, Identifiable, Sendable {
+    case title, author, added, published, progress
+
+    var id: String { rawValue }
+
+    /// The exact `sort=` value ABS expects for this choice.
+    var serverKey: String {
+        switch self {
+        case .title: return "media.metadata.title"
+        case .author: return "media.metadata.authorName"
+        case .added: return "addedAt"
+        case .published: return "media.metadata.publishedYear"
+        case .progress: return "progress"
+        }
+    }
+
+    /// The human-facing menu label.
+    var label: String {
+        switch self {
+        case .title: return "Title"
+        case .author: return "Author"
+        case .added: return "Date Added"
+        case .published: return "Published Year"
+        case .progress: return "Progress"
+        }
+    }
+}
+
+/// One active library filter, built from a `filterdata` facet selection. ABS wants the request
+/// param `filter=<group>.<base64url(value)>` where — verified against the ABS filter convention —
+/// the encoded value is the author/series *ID* for the `authors`/`series` groups and the plain
+/// string for `genres`/`tags`/`narrators`/`languages`/`publishedDecades`. `displayValue` is what
+/// the UI shows; `rawValue` is what gets base64url-encoded.
+nonisolated struct LibraryFilter: Equatable, Hashable, Sendable {
+    var group: String
+    var displayValue: String
+    var rawValue: String
+
+    init(group: String, displayValue: String, rawValue: String) {
+        self.group = group
+        self.displayValue = displayValue
+        self.rawValue = rawValue
+    }
+
+    /// The `<group>.<base64url(value)>` string threaded into `ABSClient.items(filter:)`.
+    var queryValue: String { group + "." + Self.base64URLEncode(rawValue) }
+
+    /// ABS filter convention: `Buffer.from(value).toString('base64')` made URL-safe — `+`→`-`,
+    /// `/`→`_`, and `=` padding stripped. Node's `Buffer.from(x,'base64')` decodes this url-safe,
+    /// unpadded form, so the server round-trips the original value.
+    static func base64URLEncode(_ value: String) -> String {
+        Data(value.utf8).base64EncodedString()
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "=", with: "")
+    }
+}
+
 @Observable
 final class AppState {
     enum Phase { case disconnected, connecting, connected }
@@ -82,9 +143,33 @@ final class AppState {
     /// leaves this (and the player) untouched — only signing out / removing *this* connection
     /// retires the session first.
     private var playingConnectionID: String?
+    /// The item ID of the currently-playing session, surfaced so the navigation shell's
+    /// `MiniPlayerBar`/`TransportBar` can render the right cover artwork. Set alongside
+    /// `playingConnectionID` when `startPlayback` succeeds and cleared when the session is retired.
+    /// Read-only to the UI (private setter).
+    private(set) var nowPlayingItemID: String?
     /// Last library ID `refreshItems` was asked to page — recorded so a future first-run/
     /// offline flow (M1b) can resume browsing the last-viewed library without a live server.
     private(set) var activeLibraryID: String?
+
+    // MARK: - Library browse (Task 8) — sort/filter state feeding refreshItems + the items request.
+
+    /// The active grid sort key. Mutated by `LibraryGridView`'s toolbar; read by `refreshItems`
+    /// to drive the server `items?sort=` query. Persists while browsing so a library re-visit
+    /// keeps the user's chosen order.
+    var librarySort: LibrarySort = .title
+    /// Ascending (`false`) vs descending (`true`) for `librarySort` — the toolbar order toggle.
+    var sortDescending = false
+    /// The active facet filter (nil = unfiltered). Set from `FilterSheet`; drives `items?filter=`.
+    /// Reset per-library on a library switch (a different library's facet IDs won't match).
+    var libraryFilter: LibraryFilter?
+
+    /// The server-authoritative item ORDER captured by the most recent successful `refreshItems`,
+    /// keyed by libraryID. The cache's `observeItems` only knows title order, so the grid renders
+    /// in THIS order (falling back to the cache's title order before the first refresh completes,
+    /// for instant offline paint). When a filter is active this holds ONLY the matching item IDs,
+    /// so the grid shows exactly the filtered set without the cache ever deleting non-matching rows.
+    private(set) var libraryItemOrder: [String: [String]] = [:]
 
     private var auth: AuthManager?
     private let tokenStore: any TokenStore
@@ -117,16 +202,28 @@ final class AppState {
     /// doc comment. Not awaited by `activateConnection` itself; exists so a fresh activation can
     /// cancel whatever probe preceded it.
     private var probeTask: Task<Void, Never>?
-    /// Monotonic token capturing "the latest connection-mutating user intent." Every flow that
-    /// mutates connection state (`connect`, `connectWithOIDC`, `activateConnection`, `signOut`,
-    /// `removeConnection`) bumps this at entry and captures its value; after every `await` — and in
-    /// the detached `probeTask` — it re-checks `connectionGeneration == myGeneration` before writing
-    /// any shared state or standing up a socket, and bails if a newer flow has superseded it. This
-    /// is the authoritative "am I still the current intent?" guard that composes across all four
-    /// flows, where the per-flow guards (`phase`, `activatingConnectionID`, `activeConnectionID`)
-    /// did not: it stops a slow/abandoned connect from clobbering a newer activation, and stops an
-    /// in-flight probe from resurrecting a connection the user just signed out of or removed.
-    private var connectionGeneration = 0
+    /// Monotonic epoch capturing "the latest connection-mutating user intent" — the ONE
+    /// authoritative "am I still the current intent?" guard. Every flow that mutates connection
+    /// state (`connect`, `connectWithOIDC`, `activateConnection`, `signOut`, `removeConnection`)
+    /// calls `beginConnectionFlow()` once it's committed to actually starting, capturing the
+    /// returned `myEpoch`; after every `await` — and in the detached `probeTask` — it re-checks
+    /// `connectionEpoch == myEpoch` before writing any shared state or standing up a socket, and
+    /// bails if a newer flow has superseded it. It composes across all five flows where the per-flow
+    /// guards (`phase`, `activatingConnectionID`, `activeConnectionID`) did not: it stops a
+    /// slow/abandoned connect from clobbering a newer activation, stops an in-flight probe from
+    /// resurrecting a connection the user just signed out of or removed, and stops an older
+    /// `signOut`/`removeConnection` tail from stomping a newer activation started during its awaits.
+    private var connectionEpoch = 0
+
+    /// Opens a new connection epoch and returns it — the single entry point every connection-mutating
+    /// flow calls exactly once, at the moment it commits to running (for `connect`/`connectWithOIDC`
+    /// that is AFTER URL validation, so an invalid URL that returns early never stales a healthy
+    /// active connection's in-flight probe). Callers capture the return as `myEpoch` and re-check
+    /// `connectionEpoch == myEpoch` after every subsequent await.
+    private func beginConnectionFlow() -> Int {
+        connectionEpoch += 1
+        return connectionEpoch
+    }
 
     /// Every argument defaults to production behavior; tests override them to run entirely
     /// offline (MockTransport, temp-dir cache, FakeSocket, `InMemoryTokenStore` — the Keychain
@@ -182,12 +279,14 @@ final class AppState {
         // Closes the same-frame double-tap window: without this, two rapid taps both race past
         // the stopSocket/ID-nil prefix below and each spins up its own socket, leaking one live.
         guard phase != .connecting else { return }
-        connectionGeneration += 1
-        let myGeneration = connectionGeneration
         errorMessage = nil
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
         }
+        // Bump the epoch only NOW, once URL validation has passed and we're committed to starting a
+        // connection flow. An invalid URL returns above WITHOUT bumping, so it never stales a healthy
+        // active connection's in-flight probe (Asymmetry fix A).
+        let myEpoch = beginConnectionFlow()
         // Tear down the previous connection's socket BEFORE any await, and clear the active
         // connection ID with it: otherwise the old socket stays live across the awaits below
         // while `activeConnectionID` may already reference the new connection, and a stray
@@ -203,28 +302,28 @@ final class AppState {
             let status = try await ABSClient.status(baseURL: url, transport: transport)
             // A newer flow (a fresh activation/connect, or a sign-out) superseded this connect
             // while `/status` was in flight: discard silently — the newer flow owns the state now.
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             try checkVersionGate(status)
             let connection = try findOrCreateConnection(address: url.absoluteString, username: username)
             // Awaited (not fire-and-forget) so migration can never race a fresh login's token
             // save — it must finish moving any legacy entry before `auth.login` writes new ones.
             await TokenMigration.migrateLegacyTokensIfNeeded(
                 from: url.absoluteString, to: connection.id, store: tokenStore)
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             _ = try await auth.login(username: username, password: password)
             // A stale connect whose (possibly minutes-long) login finally landed must NOT clobber
             // the connection a newer activation put in place. Its saved tokens are harmless —
             // keyed by this connection's own id — so just discard without touching shared state.
-            guard connectionGeneration == myGeneration else { return }
-            try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
+            guard connectionEpoch == myEpoch else { return }
+            try await completeConnection(connection: connection, auth: auth, url: url, epoch: myEpoch)
         } catch ABSError.http(status: 401) {
             // Only surface the error / reset state if we're still the current intent — a stale
             // connect must not stopSocket a newer connection nor bounce the user out. If the
             // superseder was a signOut and `completeConnection` had already published (then threw),
             // the bail still clears the stranded publication.
-            guard connectionGeneration == myGeneration else {
+            guard connectionEpoch == myEpoch else {
                 clearStalePublicationIfDisconnected()
                 return
             }
@@ -233,7 +332,7 @@ final class AppState {
             activeConnectionID = nil   // no stale ID while disconnected
             errorMessage = "Wrong username or password"
         } catch {
-            guard connectionGeneration == myGeneration else {
+            guard connectionEpoch == myEpoch else {
                 clearStalePublicationIfDisconnected()
                 return
             }
@@ -261,12 +360,13 @@ final class AppState {
     /// supplies the username up front.
     func connectWithOIDC(serverURL: String, browser: @Sendable (URL) async throws -> URL) async {
         guard phase != .connecting else { return }
-        connectionGeneration += 1
-        let myGeneration = connectionGeneration
         errorMessage = nil
         guard let url = normalizedServerURL(serverURL) else {
             errorMessage = "Invalid server URL"; return
         }
+        // Bump only after the normalize/validate prefix, before the awaits — same Asymmetry-fix-A
+        // reasoning as `connect()`: an invalid URL returns above without staling an active probe.
+        let myEpoch = beginConnectionFlow()
         stopSocket()
         activeConnectionID = nil
         refreshBanner = nil
@@ -274,24 +374,24 @@ final class AppState {
         do {
             let transport = self.transport
             let status = try await ABSClient.status(baseURL: url, transport: transport)
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             try checkVersionGate(status)
             let flow = OIDCFlow(serverURL: url, transport: oidcTransport)
             // The browser hop can sit open for minutes; a newer activation/connect in that window
-            // supersedes this one and its `myGeneration` will no longer match below.
+            // supersedes this one and its `myEpoch` will no longer match below.
             let loginResponse = try await flow.authenticate(browser: browser)
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             let connection = try findOrCreateConnection(
                 address: url.absoluteString, username: loginResponse.user.username, authMethod: "openid")
             let auth = AuthManager(baseURL: url, connectionID: connection.id,
                                    transport: transport, store: tokenStore)
             try await auth.completeOIDC(loginResponse: loginResponse)
-            guard connectionGeneration == myGeneration else { return }
-            try await completeConnection(connection: connection, auth: auth, url: url, generation: myGeneration)
+            guard connectionEpoch == myEpoch else { return }
+            try await completeConnection(connection: connection, auth: auth, url: url, epoch: myEpoch)
         } catch {
             // A stale OIDC connect must not tear down or reset a newer connection's state — but
             // it does clear its own stranded publication if a signOut superseded it mid-tail.
-            guard connectionGeneration == myGeneration else {
+            guard connectionEpoch == myEpoch else {
                 clearStalePublicationIfDisconnected()
                 return
             }
@@ -327,7 +427,7 @@ final class AppState {
     /// The tail both sign-in paths share once they hold an authenticated `AuthManager`: build the
     /// client, publish connection state, fetch+cache the library list, and stand up the realtime
     /// socket. Only reached after a successful login/OIDC exchange, so `phase` ends `.connected`.
-    private func completeConnection(connection: CachedConnection, auth: AuthManager, url: URL, generation: Int) async throws {
+    private func completeConnection(connection: CachedConnection, auth: AuthManager, url: URL, epoch myEpoch: Int) async throws {
         let transport = self.transport
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
@@ -344,7 +444,7 @@ final class AppState {
         // "no stale ID while disconnected" invariant holds. Scoped tightly to `.disconnected`
         // (see the helper's doc): a newer activation (`.connected`) or a newer in-flight connect
         // (`.connecting`, which republishes these fields itself) is left untouched.
-        guard connectionGeneration == generation else {
+        guard connectionEpoch == myEpoch else {
             clearStalePublicationIfDisconnected()
             return
         }
@@ -362,7 +462,7 @@ final class AppState {
         phase = .connected
     }
 
-    /// Cleanup for a superseded (stale-generation) connect flow's bail paths. `completeConnection`
+    /// Cleanup for a superseded (stale-epoch) connect flow's bail paths. `completeConnection`
     /// publishes `activeConnectionID`/`client`/`auth` BEFORE its `libraries()` await; if a
     /// signOut/removeConnection supersedes during that await (normalizing a stranded `.connecting`
     /// to `.disconnected` — it can't know this flow had already published), the stale bail — the
@@ -445,10 +545,12 @@ final class AppState {
         guard activatingConnectionID != id else { return }
         activatingConnectionID = id
         defer { activatingConnectionID = nil }
-        // Bump AFTER the same-id reentrancy guard above: a reentrant same-id call bails without a
-        // bump, so it can't invalidate the first (still legitimate) activation's own probe.
-        connectionGeneration += 1
-        let myGeneration = connectionGeneration
+        // Open the epoch AFTER the same-id reentrancy guard above: a reentrant same-id call bails
+        // without opening one, so it can't invalidate the first (still legitimate) activation's own
+        // probe. This minimal same-id guard is retained (folding it into the epoch can't replace it:
+        // a same-id double-tap must bail synchronously, before the token-store await, or it would
+        // build a second `AuthManager`/`ABSClient` and probe — see `activateConnectionReentrancyGuard`).
+        let myEpoch = beginConnectionFlow()
 
         guard let connection = try? cache.connections().first(where: { $0.id == id }),
               let url = URL(string: connection.address) else { return }
@@ -474,49 +576,49 @@ final class AppState {
         guard await tokenStore.tokens(for: id) != nil else {
             // The token lookup is a real suspension point — a newer flow may have superseded us
             // while it was in flight; if so, leave its state alone.
-            guard connectionGeneration == myGeneration else { return }
+            guard connectionEpoch == myEpoch else { return }
             client = nil
             auth = nil
             needsSignIn.insert(id)
             return
         }
-        guard connectionGeneration == myGeneration else { return }
+        guard connectionEpoch == myEpoch else { return }
         let auth = AuthManager(baseURL: url, connectionID: id, transport: transport, store: tokenStore)
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
         self.client = client
 
         // The network probe: detached so `activateConnection` returns now, with cached browsing
-        // already live. Every branch re-checks the generation (authoritative — a sign-out/removal
+        // already live. Every branch re-checks the epoch (authoritative — a sign-out/removal
         // or a newer activation of this or another id supersedes this probe) plus `activeConnectionID
         // == id` for id-specificity, since either an in-flight `authorize()` or the `libraries()`
         // that follows can resume long after the user has moved on. A signed-out connection leaves
-        // `activeConnectionID == id`, so without the generation check the probe would RESURRECT it
+        // `activeConnectionID == id`, so without the epoch check the probe would RESURRECT it
         // (needsSignIn.remove, isOnline, socket) for a connection the user just abandoned.
         probeTask = Task { [weak self] in
             guard let self else { return }
             do {
                 try await client.authorize()
-                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.needsSignIn.remove(id)
                 self.isOnline = true
                 self.startSocket(url: url, auth: auth)
                 if let libs = try? await client.libraries() {
-                    guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                    guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                     try? self.cache.upsertLibraries(libs.enumerated().map { index, lib in
                         CachedLibrary(id: lib.id, connectionID: id, name: lib.name,
                                       mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
                     }, connectionID: id)
                 }
             } catch ABSError.reauthRequired, ABSError.notAuthenticated {
-                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
                 self.needsSignIn.insert(id)
             } catch {
                 // Host down / transport error: stay in cached-only offline mode. `isOnline ==
                 // false` drives the offline banner; no blocking error alert for an expected
                 // offline case.
-                guard self.connectionGeneration == myGeneration, self.activeConnectionID == id else { return }
+                guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
             }
         }
@@ -527,12 +629,17 @@ final class AppState {
     /// cached rows so the user can still browse offline and sign back in later. Marks it
     /// `needsSignIn` so `ConnectionsView` badges it and routes a tap to re-auth.
     func signOut(connectionID id: String) async {
-        // Bump FIRST, before any await: an in-flight `activateConnection` probe for THIS connection
-        // (parked in `authorize()`/`libraries()`) captured the previous generation, so bumping here
-        // immediately makes it stale — when it resumes it will no-op instead of resurrecting the
-        // connection we're signing out (needsSignIn.remove + isOnline + socket for a dead session).
-        connectionGeneration += 1
-        // The bump also makes any in-flight connect/connectWithOIDC bail at its generation guards
+        await performSignOut(connectionID: id, epoch: beginConnectionFlow())
+    }
+
+    /// The sign-out body, run under a caller-owned epoch so `removeConnection` can share ONE epoch
+    /// across its whole flow (it opens the epoch, runs this, then guards its own tail on the same
+    /// value). Opening the epoch FIRST, before any await: an in-flight `activateConnection` probe for
+    /// THIS connection (parked in `authorize()`/`libraries()`) captured the previous epoch, so this
+    /// immediately makes it stale — when it resumes it will no-op instead of resurrecting the
+    /// connection we're signing out (needsSignIn.remove + isOnline + socket for a dead session).
+    private func performSignOut(connectionID id: String, epoch myEpoch: Int) async {
+        // Opening the epoch also makes any in-flight connect/connectWithOIDC bail at its epoch guards
         // — INCLUDING the catch blocks that normally reset `phase` — so a connect mid-flight right
         // now would otherwise strand `phase == .connecting` forever, and both connect entry guards
         // (`guard phase != .connecting`) would refuse every future sign-in. Normalize it here: the
@@ -543,7 +650,13 @@ final class AppState {
         if playingConnectionID == id {
             await retireCurrentSession()
         }
-        if activeConnectionID == id {
+        // Active-state teardown is guarded on the epoch, not just `activeConnectionID == id`
+        // (Asymmetry fix B): a newer activation started during retire's flush/close round-trips —
+        // even a re-activation of THIS same id, which `activeConnectionID == id` alone can't
+        // distinguish — now owns the live socket/client, so this older sign-out must not stomp it.
+        // The id-scoped bookkeeping below (clear tokens, badge, reload) still runs unconditionally
+        // so the signed-out row is genuinely signed out regardless of who is active now.
+        if connectionEpoch == myEpoch, activeConnectionID == id {
             stopSocket()
             isOnline = false
             client = nil
@@ -560,12 +673,19 @@ final class AppState {
     /// folder. If it was the active connection, drops back to a disconnected state so the boot
     /// flow re-routes to `ConnectionsView` (or `ConnectView` when none remain).
     func removeConnection(_ id: String) async {
-        // Generation bump AND `.connecting`-phase normalization both happen inside `signOut`
-        // (unconditionally, before its first await), so every removeConnection path — active or
-        // inactive row — leaves `phase` definite; the branch below only additionally drops a
-        // previously-CONNECTED active row to `.disconnected`.
-        await signOut(connectionID: id)
-        if activeConnectionID == id {
+        // Open ONE epoch for the whole remove flow and thread it through the shared sign-out body,
+        // so this method and its inner sign-out agree on a single "am I still the latest intent"
+        // value (rather than the sign-out opening one this method can't see). Epoch open AND
+        // `.connecting`-phase normalization both happen inside `performSignOut` (unconditionally,
+        // before its first await), so every removeConnection path — active or inactive row — leaves
+        // `phase` definite; the branch below only additionally drops a previously-CONNECTED active
+        // row to `.disconnected`.
+        let myEpoch = beginConnectionFlow()
+        await performSignOut(connectionID: id, epoch: myEpoch)
+        // Same Asymmetry-fix-B guard as the sign-out body: only clear the active session down to
+        // `.disconnected` if we're STILL the latest intent — a newer activation during the awaits
+        // above (its probe, retire, or `tokenStore.clear`) owns `activeConnectionID`/`phase` now.
+        if connectionEpoch == myEpoch, activeConnectionID == id {
             activeConnectionID = nil
             client = nil
             auth = nil
@@ -593,10 +713,18 @@ final class AppState {
         reauthTask = nil
     }
 
+    /// Upper bound on how many ids one `items_updated`/`items_added` batch will patch one-by-one
+    /// before falling back to a single full-library `refreshItems`: past this, N single-item
+    /// round trips cost more than one paged reconcile (and a mass edit is exactly the case a
+    /// reconcile handles cleanly).
+    private static let itemsChangedPatchBound = 50
+
     /// Applies a decoded server event to local state. `progressUpdated`/`progressBatch` upsert
     /// straight into the cache (last-write-wins by `lastUpdate`, enforced in
-    /// `LibraryCacheStore.upsertProgress`); item lifecycle events do a coarse re-page of
-    /// whatever library is currently open (M1a scope — per-item patch is M1c polish).
+    /// `LibraryCacheStore.upsertProgress`). `itemChanged`/`itemsChanged` do a TARGETED per-item
+    /// patch (`patchItem` → one-row upsert) rather than a coarse full-library re-page — a large
+    /// `itemsChanged` batch (> `itemsChangedPatchBound`) is the one case that still falls back to
+    /// a single `refreshItems`. `itemRemoved` stays the precise-delete deletion path.
     /// `internal` (not `private`) so the state-machine tests can drive it deterministically
     /// without waiting on the nondeterministic socket-consumer task.
     func apply(_ event: ServerEvent) async {
@@ -613,8 +741,16 @@ final class AppState {
                     currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate)
             }
             try? cache.upsertProgressBatch(batch)
-        case .itemChanged, .itemsChanged:
-            if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
+        case .itemChanged(let id):
+            try? await patchItem(id: id, connectionID: connectionID)
+        case .itemsChanged(let ids):
+            // A huge batch (a bulk metadata edit / mass import) is cheaper — and more correct —
+            // to reconcile in one paged pass than to fire N single-item fetches.
+            if ids.count > Self.itemsChangedPatchBound {
+                if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
+            } else {
+                for id in ids { try? await patchItem(id: id, connectionID: connectionID) }
+            }
         case .itemRemoved(let id):
             // Precise deletion first (instant, no round trip) — the coarse re-page below is a
             // safety net for anything else the same event batch implies, not the primary path.
@@ -654,13 +790,26 @@ final class AppState {
         return fresh
     }
 
-    /// Pages `client.items` (50/page) into the cache until the server-reported total is
-    /// satisfied or a 20-page (1000-item) cap is hit — a deliberate M1a limit; full unbounded
-    /// paging is out of scope until it's needed.
+    /// Generous upper bound on how many pages `refreshItems` will fetch before it gives up on
+    /// completing a full page-through: 200 pages × 50/page ≈ 10 000 items. The M1a hard 20-page
+    /// (1000-item) cap is GONE — a capped page-through never called `replaceItems`, so any
+    /// library over 1000 items accreted ghost rows forever (deleted items were never reconciled
+    /// away). This bound only exists so a pathological giant library degrades gracefully
+    /// (per-page upsert, no reconcile) rather than paging without end; a normal library of any
+    /// realistic size pages to completion and reconciles.
+    private static let refreshPageSafetyBound = 200
+
+    /// Pages `client.items` (50/page) into the cache until the server-reported total is satisfied
+    /// (`accumulated.count >= total`) — the ghost-accretion hazard is closed: a COMPLETED
+    /// page-through reconciles via `replaceItems`, so items the server no longer reports
+    /// (deleted/moved) disappear from the cache for a library of ANY size.
     ///
-    /// A completed page-through (every item seen, uncapped) reconciles via `replaceItems` so
-    /// items the server no longer reports (deleted/moved libraries) disappear from the cache —
-    /// otherwise a capped/interrupted page-through only upserts what it saw, exactly like before.
+    /// The only ceiling is `refreshPageSafetyBound` (≈10k items): if a library is so large the
+    /// loop hits it WITHOUT completing, we degrade to a plain per-page `upsertItemsPage` and skip
+    /// `replaceItems` — a giant library keeps its rows (no accidental wipe from an incomplete
+    /// view) rather than paging forever. The lying-response guard (`total > 0` but zero items
+    /// accumulated → skip `replaceItems`) still protects a completed-but-empty response from
+    /// nuking a good cache.
     ///
     /// On outright failure (network/server error), a library the cache already has content for
     /// gets a non-blocking `refreshBanner` instead of throwing — the existing (possibly stale)
@@ -671,13 +820,20 @@ final class AppState {
             throw ABSError.notAuthenticated
         }
         activeLibraryID = libraryID
+        // Snapshot the browse state once so a mid-refresh toolbar change can't split the query
+        // (page 0 filtered, page 1 not) — the next task-driven refresh picks up the new state.
+        let sort = librarySort
+        let desc = sortDescending
+        let activeFilter = libraryFilter
         let limit = 50
         var accumulated: [CachedItem] = []
         var lastTotal = 0
         var completed = false
         do {
-            for page in 0..<20 {
-                let result = try await client.items(libraryID: libraryID, limit: limit, page: page)
+            for page in 0..<Self.refreshPageSafetyBound {
+                let result = try await client.items(
+                    libraryID: libraryID, limit: limit, page: page,
+                    sort: sort.serverKey, desc: desc, filter: activeFilter?.queryValue)
                 lastTotal = result.total
                 accumulated += result.results.map { item in
                     CachedItem(id: item.id, connectionID: connectionID, libraryID: libraryID,
@@ -699,25 +855,96 @@ final class AppState {
             }
             throw error
         }
-        if completed {
-            // replaceItems with [] wipes the library's cache — only reached after a completed
-            // page-through; guarded below so a lying/failed response that reports a non-zero
-            // total but hands back zero items can never nuke a good cache.
-            if !(lastTotal > 0 && accumulated.isEmpty) {
-                try cache.replaceItems(accumulated, connectionID: connectionID, libraryID: libraryID)
-            }
-        } else {
+        // A server "lie": a non-zero total but zero items handed back — never reconcile/wipe on it.
+        let isLyingEmpty = (lastTotal > 0 && accumulated.isEmpty)
+        if !completed {
+            // Safety bound hit before the total was satisfied — a pathological (>~10k-item)
+            // library. Note it and degrade to a plain upsert of what we DID page: never
+            // `replaceItems`, which would delete every row past the bound we simply never fetched.
+            NSLog("[Colophon] refreshItems: library \(libraryID) exceeded the \(Self.refreshPageSafetyBound)-page safety bound (total \(lastTotal)); upserting \(accumulated.count) paged items without reconciliation.")
             try cache.upsertItemsPage(accumulated, connectionID: connectionID, libraryID: libraryID)
+        } else if activeFilter != nil {
+            // Filtered page-through: the server returned ONLY matching items. `replaceItems` would
+            // delete every non-matching cached row (destroying the offline browse set for a
+            // transient filter); upsert instead so the matches are fresh, and let `libraryItemOrder`
+            // below scope the grid's visible set to exactly these IDs.
+            try cache.upsertItemsPage(accumulated, connectionID: connectionID, libraryID: libraryID)
+        } else if !isLyingEmpty {
+            // Completed, UNFILTERED page-through: reconcile. `replaceItems` with [] wipes the
+            // library's cache — reached only for a genuinely empty library (total 0); the guard
+            // above skips it for a lying/failed response, so that can never nuke a good cache.
+            try cache.replaceItems(accumulated, connectionID: connectionID, libraryID: libraryID)
+        }
+        // Capture the server-authoritative order (full set unfiltered, matching set filtered) for
+        // the grid — but never clobber a good order with a lying-empty response's zero IDs, and
+        // never settle the grid on a SUPERSEDED order: if the sort/order/filter changed while this
+        // (possibly slow) request was in flight, a newer refresh owns the order, so skip the write
+        // and let it win. (Cache writes above are always safe — upsert or full reconcile of valid
+        // rows — so only the order, which drives what the grid shows, needs this guard.)
+        let stillCurrent = (librarySort == sort && sortDescending == desc && libraryFilter == activeFilter)
+        if !isLyingEmpty && stillCurrent && !Task.isCancelled {
+            libraryItemOrder[libraryID] = accumulated.map(\.id)
         }
         // Success clears only this library's banner — another library's failure stays visible
         // on its own screen until *it* refreshes successfully.
         if refreshBanner?.libraryID == libraryID { refreshBanner = nil }
     }
 
+    /// Targeted single-item patch for `item_updated`/`item_added` socket events: fetches just
+    /// that item (`GET /api/items/:id?expanded=1`), maps it to a `CachedItem`, and upserts the
+    /// ONE row — no coarse full-library re-page. The item's own `libraryId` from the response
+    /// scopes the upsert; a malformed/absent one falls back to `activeLibraryID` (the library the
+    /// user is currently browsing — the only other context we have). If neither is available
+    /// there's no library to scope the row to, so it's dropped (the next full `refreshItems`
+    /// picks it up). Best-effort: a fetch/map failure is swallowed by the `try?` at the call site.
+    private func patchItem(id: String, connectionID: String) async throws {
+        guard let client else { return }
+        let detail = try await client.item(id: id)
+        guard let libraryID = detail.libraryId ?? activeLibraryID else { return }
+        let item = CachedItem(
+            id: detail.id, connectionID: connectionID, libraryID: libraryID,
+            title: detail.media.metadata.title ?? "Untitled",
+            authorName: detail.media.metadata.authorName,
+            duration: detail.media.duration, updatedAt: detail.updatedAt)
+        try cache.upsertItemsPage([item], connectionID: connectionID, libraryID: libraryID)
+    }
+
     /// Retry hook for the `RefreshBanner`'s button — re-runs `refreshItems` for the library the
     /// banner belongs to (the view passes its own `library.id`, no `activeLibraryID` indirection).
     func retryRefresh(libraryID: String) {
         Task { try? await refreshItems(libraryID: libraryID) }
+    }
+
+    /// Joins `GET /api/me`'s `mediaProgress[]` into the cache's `CachedProgress` — THE source of
+    /// the home shelves' progress pills, since personalized-shelf entities carry NO progress field
+    /// (verified live). `HomeView` calls this on appear and on pull-to-refresh; from the connected
+    /// shell's perspective that is "on connect/activate" (Home is the initial surface) plus every
+    /// manual refresh. Deliberately NOT wired into `completeConnection`/`activateConnection`: those
+    /// flows are covered by a FIFO-ordered `MockTransport` test suite that asserts exact request
+    /// sequences, and a background `me()` there would perturb every connect-based test — so the
+    /// join is driven from the UI lifecycle instead, which is where the pill is actually consumed.
+    ///
+    /// Best-effort: an absent/failed `me()` leaves existing progress untouched. The upsert is
+    /// last-write-wins by `lastUpdate` (`upsertProgressBatch`), so a socket `progressUpdated` that
+    /// lands before or after this join never regresses the newer value; `me()` entries carry the
+    /// server's own `lastUpdate`, falling back to wall-clock only when the server omits it.
+    func refreshProgress() async {
+        guard let client, let connectionID = activeConnectionID else { return }
+        guard let me = try? await client.me() else { return }
+        // A connection switch during the me() round-trip must never write server-A progress under
+        // server-B's ID.
+        guard connectionID == activeConnectionID else { return }
+        let now = Int(Date().timeIntervalSince1970 * 1000)
+        let batch = (me.mediaProgress ?? []).map { entry in
+            CachedProgress(
+                connectionID: connectionID,
+                itemID: entry.libraryItemId,
+                episodeID: entry.episodeId,           // nil → "" per the 3-part PK
+                currentTime: entry.currentTime ?? 0,
+                isFinished: entry.isFinished ?? false,
+                lastUpdate: entry.lastUpdate ?? now)
+        }
+        try? cache.upsertProgressBatch(batch)
     }
 
     /// Retire the current session completely (ordering matters: flush → detach sync callback →
@@ -734,6 +961,7 @@ final class AppState {
         playback.unload()
         sessionHandle = nil
         playingConnectionID = nil
+        nowPlayingItemID = nil
     }
 
     func startPlayback(itemID: String) async {
@@ -758,6 +986,7 @@ final class AppState {
             // retires it first, while a mere connection *switch* leaves it playing (the handle
             // holds its own client, captured above — independent of `self.client`).
             playingConnectionID = owner
+            nowPlayingItemID = itemID
             playback.onSyncDue = { payload in
                 await handle.sync(currentTime: payload.currentTime, timeListened: payload.timeListened)
             }
