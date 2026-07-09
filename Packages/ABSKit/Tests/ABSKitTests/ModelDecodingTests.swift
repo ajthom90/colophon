@@ -271,9 +271,11 @@ private func fixture(_ name: String) throws -> Data {
         // `recently-added` on a PODCAST library is shelf `type` "podcast" (a book library's own
         // recently-added is `type` "book" — see `personalized.json`), and its entities decode as
         // `.book` (they carry `media`, not `recentEpisode`) — the PODCAST item itself, not an
-        // episode. This `type` is the ONLY discriminator available (the entity/media shape carries
-        // no `mediaType` of its own), and it's what M1c-c Task 7's home-shelf routing keys off of to
-        // send these cards to `PodcastDetailRoute` instead of `ItemDetailRoute`.
+        // episode. Fix round 2: the entity ALSO carries its OWN top-level `mediaType` ("podcast"
+        // here) — the PRECISE per-entity signal M1c-c Task 7's home-shelf routing prefers, falling
+        // back to the enclosing `Shelf.type` only when the entity omits it — to send these cards to
+        // `PodcastDetailRoute` instead of `ItemDetailRoute`. (The v1 claim that the entity carries
+        // "no mediaType of its own" was FALSE; corrected here and in `ShelfBookEntity`.)
         let recentlyAdded = try #require(shelves.first { $0.id == "recently-added" })
         #expect(recentlyAdded.type == "podcast")
         guard case let .book(podcastAsBook) = recentlyAdded.entities.first else {
@@ -282,10 +284,27 @@ private func fixture(_ name: String) throws -> Data {
         }
         #expect(podcastAsBook.id == "55967a7a-0b3e-4a2c-aaf9-45843286117a")
         #expect(podcastAsBook.media.metadata.title == "Colophon Test Podcast")
+        // The entity's OWN mediaType decodes as "podcast" (the routing's preferred signal).
+        #expect(podcastAsBook.mediaType == "podcast")
         // A podcast's shelf-entity metadata reports its author as "author", not "authorName" (the
         // book field) — verified live; a caller must fall back to `author` for a podcast entity.
         #expect(podcastAsBook.media.metadata.authorName == nil)
         #expect(podcastAsBook.media.metadata.author == "Colophon Dev")
+    }
+
+    /// A BOOK library's `recently-added` shelf entity carries `mediaType: "book"` (fix round 2,
+    /// grounded in `personalized.json`) — the counterpart to the podcast assertion above, proving the
+    /// per-entity mediaType is populated for both library kinds and that a book entity is never
+    /// mistaken for a podcast.
+    @Test func decodesBookShelfEntityMediaType() throws {
+        let shelves = try decoder.decode([Shelf].self, from: fixture("personalized"))
+        let recentlyAdded = try #require(shelves.first { $0.id == "recently-added" })
+        #expect(recentlyAdded.type == "book")
+        guard case let .book(book) = recentlyAdded.entities.first else {
+            Issue.record("expected a book shelf entity")
+            return
+        }
+        #expect(book.mediaType == "book")
     }
 
     /// `podcast-search.json` is a live `GET /api/libraries/:podcastLib/search?q=on` capture: `q=on`

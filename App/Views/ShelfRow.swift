@@ -54,7 +54,10 @@ struct ShelfRow: View {
                 author: book.media.metadata.authorName ?? book.media.metadata.author,
                 duration: book.media.duration,
                 progress: progressFor(book.id),
-                isPodcast: ShelfCardRouting.isPodcastBookEntity(shelfType: shelf.type))
+                // Prefer the entity's OWN mediaType (live-verified present on every recently-added
+                // entity); fall back to the shelf's type only if the entity ever omits it.
+                isPodcast: ShelfCardRouting.isPodcastBookEntity(
+                    entityMediaType: book.mediaType, shelfType: shelf.type))
         case .author(let author):
             AuthorCard(name: author.name)
         case .episode(let episode):
@@ -112,17 +115,23 @@ struct ShelfRow: View {
 /// `recently-added` shelf entities decode as `.book` (`ShelfBookEntity`) — they carry `media`, not
 /// `recentEpisode` — because they're podcast LIBRARY ITEMS, not episodes; the episode-typed shelves
 /// (`continue-listening`/`newest-episodes`) decode as `.episode` instead and never reach this check.
-/// Neither `ShelfBookEntity` nor `ShelfEntityMedia`/`ShelfEntityMetadata` carries a `mediaType` field
-/// of its own (verified against both the book and podcast fixtures — the shelf projection just omits
-/// it), so the entity's OWN shape can't distinguish a podcast from a book. The one signal that DOES
-/// distinguish them is the enclosing `Shelf.type`: `"book"` for a book library's `recently-added`
-/// (`personalized.json`) vs. `"podcast"` for a podcast library's (`podcast-personalized.json`) — ABS
-/// sets the shelf `type` to the library's own `mediaType` for this shelf (per the plan's source
-/// reference: "recently-added(type = library.mediaType)"). Misrouting a podcast to `ItemDetailRoute`
-/// would open the book detail page for something that isn't a book (no chapters/tracks/author-book
-/// concepts apply), so this check is load-bearing, not cosmetic.
+///
+/// **Fix round 2 (corrected grounding):** every `recently-added` shelf entity carries its OWN
+/// top-level `mediaType` field — LIVE-VERIFIED against BOTH fixtures: `"podcast"` in
+/// `podcast-personalized.json`, `"book"` in `personalized.json` (the v1 claim that shelf entities
+/// carry "no mediaType of their own" was FALSE — the field was simply unmapped on `ShelfBookEntity`).
+/// So the PRECISE, per-entity signal is `entityMediaType == "podcast"`; we prefer it when present.
+/// Only when the entity omits it (an older/variant server, or a projection that ever drops it) do we
+/// fall back to the enclosing `Shelf.type` — `"podcast"` for a podcast library's `recently-added`,
+/// `"book"` for a book library's (ABS sets it to the library's own `mediaType`, per the plan source:
+/// "recently-added(type = library.mediaType)"). Misrouting a podcast to `ItemDetailRoute` would open
+/// the book detail page for something that isn't a book (no chapters/tracks/author-book concepts
+/// apply), so this check is load-bearing, not cosmetic.
 enum ShelfCardRouting {
-    static func isPodcastBookEntity(shelfType: String) -> Bool {
-        shelfType == "podcast"
+    static func isPodcastBookEntity(entityMediaType: String?, shelfType: String) -> Bool {
+        if let entityMediaType, !entityMediaType.isEmpty {
+            return entityMediaType == "podcast"    // precise per-entity signal wins
+        }
+        return shelfType == "podcast"              // fallback: the enclosing shelf's type
     }
 }

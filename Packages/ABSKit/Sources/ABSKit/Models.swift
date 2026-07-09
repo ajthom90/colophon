@@ -213,6 +213,15 @@ public enum ShelfEntity: Decodable, Sendable {
 public struct ShelfBookEntity: Decodable, Sendable, Identifiable {
     public let id: String
     public let media: ShelfEntityMedia
+    /// The entity's OWN media type (`"book"` / `"podcast"`) — LIVE-CAPTURED (M1c-c Task 7,
+    /// `podcast-personalized.json` and `personalized.json`): EVERY `recently-added`/
+    /// `continue-listening` shelf entity carries this top-level field (a podcast library's is
+    /// `"podcast"`, a book library's is `"book"`). Optional/tolerant because an older/variant server
+    /// or a shelf projection that ever omits it must still decode — and because it lets the
+    /// podcast-vs-book routing (`ShelfCardRouting`) prefer this precise per-entity signal when present,
+    /// falling back to the enclosing `Shelf.type` only when it's absent. (The M1c-c Task 7 v1 claim
+    /// that shelf entities carry "no mediaType of their own" was WRONG — corrected here in fix round 2.)
+    public let mediaType: String?
 }
 
 /// Shared media projection for shelf book entities AND search's `book` bucket (verified live:
