@@ -139,6 +139,16 @@ public struct LibraryCacheStore: Sendable {
         }
     }
 
+    /// One browse-row item by its `(connectionID, id)` primary key, or nil if the item was never
+    /// cached. Offline playback (M2a Task 5) reads it for the now-playing title/author of a
+    /// downloaded book (the pinned `CachedItemDetail` carries chapters/description but not the
+    /// title/author, which live on this row).
+    public func item(connectionID: String, itemID: String) throws -> CachedItem? {
+        try pool.read {
+            try CachedItem.fetchOne($0, key: ["connectionID": connectionID, "id": itemID])
+        }
+    }
+
     public func progress(connectionID: String, itemID: String, episodeID: String? = nil) throws -> CachedProgress? {
         try pool.read {
             try CachedProgress.fetchOne($0, key: ["connectionID": connectionID,

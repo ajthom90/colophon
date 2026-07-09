@@ -179,6 +179,7 @@ enum Schema {
                 t.column("totalBytes", .integer).notNull().defaults(to: 0)
                 t.column("state", .text).notNull()             // queued/downloading/downloaded/failed
                 t.column("mimeType", .text)
+                t.column("durationSeconds", .double)           // this file's playback seconds (offline timeline)
                 t.primaryKey(["connectionID", "itemID", "episodeID", "trackIndex"])
             }
         }

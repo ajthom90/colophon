@@ -378,6 +378,12 @@ public struct CachedDownloadFile: Codable, FetchableRecord, PersistableRecord, S
     public var totalBytes: Int
     public var state: String
     public var mimeType: String?
+    /// This file's playback duration in seconds (from the server's `audioFile.duration`), captured
+    /// at download time. OFFLINE playback (M2a Task 5) needs it to rebuild the book's timeline —
+    /// each track's `startOffset` is the running sum of the preceding files' durations — with no
+    /// network. Nullable (an older download row, or a server that omitted the duration, leaves it
+    /// nil → the offline path treats that track as zero-length).
+    public var durationSeconds: Double?
 
     public var id: String { connectionID + "/" + itemID + "/" + episodeID + "/" + String(trackIndex) }
 
@@ -391,7 +397,8 @@ public struct CachedDownloadFile: Codable, FetchableRecord, PersistableRecord, S
         receivedBytes: Int = 0,
         totalBytes: Int = 0,
         state: String,
-        mimeType: String? = nil
+        mimeType: String? = nil,
+        durationSeconds: Double? = nil
     ) {
         self.connectionID = connectionID
         self.itemID = itemID
@@ -403,11 +410,12 @@ public struct CachedDownloadFile: Codable, FetchableRecord, PersistableRecord, S
         self.totalBytes = totalBytes
         self.state = state
         self.mimeType = mimeType
+        self.durationSeconds = durationSeconds
     }
 
     enum CodingKeys: String, CodingKey {
         case connectionID, itemID, episodeID, trackIndex, ino, localRelativePath, receivedBytes,
-             totalBytes, state, mimeType
+             totalBytes, state, mimeType, durationSeconds
     }
 }
 

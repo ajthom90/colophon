@@ -5,6 +5,7 @@ import ABSKit
 import ABSKitTestSupport
 import ABSRealtime
 import LibraryCache
+import PlayerEngine
 @testable import Colophon
 
 /// State-machine coverage for `AppState` — where both M1a merge-gating bugs lived. Every test
@@ -1744,5 +1745,187 @@ struct SettingsPlumbingTests {
 
         await app.startPlayback(itemID: "i1")   // re-open the SAME book
         #expect(app.playback.rate == 1.5)       // resumes at the persisted per-book rate
+    }
+
+    // MARK: - Offline playback from downloaded files (M2a Task 5)
+
+    /// Builds an `AppState` with an isolated temp downloads root, so an offline test can seed a
+    /// download's file at a path the `DownloadCoordinator` will resolve to.
+    private func makeAppWithDownloads(dir: URL, downloadsRoot: URL,
+                                      transport: Transport, tokenStore: any TokenStore) -> AppState {
+        AppState(
+            transportProvider: { transport },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: tokenStore,
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() },
+            downloadsRoot: downloadsRoot)
+    }
+
+    /// Seed a FULLY-downloaded single-file book: the pinned browse row (title/author) + detail
+    /// (chapters), an optional resume `cachedProgress`, a `.downloaded` parent + file row, and the
+    /// fake audio file on disk at the coordinator's resolved path. Returns the on-disk `file://` URL.
+    @discardableResult
+    private func seedDownloadedBook(
+        _ app: AppState, connectionID: String, itemID: String, downloadsRoot: URL,
+        duration: Double, currentTime: Double, title: String = "Downloaded Book",
+        author: String = "Local Author", chapters: [CachedChapter] = []
+    ) throws -> URL {
+        try app.cache.upsertItemsPage(
+            [CachedItem(id: itemID, connectionID: connectionID, libraryID: "L1",
+                        title: title, authorName: author, duration: duration, updatedAt: 1)],
+            connectionID: connectionID, libraryID: "L1")
+        try app.cache.upsertItemDetail(
+            CachedItemDetail(connectionID: connectionID, itemID: itemID, chapters: chapters))
+        if currentTime > 0 {
+            try app.cache.upsertProgress(CachedProgress(
+                connectionID: connectionID, itemID: itemID, currentTime: currentTime,
+                isFinished: false, lastUpdate: 1))
+        }
+        let rel = "\(connectionID)/\(itemID)/_/track-0.mp3"
+        try app.cache.upsertDownload(CachedDownload(
+            connectionID: connectionID, itemID: itemID, state: DownloadCoordinator.State.downloaded,
+            receivedBytes: 100, totalBytes: 100, updatedAt: 1))
+        try app.cache.upsertDownloadFile(CachedDownloadFile(
+            connectionID: connectionID, itemID: itemID, trackIndex: 0, ino: "111",
+            localRelativePath: rel, receivedBytes: 100, totalBytes: 100,
+            state: DownloadCoordinator.State.downloaded, mimeType: "audio/mpeg",
+            durationSeconds: duration))
+        let fileURL = downloadsRoot.appending(path: rel)
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("fake audio".utf8).write(to: fileURL)
+        return fileURL
+    }
+
+    /// THE offline-playback deliverable: a FULLY-downloaded item plays from LOCAL `file://` URLs with
+    /// ZERO network — no `/play` session opened — carrying `playMethod: local`, the cached chapters,
+    /// and the `cachedProgress` resume position, wired into the same now-playing state as streaming.
+    @Test func offlinePlaybackUsesLocalFilesWithNoPlayRequest() async throws {
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()          // nothing queued: a stream attempt would be visible
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        let chapters = [CachedChapter(id: 0, start: 0, end: 60, title: "Ch1"),
+                        CachedChapter(id: 1, start: 60, end: 120, title: "Ch2")]
+        let fileURL = try seedDownloadedBook(app, connectionID: "C1", itemID: "dl1",
+                                             downloadsRoot: downloadsRoot, duration: 120,
+                                             currentTime: 42, chapters: chapters)
+
+        await app.activateConnection("C1")       // no tokens → offline, client nil
+        #expect(app.activeConnectionID == "C1")
+        #expect(app.isOnline == false)
+
+        await app.startPlayback(itemID: "dl1")
+
+        // NOT a single request reached the server — no /play, no anything.
+        #expect(await transport.recorded.isEmpty)
+        // The LOCAL file was loaded (a file:// URL at the resolved downloads path).
+        #expect(app.playback.loadedTrackURLs == [fileURL])
+        #expect(app.playback.loadedTrackURLs.allSatisfy { $0.isFileURL })
+        // Local play method (ABS PlayMethod.LOCAL == 3).
+        #expect(app.playback.playMethod == LocalPlaybackSession.playMethodLocal)
+        // Now-playing state wired exactly like the streaming path.
+        #expect(app.nowPlayingItemID == "dl1")
+        #expect(app.nowPlayingEpisodeID == nil)
+        #expect(app.nowPlayingChapters.map(\.id) == [0, 1])   // chapters from the pinned cache detail
+        #expect(app.playback.isPlaying == true)
+        // Resumed at the cached progress position.
+        #expect(app.playback.globalTime == 42)
+    }
+
+    /// The SELECTION RULE's other half: a NON-downloaded item still STREAMS (opens a `/play` session)
+    /// — the existing path is unregressed by the offline branch.
+    @Test func nonDownloadedItemStillStreams() async throws {
+        let dir = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // /play for i1
+        let app = makeApp(dir: dir, transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+
+        await app.startPlayback(itemID: "i1")    // i1 has no download → must stream
+
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.hasSuffix("/items/i1/play") })
+        #expect(app.nowPlayingItemID == "i1")
+        #expect(app.playback.playMethod == 0)                          // streamed (envelope playMethod 0)
+        #expect(app.playback.loadedTrackURLs.allSatisfy { !$0.isFileURL })   // server URLs, not local
+    }
+
+    /// The guards are REUSED, not forked: while a streaming start is in-flight (parked on the /play
+    /// gate, `isStartingPlayback` held), a racing OFFLINE start of a downloaded item is DROPPED by the
+    /// SAME reentrancy guard — it never sneaks past to load local audio.
+    @Test func offlineStartIsDroppedByTheSharedReentrancyGuard() async throws {
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = GatedTransport(gatePath: "/play")
+        await transport.enqueue(status: 200, json: statusOK)
+        await transport.enqueue(status: 200, json: loginOK)
+        await transport.enqueue(status: 200, json: librariesOK)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // i1 /play (released after gate)
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+        let connID = try #require(app.activeConnectionID)
+        try seedDownloadedBook(app, connectionID: connID, itemID: "dl2",
+                               downloadsRoot: downloadsRoot, duration: 100, currentTime: 0)
+
+        // First tap: STREAMING i1, parked on the /play gate (guard held).
+        let first = Task { await app.startPlayback(itemID: "i1") }
+        while await transport.requestCount(pathContains: "/play") == 0 { await Task.yield() }
+
+        // Second tap while the first is in-flight: an OFFLINE downloaded item — dropped by the guard.
+        await app.startPlayback(itemID: "dl2")
+        #expect(app.nowPlayingItemID != "dl2")
+        #expect(app.playback.loadedTrackURLs.isEmpty)   // nothing loaded — i1 is still gated
+
+        await transport.openGate()
+        await first.value
+        #expect(await transport.requestCount(pathContains: "/play") == 1)   // only the first start ran
+        #expect(app.nowPlayingItemID == "i1")
+    }
+
+    /// Task-5 progress scope (local only): the OFFLINE session's `onSyncDue` writes `cachedProgress`
+    /// LOCALLY on each due tick / flush — with NO network — so the resume + UI reflect an offline
+    /// listen. (Task 6 fills the `onOfflineProgressAccrued` seam for server sync-back.)
+    @Test func offlineOnSyncDueWritesLocalProgressWithoutNetwork() async throws {
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try seedDownloadedBook(app, connectionID: "C1", itemID: "dl1",
+                               downloadsRoot: downloadsRoot, duration: 120, currentTime: 0)
+        await app.activateConnection("C1")
+        await app.startPlayback(itemID: "dl1")
+        #expect(app.playback.playMethod == LocalPlaybackSession.playMethodLocal)
+
+        // Also proves the Task-6 seam is invoked with the same payload.
+        var seamPayload: SyncPayload?
+        app.onOfflineProgressAccrued = { _, _, payload in seamPayload = payload }
+
+        // Drive the offline sync sink directly (the exact closure a tick / pause / retire invokes).
+        let synced = await app.playback.onSyncDue?(SyncPayload(currentTime: 63.5, timeListened: 20))
+        #expect(synced == true)
+
+        let progress = try #require((try? app.cache.progress(connectionID: "C1", itemID: "dl1")) ?? nil)
+        #expect(progress.currentTime == 63.5)      // offline listen reflected locally
+        #expect(seamPayload?.currentTime == 63.5)  // Task-6 seam saw it too
+        #expect(await transport.recorded.isEmpty)  // NO network
     }
 }

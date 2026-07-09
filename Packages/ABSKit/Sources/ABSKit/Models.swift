@@ -183,6 +183,39 @@ public struct PlaybackSession: Decodable, Sendable {
     public let playMethod: Int
     public let audioTracks: [AudioTrack]
     public let chapters: [Chapter]
+
+    /// LOCAL constructor (M2a Task 5): builds a `PlaybackSession` for OFFLINE playback of a
+    /// fully-downloaded item — one that never had a server `/play` round trip. The app assembles it
+    /// from cached pieces (local `file://` tracks, the pinned detail's chapters, `cachedProgress`'s
+    /// resume `startTime`) and hands it to `PlayerEngine.load(session:trackURLs:)` unchanged, with
+    /// `playMethod` = `LocalPlaybackSession.playMethodLocal` (ABS `PlayMethod.LOCAL`, `3`). This is
+    /// additive: the decoder's synthesized `init(from:)` is untouched (the streaming path still
+    /// decodes the server envelope).
+    public init(
+        id: String,
+        libraryItemId: String,
+        episodeId: String? = nil,
+        displayTitle: String?,
+        displayAuthor: String?,
+        duration: Double,
+        startTime: Double,
+        currentTime: Double? = nil,
+        playMethod: Int,
+        audioTracks: [AudioTrack],
+        chapters: [Chapter]
+    ) {
+        self.id = id
+        self.libraryItemId = libraryItemId
+        self.episodeId = episodeId
+        self.displayTitle = displayTitle
+        self.displayAuthor = displayAuthor
+        self.duration = duration
+        self.startTime = startTime
+        self.currentTime = currentTime
+        self.playMethod = playMethod
+        self.audioTracks = audioTracks
+        self.chapters = chapters
+    }
 }
 
 public struct AudioTrack: Decodable, Sendable {
@@ -192,6 +225,25 @@ public struct AudioTrack: Decodable, Sendable {
     public let title: String?
     public let contentUrl: String?
     public let mimeType: String?
+
+    /// Memberwise constructor for a LOCALLY-built track (M2a Task 5) — the offline path synthesizes
+    /// tracks from cached per-file durations (`contentUrl` is nil: local playback feeds `file://`
+    /// URLs directly to the player, never resolving a server content path).
+    public init(
+        index: Int,
+        startOffset: Double,
+        duration: Double,
+        title: String? = nil,
+        contentUrl: String? = nil,
+        mimeType: String? = nil
+    ) {
+        self.index = index
+        self.startOffset = startOffset
+        self.duration = duration
+        self.title = title
+        self.contentUrl = contentUrl
+        self.mimeType = mimeType
+    }
 }
 
 public struct Chapter: Decodable, Sendable, Identifiable {
@@ -199,6 +251,15 @@ public struct Chapter: Decodable, Sendable, Identifiable {
     public let start: Double
     public let end: Double
     public let title: String?
+
+    /// Memberwise constructor (M2a Task 5) — lets the offline path rebuild chapters from the pinned
+    /// `CachedItemDetail`'s cached `{id,start,end,title}` marks. Additive; the decoder is untouched.
+    public init(id: Int, start: Double, end: Double, title: String? = nil) {
+        self.id = id
+        self.start = start
+        self.end = end
+        self.title = title
+    }
 }
 
 // MARK: - Browse, search, and me (Task 5)

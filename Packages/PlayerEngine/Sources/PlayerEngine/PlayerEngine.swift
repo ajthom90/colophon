@@ -18,6 +18,17 @@ public final class PlaybackController {
     /// reads chapters from `AppState.nowPlayingChapters` separately; this is the engine's own copy
     /// so the now-playing surface stays self-contained.
     public private(set) var chapters: [Chapter] = []
+    /// The track URLs handed to the backend by the most recent `load()` — the exact ordered queue
+    /// now playing. Streaming loads set these to server `/public/session/.../track/N` URLs; an
+    /// OFFLINE load (M2a Task 5) sets them to local `file://` URLs. Exposed so `AppState` and its
+    /// tests can confirm which SOURCE a session actually loaded (file vs. network) without reaching
+    /// into the backend. `[]` before the first load.
+    public private(set) var loadedTrackURLs: [URL] = []
+    /// The ABS `PlayMethod` of the currently loaded session (`0/1/2` = direct/stream/transcode,
+    /// `3` = local). Copied from the loaded `PlaybackSession` in `load()`; `-1` before any load.
+    /// Lets `AppState`/tests confirm an offline session loaded with `playMethod == local` — the
+    /// one field that distinguishes an offline source from a streamed one on the player.
+    public private(set) var playMethod: Int = -1
     /// The current book's cover-art bytes for the now-playing surface. `AppState` loads these from
     /// its disk cover cache in `startPlayback` and hands them here via `setNowPlayingArtwork`;
     /// `NowPlayingUpdater` builds the platform `MPMediaItemArtwork`. `nil` until the app supplies the
@@ -109,6 +120,8 @@ public final class PlaybackController {
         title = session.displayTitle ?? "Untitled"
         author = authorOverride ?? session.displayAuthor ?? ""
         chapters = session.chapters          // now-playing chapter number/title source (Task 9)
+        loadedTrackURLs = trackURLs          // the exact ordered queue (file:// offline, http streaming)
+        playMethod = session.playMethod      // 3 = local (offline), 0/1/2 = a server stream
         artworkData = nil                    // fresh book → drop the previous cover until AppState resupplies
         sync = SessionSyncController()
         syncInFlight = false

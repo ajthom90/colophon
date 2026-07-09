@@ -180,7 +180,8 @@ final class DownloadCoordinator {
                 connectionID: connectionID, itemID: itemID, episodeID: episode,
                 trackIndex: planned.trackIndex, ino: planned.ino,
                 localRelativePath: planned.relativePath, receivedBytes: 0, totalBytes: planned.size,
-                state: State.downloading, mimeType: planned.mimeType))
+                state: State.downloading, mimeType: planned.mimeType,
+                durationSeconds: planned.durationSeconds))
         }
 
         // Enqueue each file. The download URL is RE-DERIVED here (its token is bearer-equivalent and
@@ -263,7 +264,8 @@ final class DownloadCoordinator {
         let filename = ext.map { "track-\(trackIndex).\($0)" } ?? "track-\(trackIndex)"
         let relativePath = "\(connectionID)/\(itemID)/\(episodeSegment)/\(filename)"
         return PlannedFile(trackIndex: trackIndex, ino: audioFile.ino, relativePath: relativePath,
-                           size: audioFile.metadata?.size ?? 0, mimeType: audioFile.mimeType)
+                           size: audioFile.metadata?.size ?? 0, mimeType: audioFile.mimeType,
+                           durationSeconds: audioFile.duration)
     }
 
     private func markParentFailed(connectionID: String, itemID: String, episodeID: String) {
@@ -359,6 +361,9 @@ private struct PlannedFile {
     let relativePath: String
     let size: Int
     let mimeType: String?
+    /// The file's playback seconds (`audioFile.duration`), persisted so OFFLINE playback (Task 5)
+    /// can rebuild the book timeline with no network. nil when the server omits it.
+    let durationSeconds: Double?
 }
 
 /// The opaque per-file transfer key `"<connectionID>/<itemID>/<episodeID>/<trackIndex>"` and its

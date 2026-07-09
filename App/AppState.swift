@@ -1110,11 +1110,20 @@ final class AppState {
     /// deterministically before severing onSyncDue (idempotent: a harmless no-op if pause()'s
     /// internal flush already landed).
     private func retireCurrentSession() async {
-        guard let handle = sessionHandle else { return }
+        // Retire EITHER a streaming session (`sessionHandle` present) OR an OFFLINE one (M2a Task 5:
+        // no server handle, but a loaded local session — flagged by `nowPlayingItemID`). Nothing
+        // loaded → nothing to retire. The flush-then-detach ordering is shared by both: for a
+        // streaming session `flushOnly` drives `onSyncDue`→`handle.sync`; for an offline one it drives
+        // `onSyncDue`→the LOCAL `cachedProgress` write — the sole divergence is the sync SINK, not the
+        // teardown sequence.
+        guard sessionHandle != nil || nowPlayingItemID != nil else { return }
         playback.pause()
         await playback.flushOnly()
         playback.onSyncDue = nil
-        await handle.close(currentTime: playback.globalTime, timeListened: 0)
+        // Only a streaming session has a server session to close; an offline one never opened one.
+        if let handle = sessionHandle {
+            await handle.close(currentTime: playback.globalTime, timeListened: 0)
+        }
         playback.unload()
         sessionHandle = nil
         playingConnectionID = nil
@@ -1152,11 +1161,30 @@ final class AppState {
         guard !isStartingPlayback else { return }
         isStartingPlayback = true
         defer { isStartingPlayback = false }
-        guard let client else { return }
         // Captured NOW, before any await below — a connection switch racing the awaits (e.g.
         // during `retireCurrentSession`'s flush/close or the /play round trip) must not be
-        // misattributed as this session's owner.
+        // misattributed as this session's owner. Shared by BOTH the offline and streaming branches.
         let owner = activeConnectionID
+        let episode = episodeId ?? ""
+
+        // OFFLINE-SOURCE branch (M2a Task 5): SELECTION RULE — prefer LOCAL files ONLY when this
+        // (item, episode) is FULLY `.downloaded`; a partial/absent download falls through to the
+        // streaming path below. Checked BEFORE requiring a live `client`/network, so a downloaded
+        // item plays with the server unreachable — and, even when online, a downloaded item STILL
+        // plays from local (downloads-first; a user-facing "prefer downloads" toggle is post-v1).
+        // The ONLY divergence from streaming is the SOURCE (local files + a locally-built session vs.
+        // a `/play` envelope): the reentrancy guard, epoch owner capture, and `retireCurrentSession`
+        // are the SAME — no forked guard logic.
+        if let owner, let source = localPlaybackSource(connectionID: owner, itemID: itemID, episodeID: episode) {
+            await retireCurrentSession()
+            loadOfflineSession(owner: owner, itemID: itemID, episodeId: episodeId,
+                               podcastTitle: podcastTitle, source: source)
+            return
+        }
+
+        // STREAMING branch: requires a live client. Guarded HERE (not before the offline check) so an
+        // OFFLINE tap on a NON-downloaded item is a clean no-op that never disturbs current playback.
+        guard let client else { return }
         // Retire the old session completely before touching the new one.
         await retireCurrentSession()
         do {
@@ -1226,6 +1254,141 @@ final class AppState {
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    // MARK: - Offline playback (M2a Task 5)
+
+    /// TASK 6 SEAM (offline sync-back): fired on every OFFLINE sync tick / flush with the same
+    /// `(itemID, episodeID, payload)` written to `cachedProgress`. Task 5 accrues progress LOCALLY
+    /// only; Task 6 fills this hook to ALSO record a local `PlaybackSession` row (client UUID,
+    /// `playMethod: local`, accruing `timeListened`) and, with an `NWPathMonitor` reachability
+    /// signal, reconcile it to the server on reconnect via `POST /api/session/local-all`. `nil` (a
+    /// no-op) this milestone — additive, so wiring it needs no change to the offline player path.
+    var onOfflineProgressAccrued: ((_ itemID: String, _ episodeID: String, _ payload: SyncPayload) -> Void)?
+
+    /// Resolve the LOCAL playback source for a FULLY-downloaded `(item, episode)`, or `nil` to fall
+    /// through to streaming. "Fully downloaded" = a `cachedDownload` in state `.downloaded` whose
+    /// every file row is `.downloaded` AND present on disk (a missing file → `nil`, so a half-evicted
+    /// download streams rather than handing AVFoundation a dangling `file://` URL). Builds ordered
+    /// `file://` track URLs (by `trackIndex`); the timeline (each track's `startOffset` = the running
+    /// sum of the preceding cached per-file durations); chapters from the pinned `CachedItemDetail`;
+    /// and the resume `startTime` from `cachedProgress` (clamped to the total). Pure cache/disk reads
+    /// — NO network.
+    private func localPlaybackSource(connectionID: String, itemID: String, episodeID: String) -> LocalPlaybackSource? {
+        guard let wf = (try? cache.download(connectionID: connectionID, itemID: itemID,
+                                            episodeID: episodeID)) ?? nil,
+              wf.download.state == DownloadCoordinator.State.downloaded,
+              !wf.files.isEmpty,
+              wf.files.allSatisfy({ $0.state == DownloadCoordinator.State.downloaded })
+        else { return nil }
+
+        var trackURLs: [URL] = []
+        var audioTracks: [AudioTrack] = []
+        var runningOffset = 0.0
+        for file in wf.files.sorted(by: { $0.trackIndex < $1.trackIndex }) {
+            let url = downloads.localURL(for: file)
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            let duration = file.durationSeconds ?? 0
+            trackURLs.append(url)
+            audioTracks.append(AudioTrack(index: file.trackIndex, startOffset: runningOffset,
+                                          duration: duration, mimeType: file.mimeType))
+            runningOffset += duration
+        }
+        let total = runningOffset
+
+        let chapters = ((try? cache.itemDetail(connectionID: connectionID, itemID: itemID)) ?? nil)?
+            .chapters.map { Chapter(id: $0.id, start: $0.start, end: $0.end, title: $0.title) } ?? []
+
+        let progress = (try? cache.progress(connectionID: connectionID, itemID: itemID,
+                                            episodeID: episodeID.isEmpty ? nil : episodeID)) ?? nil
+        let startTime = min(max(progress?.currentTime ?? 0, 0), total)
+
+        let title: String?
+        let author: String?
+        if episodeID.isEmpty {
+            let item = (try? cache.item(connectionID: connectionID, itemID: itemID)) ?? nil
+            title = item?.title
+            author = item?.authorName
+        } else {
+            let episode = ((try? cache.episodes(connectionID: connectionID, itemID: itemID)) ?? [])
+                .first { $0.episodeID == episodeID }
+            title = episode?.title
+            author = nil   // the podcast title arrives via `podcastTitle` → `authorOverride` in load()
+        }
+        return LocalPlaybackSource(trackURLs: trackURLs, audioTracks: audioTracks, chapters: chapters,
+                                   startTime: startTime, duration: total, title: title, author: author)
+    }
+
+    /// Load a LOCAL session into the SHARED player (M2a Task 5) — the offline twin of the streaming
+    /// branch's envelope wiring, reusing `PlayerEngine.load`/`play` and the SAME now-playing state
+    /// (`nowPlayingItemID`/`nowPlayingEpisodeID`/`nowPlayingChapters`, sleep-timer chapters, per-book
+    /// rate). No `/play` call and no `PlaybackSessionHandle`: `onSyncDue` writes `cachedProgress`
+    /// LOCALLY instead of syncing to a server. Called only from `startPlayback`, already inside the
+    /// shared reentrancy guard and after `retireCurrentSession`.
+    private func loadOfflineSession(owner: String, itemID: String, episodeId: String?,
+                                    podcastTitle: String?, source: LocalPlaybackSource) {
+        let episode = episodeId ?? ""
+        let session = PlaybackSession(
+            id: "local-\(owner)-\(itemID)-\(episode)",
+            libraryItemId: itemID,
+            episodeId: episodeId,
+            displayTitle: source.title,
+            displayAuthor: source.author,
+            duration: source.duration,
+            startTime: source.startTime,
+            currentTime: source.startTime,
+            playMethod: LocalPlaybackSession.playMethodLocal,   // 3 = ABS PlayMethod.LOCAL
+            audioTracks: source.audioTracks,
+            chapters: source.chapters)
+
+        // No server session/handle — offline playback never opened `/play`.
+        sessionHandle = nil
+        playingConnectionID = owner
+        nowPlayingItemID = itemID
+        nowPlayingEpisodeID = episodeId
+        nowPlayingChapters = source.chapters
+        sleepTimer.chapters = source.chapters
+        sleepTimer.turnOff()
+
+        // Offline sync SINK: write `cachedProgress` LOCALLY on each due tick / flush — NO network
+        // (last-write-wins locally by wall-clock). Returning true marks the delta consumed; the
+        // Task-6 seam runs alongside for future server sync-back.
+        playback.onSyncDue = { [weak self] payload in
+            guard let self else { return true }
+            self.writeLocalProgress(connectionID: owner, itemID: itemID, episodeID: episode,
+                                    currentTime: payload.currentTime)
+            self.onOfflineProgressAccrued?(itemID, episode, payload)
+            return true
+        }
+
+        // Mirror the streaming branch's pre-`load` setup: advertise the skip interval BEFORE load()
+        // (NowPlayingUpdater.configure reads it), then the podcast-title-as-author override.
+        playback.skipInterval = Self.storedSkipInterval()
+        let authorOverride = (episodeId != nil && !(podcastTitle ?? "").isEmpty) ? podcastTitle : nil
+        playback.load(session: session, trackURLs: source.trackURLs, authorOverride: authorOverride)
+        // Per-book stored rate (falls back to the global default) — same as the streaming branch.
+        let storedRate = (try? cache.playbackRate(connectionID: owner, itemID: itemID)) ?? nil
+        playback.rate = Float(storedRate ?? Self.storedDefaultRate())
+        playback.play()
+
+        // Now-playing artwork from the disk cover cache (best-effort; skipped when offline/no client).
+        Task { await loadNowPlayingArtwork(itemID: itemID, connectionID: owner) }
+    }
+
+    /// Write offline playback progress to `cachedProgress` (M2a Task 5) — the UI's progress pills and
+    /// the next resume read this, so an offline listen is reflected with no server. Last-write-wins
+    /// locally (`upsertProgress` compares `lastUpdate`; a fresh wall-clock stamp beats older server
+    /// progress). `isFinished` is preserved from any existing row (offline finished-detection +
+    /// server reconcile are Task 6). NO network.
+    private func writeLocalProgress(connectionID: String, itemID: String, episodeID: String,
+                                    currentTime: Double) {
+        let existing = (try? cache.progress(connectionID: connectionID, itemID: itemID,
+                                            episodeID: episodeID.isEmpty ? nil : episodeID)) ?? nil
+        try? cache.upsertProgress(CachedProgress(
+            connectionID: connectionID, itemID: itemID,
+            episodeID: episodeID.isEmpty ? nil : episodeID,
+            currentTime: currentTime, isFinished: existing?.isFinished ?? false,
+            lastUpdate: Int(Date().timeIntervalSince1970 * 1000)))
     }
 
     /// Loads the now-playing book's cover bytes (through the disk-backed `CoverStore`, the same
@@ -1409,4 +1572,22 @@ final class AppState {
         }
     }
     #endif
+}
+
+/// The resolved LOCAL playback source for a fully-downloaded item/episode (M2a Task 5) — the cached
+/// pieces `localPlaybackSource` gathers and `loadOfflineSession` assembles into a local
+/// `PlaybackSession`. A transient value passed between the two; never persisted.
+private struct LocalPlaybackSource {
+    /// Ordered `file://` URLs for the downloaded tracks (by `trackIndex`).
+    let trackURLs: [URL]
+    /// One `AudioTrack` per file — `startOffset` is the running sum of preceding durations, so the
+    /// shared `BookTimeline` maps global time onto the local files exactly as it does for a stream.
+    let audioTracks: [AudioTrack]
+    let chapters: [Chapter]
+    /// Resume position from `cachedProgress` (clamped to `duration`).
+    let startTime: Double
+    /// Total playback seconds (sum of per-file durations).
+    let duration: Double
+    let title: String?
+    let author: String?
 }
