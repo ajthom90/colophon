@@ -1273,7 +1273,9 @@ final class AppState {
     /// `file://` track URLs (by `trackIndex`); the timeline (each track's `startOffset` = the running
     /// sum of the preceding cached per-file durations); chapters from the pinned `CachedItemDetail`;
     /// and the resume `startTime` from `cachedProgress` (clamped to the total). Pure cache/disk reads
-    /// — NO network.
+    /// — NO network. Returns `nil` (→ stream) when a per-file duration is missing AND a client is
+    /// available, so a broken local timeline never wins over streaming's correct one (offline, it
+    /// plays degraded best-effort instead — see the loop).
     private func localPlaybackSource(connectionID: String, itemID: String, episodeID: String) -> LocalPlaybackSource? {
         guard let wf = (try? cache.download(connectionID: connectionID, itemID: itemID,
                                             episodeID: episodeID)) ?? nil,
@@ -1285,15 +1287,26 @@ final class AppState {
         var trackURLs: [URL] = []
         var audioTracks: [AudioTrack] = []
         var runningOffset = 0.0
+        var anyDurationMissing = false
         for file in wf.files.sorted(by: { $0.trackIndex < $1.trackIndex }) {
             let url = downloads.localURL(for: file)
             guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            // A nil per-file duration (the server omitted `audioFile.duration`) would make a
+            // ZERO-LENGTH track — resume lost for a single-file book, and misaligned/skipped audio
+            // for a multi-file one. When ONLINE (a live client can open a `/play` session with the
+            // server-computed track offsets), fall back to streaming rather than build a broken
+            // timeline; when OFFLINE, play best-effort degraded (see the guard below).
+            if file.durationSeconds == nil { anyDurationMissing = true }
             let duration = file.durationSeconds ?? 0
             trackURLs.append(url)
             audioTracks.append(AudioTrack(index: file.trackIndex, startOffset: runningOffset,
                                           duration: duration, mimeType: file.mimeType))
             runningOffset += duration
         }
+        // If any track's duration is missing AND we could stream instead (online), prefer streaming's
+        // correct timeline over this broken-local one. Offline (no client), proceed best-effort —
+        // degraded playback beats no playback — accepting a possibly-wrong resume/track alignment.
+        if anyDurationMissing, client != nil { return nil }
         let total = runningOffset
 
         let chapters = ((try? cache.itemDetail(connectionID: connectionID, itemID: itemID)) ?? nil)?

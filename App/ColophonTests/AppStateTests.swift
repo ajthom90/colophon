@@ -1770,7 +1770,8 @@ struct SettingsPlumbingTests {
     private func seedDownloadedBook(
         _ app: AppState, connectionID: String, itemID: String, downloadsRoot: URL,
         duration: Double, currentTime: Double, title: String = "Downloaded Book",
-        author: String = "Local Author", chapters: [CachedChapter] = []
+        author: String = "Local Author", chapters: [CachedChapter] = [],
+        nilFileDuration: Bool = false
     ) throws -> URL {
         try app.cache.upsertItemsPage(
             [CachedItem(id: itemID, connectionID: connectionID, libraryID: "L1",
@@ -1790,6 +1791,43 @@ struct SettingsPlumbingTests {
         try app.cache.upsertDownloadFile(CachedDownloadFile(
             connectionID: connectionID, itemID: itemID, trackIndex: 0, ino: "111",
             localRelativePath: rel, receivedBytes: 100, totalBytes: 100,
+            state: DownloadCoordinator.State.downloaded, mimeType: "audio/mpeg",
+            durationSeconds: nilFileDuration ? nil : duration))
+        let fileURL = downloadsRoot.appending(path: rel)
+        try FileManager.default.createDirectory(
+            at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try Data("fake audio".utf8).write(to: fileURL)
+        return fileURL
+    }
+
+    /// Seed a FULLY-downloaded single-file podcast EPISODE (episodeID set): the pinned `cachedEpisode`
+    /// (title) + detail (chapters), an optional resume `cachedProgress` on the 3-part episode key, a
+    /// `.downloaded` parent + file row, and the fake audio file on disk at the coordinator's resolved
+    /// episode path (`…/<itemID>/<episodeID>/track-0.mp3`). Returns the on-disk `file://` URL.
+    @discardableResult
+    private func seedDownloadedEpisode(
+        _ app: AppState, connectionID: String, itemID: String, episodeID: String, downloadsRoot: URL,
+        duration: Double, currentTime: Double, episodeTitle: String = "Episode One",
+        chapters: [CachedChapter] = []
+    ) throws -> URL {
+        try app.cache.upsertEpisodes(
+            [CachedEpisode(connectionID: connectionID, itemID: itemID, episodeID: episodeID,
+                           title: episodeTitle, durationSeconds: duration)],
+            connectionID: connectionID, itemID: itemID)
+        try app.cache.upsertItemDetail(
+            CachedItemDetail(connectionID: connectionID, itemID: itemID, chapters: chapters))
+        if currentTime > 0 {
+            try app.cache.upsertProgress(CachedProgress(
+                connectionID: connectionID, itemID: itemID, episodeID: episodeID,
+                currentTime: currentTime, isFinished: false, lastUpdate: 1))
+        }
+        let rel = "\(connectionID)/\(itemID)/\(episodeID)/track-0.mp3"
+        try app.cache.upsertDownload(CachedDownload(
+            connectionID: connectionID, itemID: itemID, episodeID: episodeID,
+            state: DownloadCoordinator.State.downloaded, receivedBytes: 100, totalBytes: 100, updatedAt: 1))
+        try app.cache.upsertDownloadFile(CachedDownloadFile(
+            connectionID: connectionID, itemID: itemID, episodeID: episodeID, trackIndex: 0,
+            ino: "222", localRelativePath: rel, receivedBytes: 100, totalBytes: 100,
             state: DownloadCoordinator.State.downloaded, mimeType: "audio/mpeg",
             durationSeconds: duration))
         let fileURL = downloadsRoot.appending(path: rel)
@@ -1927,5 +1965,80 @@ struct SettingsPlumbingTests {
         #expect(progress.currentTime == 63.5)      // offline listen reflected locally
         #expect(seamPayload?.currentTime == 63.5)  // Task-6 seam saw it too
         #expect(await transport.recorded.isEmpty)  // NO network
+    }
+
+    /// The offline path for a downloaded EPISODE (episodeID != ""): plays from the LOCAL episode file
+    /// with ZERO network — NO `/play/:episodeId` — carrying `playMethod: local`, the episode's title
+    /// (from `cachedEpisode`), the podcast title as the now-playing author (`podcastTitle` →
+    /// `authorOverride`), and the episode's own `cachedProgress` resume position. Exercises the
+    /// episode branch of `localPlaybackSource` (nowPlayingEpisodeID + episode-title assertions below
+    /// hold ONLY on that branch — the book branch would leave the episode id nil and the author blank).
+    @Test func offlineEpisodePlaybackUsesLocalFileWithNoPlayRequest() async throws {
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        let chapters = [CachedChapter(id: 0, start: 0, end: 200, title: "Part 1")]
+        let fileURL = try seedDownloadedEpisode(app, connectionID: "C1", itemID: "pod1", episodeID: "ep1",
+                                                downloadsRoot: downloadsRoot, duration: 400,
+                                                currentTime: 90, episodeTitle: "Episode One", chapters: chapters)
+
+        await app.activateConnection("C1")       // no tokens → offline, client nil
+        #expect(app.isOnline == false)
+
+        await app.startPlayback(itemID: "pod1", episodeId: "ep1", podcastTitle: "Colophon Test Podcast")
+
+        // NO server /play/:episodeId — no request at all.
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(!paths.contains { $0.contains("/play") })
+        #expect(await transport.recorded.isEmpty)
+        // Loaded the LOCAL episode file.
+        #expect(app.playback.loadedTrackURLs == [fileURL])
+        #expect(app.playback.loadedTrackURLs.allSatisfy { $0.isFileURL })
+        #expect(app.playback.playMethod == LocalPlaybackSession.playMethodLocal)
+        // Episode now-playing wiring — the episode branch.
+        #expect(app.nowPlayingItemID == "pod1")
+        #expect(app.nowPlayingEpisodeID == "ep1")
+        #expect(app.nowPlayingChapters.map(\.id) == [0])
+        #expect(app.playback.title == "Episode One")             // title from cachedEpisode
+        #expect(app.playback.author == "Colophon Test Podcast")  // podcastTitle → authorOverride
+        #expect(app.playback.isPlaying == true)
+        #expect(app.playback.globalTime == 90)                   // resume from the episode's cachedProgress
+    }
+
+    /// Robustness of the SELECTION RULE: a fully-downloaded item whose per-file duration is MISSING
+    /// (server omitted `audioFile.duration` → a nil `durationSeconds` → a zero-length/broken local
+    /// timeline) STREAMS when a client is available, rather than playing a broken local timeline. The
+    /// offline degraded path (no client) is intentionally not taken here — this asserts the online
+    /// fallback.
+    @Test func downloadedItemWithMissingDurationStreamsWhenOnline() async throws {
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: playSessionJSON)   // the streaming fallback /play
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://a:13378", username: "root", password: "pw")
+        #expect(app.phase == .connected)
+        let connID = try #require(app.activeConnectionID)
+        // Fully downloaded + on disk, but its file has NO duration → a broken local timeline.
+        try seedDownloadedBook(app, connectionID: connID, itemID: "dlN", downloadsRoot: downloadsRoot,
+                               duration: 100, currentTime: 30, nilFileDuration: true)
+
+        await app.startPlayback(itemID: "dlN")
+
+        // Online + broken local timeline → fall back to STREAMING (correct server-computed offsets).
+        let paths = await transport.recorded.compactMap { $0.url?.path }
+        #expect(paths.contains { $0.hasSuffix("/items/dlN/play") })
+        #expect(app.nowPlayingItemID == "dlN")
+        #expect(app.playback.playMethod == 0)                            // streamed, not local
+        #expect(app.playback.loadedTrackURLs.allSatisfy { !$0.isFileURL })   // server URLs, not file
     }
 }
