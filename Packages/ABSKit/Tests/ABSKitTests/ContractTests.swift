@@ -303,7 +303,12 @@ struct ContractTests {
             deviceInfo: DeviceInfo(deviceId: "contract-test-local-all", clientVersion: "0.1.0", model: "test"),
             startedAt: nowMillis - 60_000, updatedAt: nowMillis)
 
-        try await client.syncLocalSessions([session])
+        let results = try await client.syncLocalSessions([session])
+        #expect(results.count == 1, "server must return one result per posted session")
+        let result = try #require(results.first)
+        #expect(result.id == session.id, "the server echoes back the posted session id")
+        #expect(result.success == true, "a valid seeded item must sync successfully")
+        #expect(result.error == nil)
 
         let synced = try #require(await rawMediaProgress(client, libraryItemId: itemID, episodeId: nil),
                                   "expected /api/me to carry progress for this item after the batch sync")

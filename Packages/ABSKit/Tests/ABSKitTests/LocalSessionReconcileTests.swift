@@ -136,8 +136,40 @@ import ABSKitTestSupport
 
     @Test func syncLocalSessionsIsANoOpForAnEmptyBatch() async throws {
         let (client, transport) = try await makeSUT()
-        try await client.syncLocalSessions([])
+        let results = try await client.syncLocalSessions([])
+        #expect(results.isEmpty)
         #expect(await transport.requestCount() == 0)
+    }
+
+    /// The server answers HTTP 200 even when INDIVIDUAL sessions are rejected — `syncLocalSessions`
+    /// must decode and RETURN the per-session verdicts so Task 6 prunes only the successful ones
+    /// (a rejected session's offline listen time must not be silently lost). Tolerant decode:
+    /// `error` present on failures, absent on success; an unmodeled `progressSynced` is ignored.
+    @Test func syncLocalSessionsReturnsMixedPerSessionResults() async throws {
+        let (client, transport) = try await makeSUT()
+        await transport.enqueue(status: 200, json: #"""
+        {"results":[
+          {"id":"sess-ok","success":true,"progressSynced":true},
+          {"id":"sess-bad","success":false,"error":"Media item not found"}
+        ]}
+        """#)
+
+        let ok = makeSession(id: "sess-ok", libraryItemId: "li_1")
+        let bad = makeSession(id: "sess-bad", libraryItemId: "li_gone")
+        let results = try await client.syncLocalSessions([ok, bad])
+
+        #expect(results.count == 2)
+        let okResult = try #require(results.first { $0.id == "sess-ok" })
+        #expect(okResult.success == true)
+        #expect(okResult.error == nil)
+
+        let badResult = try #require(results.first { $0.id == "sess-bad" })
+        #expect(badResult.success == false)
+        #expect(badResult.error == "Media item not found")
+
+        // What Task 6 will actually do: prune only the successes.
+        let prunable = Set(results.filter(\.success).map(\.id))
+        #expect(prunable == ["sess-ok"])
     }
 
     // MARK: - progressReconcileView()
@@ -152,16 +184,38 @@ import ABSKitTestSupport
         """#)
 
         let view = try await client.progressReconcileView()
-        let book = try #require(view["li_1"])
+        let book = try #require(view.progress(itemID: "li_1"))
         #expect(book.currentTime == 30)
         #expect(book.lastUpdate == 1_700_000_000_000)
 
-        let episode = try #require(view["li_2", "ep_1"])
+        let episode = try #require(view.progress(itemID: "li_2", episodeID: "ep_1"))
         #expect(episode.currentTime == 120)
         #expect(episode.lastUpdate == 1_700_000_005_000)
 
-        #expect(view["li_2"] == nil, "the book-only subscript must NOT match a different item's episode row")
-        #expect(view["li_3"] == nil)
+        #expect(view.progress(itemID: "li_2") == nil, "the book-only lookup must NOT match a different item's episode row")
+        #expect(view.progress(itemID: "li_3") == nil)
+    }
+
+    /// The load-bearing normalization: `me()` reports a book's `episodeId` as `null` (→ `nil`), but
+    /// `LibraryCache.CachedProgress.episodeID` is a non-optional `String` that stores `""` for a
+    /// book. A Task-6 lookup keyed by that `""` MUST resolve to the book's `me()` entry — without
+    /// `nil == "" ` normalization it never would (`Optional("") != Optional.none`) and
+    /// last-write-wins would silently never fire for ANY book.
+    @Test func progressReconcileViewTreatsEmptyEpisodeIDAsBookMatchingLibraryCacheConvention() async throws {
+        let (client, transport) = try await makeSUT()
+        await transport.enqueue(status: 200, json: #"""
+        {"id":"u1","username":"root","mediaProgress":[
+          {"libraryItemId":"li_1","episodeId":null,"currentTime":30,"duration":4000,"progress":0.0075,"isFinished":false,"lastUpdate":1700000000000}
+        ]}
+        """#)
+        let view = try await client.progressReconcileView()
+
+        // Looked up the way Task 6 will: with a CachedProgress.episodeID of "" for a book.
+        let viaEmptyString = try #require(view.progress(itemID: "li_1", episodeID: ""))
+        #expect(viaEmptyString.currentTime == 30)
+        // nil and "" resolve to the SAME entry.
+        #expect(view.progress(itemID: "li_1", episodeID: nil)?.lastUpdate == viaEmptyString.lastUpdate)
+        #expect(view["li_1", ""]?.currentTime == 30, "subscript shares the same normalization")
     }
 
     @Test func progressReconcileViewCallsMeExactlyOnce() async throws {

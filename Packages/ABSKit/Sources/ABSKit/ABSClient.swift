@@ -192,6 +192,13 @@ public final class ABSClient: Sendable {
     /// authenticated call uses, just carried differently for this one background-session caller.
     /// `URLComponents.queryItems` percent-encodes the token correctly (it may contain JWT
     /// characters like `.`/`-`/`_`); `URL.appending(path:)` does the same for `itemID`/`ino`.
+    ///
+    /// **Credential handling (Task 4 MUST honor):** the embedded `token` is the live access token
+    /// — a Bearer-EQUIVALENT credential that grants full API access, and one that EXPIRES (~1h
+    /// server-side). So a returned URL is short-lived and secret: Task 4 must re-derive it (call
+    /// this again) immediately before each (re)transfer or resume — a URL captured earlier can
+    /// carry a stale/expired token and 401 — and must NEVER log, persist, or surface the full URL
+    /// (it embeds the credential in the query string). Log the item/ino, not the URL.
     public func fileDownloadURL(itemID: String, ino: String) async throws -> URL {
         let token = try await auth.currentAccessToken()
         var comps = URLComponents(url: baseURL.appending(path: "api/items/\(itemID)/file/\(ino)/download"),
@@ -236,27 +243,48 @@ public struct PlaybackSessionEnvelope: Sendable {
     public init(session: PlaybackSession, rawData: Data) { self.session = session; self.rawData = rawData }
 }
 
-/// A keyed view over `MeUser.mediaProgress[]`, built by `ABSClient.progressReconcileView()`.
-/// Keys by `(libraryItemId, episodeId)` — the same 3-part identity `LibraryCache`'s
-/// `cachedProgress` PK and `LocalPlaybackSession` use — so the offline reconcile (Task 6) can
-/// look up a pending local session's server-side counterpart in O(1) and compare
-/// `MediaProgressEntry.lastUpdate` against the local session's `updatedAt`.
+/// A keyed view over `MeUser.mediaProgress[]`, built by `ABSClient.progressReconcileView()`, so
+/// the offline reconcile (Task 6) can look up a pending local session's server-side counterpart in
+/// O(1) and compare `MediaProgressEntry.lastUpdate` against the local session's `updatedAt`.
+///
+/// **Key normalization (load-bearing):** the lookup key `episodeID` is normalized to a
+/// NON-optional `String` with `""` meaning "book / no episode" — the EXACT convention
+/// `LibraryCache.CachedProgress.episodeID` uses (which stores `episodeID ?? ""`). `me()`'s own
+/// `episodeId` is `nil` for a book, so this maps `nil → ""` on both insert and lookup; without
+/// that, a Task-6 lookup keyed by a `CachedProgress.episodeID` of `""` would never match a book's
+/// `me()` entry (`Optional("") != Optional.none`) and last-write-wins would silently never fire
+/// for ANY book. Call `progress(itemID:episodeID:)` with a `CachedProgress.episodeID` value
+/// directly — it needs no `nil`/`""` massaging at the call site.
 public struct ProgressReconcileView: Sendable {
-    struct Key: Hashable, Sendable { let libraryItemId: String; let episodeId: String? }
+    struct Key: Hashable, Sendable { let libraryItemId: String; let episodeID: String }
     private let byKey: [Key: MediaProgressEntry]
+
+    /// Normalizes an optional episode id (`me()`'s `nil`, or a `CachedProgress.episodeID` that is
+    /// already `""` for a book) to the single `""`-for-book convention both sides share.
+    private static func normalize(_ episodeID: String?) -> String {
+        (episodeID?.isEmpty ?? true) ? "" : episodeID!
+    }
 
     init(entries: [MediaProgressEntry]) {
         var map: [Key: MediaProgressEntry] = [:]
         for entry in entries {
-            map[Key(libraryItemId: entry.libraryItemId, episodeId: entry.episodeId)] = entry
+            map[Key(libraryItemId: entry.libraryItemId, episodeID: Self.normalize(entry.episodeId))] = entry
         }
         byKey = map
     }
 
-    /// The server's progress for this item/episode, if any. `nil` means the server has no
-    /// record — a brand-new local session with nothing to reconcile against, always safe to push.
-    public subscript(libraryItemId: String, episodeId: String? = nil) -> MediaProgressEntry? {
-        byKey[Key(libraryItemId: libraryItemId, episodeId: episodeId)]
+    /// The server's progress for this item/episode, if any — the accessor Task 6 calls with a
+    /// `CachedProgress.episodeID` (a non-optional `String`, `""` = book; `nil` also accepted and
+    /// treated identically). `nil` return means the server has no record — a brand-new local
+    /// session with nothing to reconcile against, always safe to push.
+    public func progress(itemID: String, episodeID: String? = nil) -> MediaProgressEntry? {
+        byKey[Key(libraryItemId: itemID, episodeID: Self.normalize(episodeID))]
+    }
+
+    /// Convenience subscript equivalent to `progress(itemID:episodeID:)` (same `""`==book==nil
+    /// normalization), kept for terse call sites and tests.
+    public subscript(itemID: String, episodeID: String? = nil) -> MediaProgressEntry? {
+        progress(itemID: itemID, episodeID: episodeID)
     }
 }
 
@@ -333,24 +361,34 @@ extension ABSClient {
 
     /// `POST /api/session/local-all` `{sessions, deviceInfo}` — batch counterpart to
     /// `postLocalSession`'s single-session upsert, for reconciling many offline-accrued local
-    /// sessions in one round trip after a reconnect (Task 6). Verified against ABS
-    /// `PlaybackSessionManager.syncLocalSessionsRequest`/`syncLocalSession`: the server builds
-    /// `new PlaybackSession(sessionJson)` per array element, then unconditionally overwrites
-    /// `session.deviceInfo = deviceInfo` using the TOP-LEVEL batch `deviceInfo` (a sibling of
-    /// `sessions`, not each session's own nested field) — so that field, not any per-session
-    /// value, is what the server actually applies to every session in the batch. Every session
-    /// queued by this app instance necessarily shares one device, so this derives the shared
-    /// `deviceInfo` from the batch's first session instead of taking a redundant separate
-    /// parameter. An empty `sessions` array is a no-op — nothing to reconcile, and there is no
-    /// `deviceInfo` to report.
-    public func syncLocalSessions(_ sessions: [LocalPlaybackSession]) async throws {
-        guard let deviceInfo = sessions.first?.deviceInfo else { return }
+    /// sessions in one round trip after a reconnect (Task 6). Returns the server's PER-SESSION
+    /// results — this is load-bearing, NOT cosmetic: `POST /api/session/local-all` always answers
+    /// HTTP 200 even when INDIVIDUAL sessions are rejected (e.g. the source item was deleted or
+    /// moved on the server while the device was offline → `"Media item not found"`), so a bare
+    /// "didn't throw" would make a permanently-rejected session indistinguishable from a synced
+    /// one. Task 6 MUST prune only the sessions whose `LocalSessionSyncResult.success == true`,
+    /// re-queueing (or surfacing) the rest, so their offline listening time is never silently
+    /// lost. Verified against ABS `PlaybackSessionManager.syncLocalSessionsRequest`/
+    /// `syncLocalSession`: the server responds `{results: [{id, success, error?}, …]}`.
+    ///
+    /// Body shape: the server builds `new PlaybackSession(sessionJson)` per array element and, on
+    /// FIRST INSERT of a session id ONLY, sets `session.deviceInfo = deviceInfo` from the
+    /// TOP-LEVEL batch `deviceInfo` (a sibling of `sessions`, not each session's own nested
+    /// field); a resync of an already-persisted id updates only `currentTime`/`timeListening`/
+    /// `updatedAt` and leaves the stored `deviceInfo` untouched. Every session queued by this app
+    /// instance shares one device, so this derives that top-level `deviceInfo` from the batch's
+    /// first session rather than taking a redundant separate parameter. An empty `sessions` array
+    /// is a no-op returning `[]` — nothing to reconcile, and no `deviceInfo` to report.
+    @discardableResult
+    public func syncLocalSessions(_ sessions: [LocalPlaybackSession]) async throws -> [LocalSessionSyncResult] {
+        guard let deviceInfo = sessions.first?.deviceInfo else { return [] }
         struct Body: Encodable { let sessions: [LocalPlaybackSession]; let deviceInfo: DeviceInfo }
         var req = URLRequest(url: baseURL.appending(path: "api/session/local-all"))
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try ABSAPI.encoder.encode(Body(sessions: sessions, deviceInfo: deviceInfo))
-        _ = try await authorizedData(req)
+        let data = try await authorizedData(req)
+        return try ABSAPI.decoder.decode(LocalSessionSyncResponse.self, from: data).results
     }
 
     public func syncSession(id: String, currentTime: Double, timeListened: Double, duration: Double) async throws {

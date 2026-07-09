@@ -689,3 +689,26 @@ public struct LocalPlaybackSession: Encodable, Sendable {
         self.updatedAt = updatedAt
     }
 }
+
+/// One entry of `POST /api/session/local-all`'s `{results: […]}` response — the server's verdict
+/// on a SINGLE session in the batch. `POST /api/session/local-all` always answers HTTP 200 even
+/// when individual sessions fail (verified against ABS
+/// `PlaybackSessionManager.syncLocalSessionsRequest`, which pushes one of these per input session
+/// into a `syncResults` array: `{id, success, progressSynced}` on success, `{id, success:false,
+/// error}` on failure — e.g. `"Media item not found"` when the offline source item was deleted or
+/// moved server-side). Task 6's reconcile prunes a local session from its queue ONLY when the
+/// matching result's `success` is `true`, so a rejected session's offline listen time is
+/// re-queued/surfaced rather than silently dropped. Tolerant decode: `error` (and any unmodeled
+/// server field like `progressSynced`) is optional/ignored.
+public struct LocalSessionSyncResult: Decodable, Sendable, Identifiable {
+    /// The session id the server echoes back — matches the `LocalPlaybackSession.id` that was
+    /// posted, so Task 6 can map a result to the exact queued session to prune.
+    public let id: String
+    public let success: Bool
+    public let error: String?
+}
+
+/// The `{results: […]}` envelope `POST /api/session/local-all` wraps its per-session verdicts in.
+struct LocalSessionSyncResponse: Decodable, Sendable {
+    let results: [LocalSessionSyncResult]
+}
