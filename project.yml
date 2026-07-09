@@ -12,6 +12,8 @@ packages:
     path: Packages/PlayerEngine
   LibraryCache:
     path: Packages/LibraryCache
+  DownloadManager:
+    path: Packages/DownloadManager
   # GRDB is a transitive dependency of LibraryCache whose public `AsyncValueObservation` API
   # leaks GRDB types into the app's own object files. The plain build action links it via
   # eager-linking response files, but the test-host app link drops those transitive inputs and
@@ -33,6 +35,7 @@ targets:
         product: ABSRealtime
       - package: PlayerEngine
       - package: LibraryCache
+      - package: DownloadManager
       - package: GRDB
         product: GRDB
     settings:
