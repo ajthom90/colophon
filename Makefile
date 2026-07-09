@@ -19,6 +19,7 @@ test:
 	cd Packages/ABSKit && swift test
 	cd Packages/PlayerEngine && swift test
 	cd Packages/LibraryCache && swift test
+	cd Packages/DownloadManager && swift test
 
 # pipefail: without it the pipeline exits with tail's status (always 0) and a
 # red test suite would report green.

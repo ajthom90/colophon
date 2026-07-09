@@ -55,6 +55,14 @@ public protocol DownloadManaging: Sendable {
     /// A merged stream of every file's updates — for aggregate observers (e.g. a coordinator).
     func updates() async -> AsyncStream<DownloadUpdate>
     func setBackgroundCompletionHandler(_ handler: @escaping @Sendable () -> Void) async
+    /// Re-attach to background transfers still outstanding after an app relaunch and resume driving
+    /// them through `updates()`/the per-file streams — so an in-flight download keeps reporting and
+    /// a transfer the background session finished while the app was dead delivers its terminal
+    /// event. Since the manager is pure-transfer (it forgets destinations when the process dies),
+    /// the caller supplies `destinations` keyed by `fileID` (rebuilt from its own records); a
+    /// re-attached transfer whose `fileID` has no destination here is skipped. Already-tracked
+    /// transfers are left untouched.
+    func reattach(destinations: [String: URL]) async
 }
 
 public extension DownloadManaging {
@@ -109,11 +117,32 @@ public actor DownloadManager: DownloadManaging {
             await session.cancel(id: fileID)
         }
 
+        let events = session.start(id: fileID, request: request, resumeData: resumeData)
+        return beginTransfer(fileID: fileID, destination: destination, events: events)
+    }
+
+    public func reattach(destinations: [String: URL]) async {
+        let outstanding = await session.reattachOutstandingTransfers()
+        for fileID in outstanding {
+            // Don't disturb a transfer we're already tracking (e.g. reattach called twice).
+            guard transfers[fileID] == nil else { continue }
+            // Pure-transfer: without a destination from the caller we can't place a finished file.
+            guard let destination = destinations[fileID] else { continue }
+            guard let events = session.attach(id: fileID) else { continue }
+            _ = beginTransfer(fileID: fileID, destination: destination, events: events)
+        }
+    }
+
+    /// Register a transfer for `fileID` (destination + fresh single-consumer stream) and start a
+    /// consumer draining `events` into `handle`. Shared by `enqueue` (a new task's stream) and
+    /// `reattach` (an outstanding task's re-attached stream).
+    private func beginTransfer(
+        fileID: String, destination: URL, events: AsyncStream<DownloadEvent>
+    ) -> AsyncStream<DownloadUpdate> {
         let token = UUID()
         let (stream, continuation) = AsyncStream.makeStream(
             of: DownloadUpdate.self, bufferingPolicy: .bufferingNewest(64)
         )
-        let events = session.start(id: fileID, request: request, resumeData: resumeData)
         transfers[fileID] = Transfer(
             token: token, destination: destination, continuation: continuation, consumer: nil
         )

@@ -8,6 +8,7 @@ import ABSKit
 import ABSRealtime
 import PlayerEngine
 import LibraryCache
+import DownloadManager
 
 /// The library-browse sort options surfaced in `LibraryGridView`'s toolbar, each mapped to a
 /// verified ABS `items?sort=` key (see the plan's endpoint reference). Plain `Sendable` value type
@@ -104,6 +105,10 @@ final class AppState {
     let queue = PlaybackQueue()
     let cache: LibraryCacheStore
     let coverStore: CoverStore
+    /// Offline-download orchestration (M2a Task 4): `download`/`delete`/storage over the
+    /// `DownloadManager` + LibraryCache v4 records. AppState feeds it the live active client +
+    /// connection id (below); the Downloads UI (Tasks 7-8) reads/observes the cache and calls it.
+    let downloads: DownloadCoordinator
 
     /// UserDefaults key persisting the last connection the user activated, so `ConnectionsView`
     /// can auto-resume it on the next launch — the load-bearing half of the offline first-run
@@ -278,7 +283,12 @@ final class AppState {
         cacheDirectory: URL? = nil,
         socketFactory: ((URL, @escaping @Sendable () async -> String?) -> any RealtimeSocketProtocol)? = nil,
         tokenStore: (any TokenStore)? = nil,
-        oidcTransportProvider: (@Sendable () -> Transport)? = nil
+        oidcTransportProvider: (@Sendable () -> Transport)? = nil,
+        // The download manager is built LAZILY on first download use — constructing a real
+        // `DownloadManager` stands up a background `URLSession`, which must not happen merely by
+        // constructing `AppState` in a unit test that never downloads. Tests inject a fake.
+        downloadManagerProvider: (@MainActor () -> any DownloadManaging)? = nil,
+        downloadsRoot: URL? = nil
     ) {
         self.transport = transportProvider()
         self.oidcTransport = oidcTransportProvider?()
@@ -299,6 +309,14 @@ final class AppState {
         let coversDir = cacheDirectory?.appending(path: "covers")
             ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appending(path: "covers")
         coverStore = CoverStore(directory: coversDir)
+        // Downloads live UNDER the (persistent) support dir — never Caches, which the OS may purge.
+        let resolvedDownloadsRoot = downloadsRoot ?? supportDir.appending(path: "Downloads")
+        let resolvedManagerProvider: @MainActor () -> any DownloadManaging = downloadManagerProvider ?? {
+            DownloadManager(session: URLSessionDownloadSession(
+                identifier: "com.andrewthom.colophon.downloads"))
+        }
+        downloads = DownloadCoordinator(cache: cache, downloadsRoot: resolvedDownloadsRoot,
+                                        managerProvider: resolvedManagerProvider)
         // Seed the observed connections array now, not just on the first `.task` after launch —
         // otherwise `ColophonApp`'s `app.connections.isEmpty` check on first render sees an empty
         // array and flashes `ConnectView` for one frame before `.task` runs `loadConnections()`,
@@ -312,6 +330,11 @@ final class AppState {
         playback.onBookFinished = { [weak self] in
             Task { await self?.advanceToNext() }
         }
+        // Feed the download coordinator the LIVE active client + connection id (both change on a
+        // connection switch / sign-out), so `download` re-derives URLs against the current client
+        // and every download is scoped to the active connection.
+        downloads.clientProvider = { [weak self] in self?.client }
+        downloads.connectionIDProvider = { [weak self] in self?.activeConnectionID }
     }
 
     var deviceInfo: DeviceInfo {
@@ -516,6 +539,9 @@ final class AppState {
         persistLastActive(connection.id)
         loadConnections()
         phase = .connected
+        // Same download reconcile as `activateConnection`'s cached-first path — the fresh sign-in is
+        // also a launch/activation moment where the background session's state must meet the cache.
+        Task { await downloads.reattachOnLaunch() }
     }
 
     /// Cleanup for a superseded (stale-epoch) connect flow's bail paths. `completeConnection`
@@ -627,6 +653,10 @@ final class AppState {
         persistLastActive(id)
         loadConnections()
         phase = .connected   // cached browsing is live from here — server up or not.
+        // Reconcile in-progress downloads against the background session for the now-active
+        // connection (an in-flight transfer resumes; one finished while dead is marked downloaded).
+        // Detached + best-effort; safe to run offline (it only needs the connection id + cache).
+        Task { await downloads.reattachOnLaunch() }
 
         // No stored credentials: surface re-auth, don't probe (nothing to probe with).
         guard await tokenStore.tokens(for: id) != nil else {

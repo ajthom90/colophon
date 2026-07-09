@@ -42,6 +42,16 @@ public protocol DownloadSession: Sendable {
     /// `application(_:handleEventsForBackgroundURLSession:completionHandler:)`. The session invokes
     /// it once it has finished delivering background events after an app relaunch.
     func setBackgroundCompletionHandler(_ handler: @escaping @Sendable () -> Void)
+    /// The `id`s of transfers the session is still tracking after an app relaunch — a background
+    /// session survives suspension/termination and, when recreated with the same identifier,
+    /// re-exposes its outstanding tasks. Repopulates whatever `id → task` bookkeeping the session
+    /// needs so `cancel`/`pause`/`attach` keep working. Empty when nothing is outstanding.
+    func reattachOutstandingTransfers() async -> [String]
+    /// Attach a FRESH event stream to an already-outstanding transfer for `id` (e.g. after a
+    /// relaunch + `reattachOutstandingTransfers`) WITHOUT starting a new task, so replayed
+    /// progress/terminal events flow to a new consumer. `nil` when no outstanding task is tracked
+    /// for `id`.
+    func attach(id: String) -> AsyncStream<DownloadEvent>?
 }
 
 /// A `Sendable` box for a transfer failure whose underlying `Error` (e.g. a bridged `NSError`)

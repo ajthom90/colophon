@@ -40,7 +40,10 @@ struct AppStateTests {
             tokenStore: InMemoryTokenStore(),
             // Same transport instance as `/status`/`/libraries` — lets a single MockTransport/
             // GatedTransport FIFO queue script an entire `connectWithOIDC` call in test order.
-            oidcTransportProvider: transportProvider
+            oidcTransportProvider: transportProvider,
+            // A fake download manager so activating a connection (which reconciles downloads on
+            // launch) never stands up a real background `URLSession` in the test host.
+            downloadManagerProvider: { FakeDownloadManaging() }
         )
     }
 
@@ -599,7 +602,8 @@ struct AppStateTests {
             cacheDirectory: dir,
             socketFactory: { _, _ in FakeSocket() },
             tokenStore: tokenStore,
-            oidcTransportProvider: { transport })
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() })
     }
 
     /// THE offline first-run fix: activating a connection whose server is unreachable (transport
@@ -904,7 +908,8 @@ struct AppStateTests {
             cacheDirectory: dir,
             socketFactory: { _, _ in sockets.record(); return FakeSocket() },
             tokenStore: tokenStore,
-            oidcTransportProvider: { transport }
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() }
         )
         try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
                                                         username: "root", authMethod: "local", sortIndex: 0))
@@ -973,7 +978,8 @@ struct AppStateTests {
             cacheDirectory: dir,
             socketFactory: { _, _ in sockets.record(); return FakeSocket() },
             tokenStore: tokenStore,
-            oidcTransportProvider: { transport }
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() }
         )
         try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
                                                         username: "root", authMethod: "local", sortIndex: 0))
@@ -1025,7 +1031,8 @@ struct AppStateTests {
             cacheDirectory: dir,
             socketFactory: { _, _ in sockets.record(); return FakeSocket() },
             tokenStore: tokenStore,
-            oidcTransportProvider: { transport }
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() }
         )
         // The newer connection, seeded with tokens so its probe comes online with a socket.
         try app.cache.upsertConnection(CachedConnection(id: "NEWER", address: "http://newer:13378", name: "Newer",
@@ -1224,7 +1231,8 @@ struct AppStateTests {
             cacheDirectory: dir,
             socketFactory: { _, _ in let s = FakeSocket(); sockets.record(s); return s },
             tokenStore: tokenStore,
-            oidcTransportProvider: { transport }
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() }
         )
         app.playback.muted = true
 
@@ -1287,7 +1295,8 @@ struct AppStateTests {
             cacheDirectory: makeTempDir(),
             socketFactory: { _, _ in fakeSocket },
             tokenStore: InMemoryTokenStore(),
-            oidcTransportProvider: { transport }
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() }
         )
 
         await app.connectWithOIDC(serverURL: "http://s:13378", browser: fakeBrowser())
@@ -1599,7 +1608,8 @@ struct SettingsPlumbingTests {
             cacheDirectory: dir,
             socketFactory: { _, _ in FakeSocket() },
             tokenStore: tokenStore,
-            oidcTransportProvider: { transport })
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() })
     }
 
     /// Saves the current value (if any) of a `UserDefaults.standard` key and returns a restore

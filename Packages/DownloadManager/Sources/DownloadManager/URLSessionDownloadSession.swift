@@ -89,10 +89,16 @@ public final class URLSessionDownloadSession: NSObject, DownloadSession, @unchec
         lock.withLock { backgroundCompletionHandler = handler }
     }
 
+    /// `DownloadSession` conformance — the manager-level reattach entry point calls this; it simply
+    /// delegates to `reattachOutstandingTasks()` (kept as the concrete, descriptively-named API).
+    public func reattachOutstandingTransfers() async -> [String] {
+        await reattachOutstandingTasks()
+    }
+
     /// Re-attach to transfers the background session is still tracking after an app relaunch,
     /// repopulating the `fileID → task` map so `cancel`/`pause`/`attach` continue to work. Returns
     /// the `fileID`s of the outstanding downloads. Only Sendable `String`s cross the continuation
-    /// boundary. (The manager-level reconcile that consumes this is wired in a later task.)
+    /// boundary.
     public func reattachOutstandingTasks() async -> [String] {
         await withCheckedContinuation { (cont: CheckedContinuation<[String], Never>) in
             session.getAllTasks { tasks in

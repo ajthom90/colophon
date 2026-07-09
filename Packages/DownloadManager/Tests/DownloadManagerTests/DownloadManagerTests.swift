@@ -233,6 +233,44 @@ private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath:
     #expect(!exists(destination))       // no partial file left behind
 }
 
+@Test func reattachResumesOutstandingTransferAndReportsTerminalEvent() async throws {
+    let fake = FakeDownloadSession()
+    let manager = DownloadManager(session: fake)
+    let dir = try makeTempDir()
+    let destination = dir.appendingPathComponent("books/li1/track1.m4b")
+
+    // Simulate a relaunch: the background session still tracks "f1", and the manager has no
+    // in-memory transfer for it (fresh process). The caller (a coordinator) supplies the
+    // destination it rebuilt from its own records.
+    fake.setOutstanding(["f1"])
+    let observer = await manager.updates()
+    await manager.reattach(destinations: ["f1": destination])
+
+    // A transfer that FINISHED while the app was dead now delivers its terminal event on the
+    // re-attached stream → the manager moves the staged file into place and reports downloaded.
+    let source = try makeTempFile(bytes: 100, in: dir)
+    fake.complete(id: "f1", temporaryURL: source)
+
+    var observed: [DownloadState] = []
+    for await update in observer where update.fileID == "f1" {
+        observed.append(update.state)
+        if update.state.isTerminal { break }
+    }
+
+    #expect(observed.last == .downloaded)
+    #expect(exists(destination))
+    #expect(await manager.state(for: "f1") == .downloaded)
+}
+
+@Test func reattachSkipsTransfersWithNoSuppliedDestination() async throws {
+    let fake = FakeDownloadSession()
+    let manager = DownloadManager(session: fake)
+    fake.setOutstanding(["f1"])
+    // No destination for "f1" → the manager can't place a finished file, so it skips it entirely.
+    await manager.reattach(destinations: [:])
+    #expect(await manager.state(for: "f1") == nil)
+}
+
 @Test func cancelUnknownFileIsANoOp() async throws {
     let fake = FakeDownloadSession()
     let manager = DownloadManager(session: fake)

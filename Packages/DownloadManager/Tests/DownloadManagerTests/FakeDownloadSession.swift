@@ -17,6 +17,7 @@ final class FakeDownloadSession: DownloadSession, @unchecked Sendable {
     private var _starts: [Start] = []
     private var _cancelled: [String] = []
     private var _continuations: [String: AsyncStream<DownloadEvent>.Continuation] = [:]
+    private var _outstanding: [String] = []
     private var _backgroundHandler: (@Sendable () -> Void)?
     /// Resume data the fake hands back from `cancelProducingResumeData`.
     private var _resumeData = Data("resume-token".utf8)
@@ -66,6 +67,27 @@ final class FakeDownloadSession: DownloadSession, @unchecked Sendable {
     func setBackgroundCompletionHandler(_ handler: @escaping @Sendable () -> Void) {
         lock.withLock { _backgroundHandler = handler }
     }
+
+    /// Transfers the fake still "tracks" after a simulated relaunch — seed via `outstanding`.
+    func reattachOutstandingTransfers() async -> [String] {
+        lock.withLock { _outstanding }
+    }
+
+    /// Re-attach a fresh stream for an outstanding id, mirroring the real session: buffered events
+    /// scripted afterwards (progress/complete/fail) flow to it.
+    func attach(id: String) -> AsyncStream<DownloadEvent>? {
+        lock.withLock {
+            guard _outstanding.contains(id) else { return nil }
+            let (stream, continuation) = AsyncStream.makeStream(
+                of: DownloadEvent.self, bufferingPolicy: .bufferingNewest(64)
+            )
+            _continuations[id] = continuation
+            return stream
+        }
+    }
+
+    /// Seed the ids `reattachOutstandingTransfers` reports (a simulated post-relaunch outstanding set).
+    func setOutstanding(_ ids: [String]) { lock.withLock { _outstanding = ids } }
 
     // MARK: - Scripting
 

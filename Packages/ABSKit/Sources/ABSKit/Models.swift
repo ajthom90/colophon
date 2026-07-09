@@ -89,6 +89,42 @@ public struct ExpandedItemMedia: Decodable, Sendable {
     public let metadata: ExpandedItemMetadata
     /// Chapter marks in GLOBAL book seconds (`{id,start,end,title}`), for the chapters preview.
     public let chapters: [Chapter]?
+    /// The item's on-disk audio files (`media.audioFiles[]` from `?expanded=1`) — each carries the
+    /// `ino` the per-file download route (`/api/items/:id/file/:ino/download`) keys on, plus its
+    /// `index` (1-based track order) and `metadata.ext`. Optional/tolerant: a lean projection that
+    /// omits it (search/shelf entities) still decodes; only the offline-download orchestrator
+    /// (`DownloadCoordinator`) reads it.
+    public let audioFiles: [AudioFileInfo]?
+}
+
+/// One entry of an item's `media.audioFiles[]` (a book) or an episode's `audioFile` (a podcast) —
+/// the minimum the offline-download orchestrator needs to enumerate and fetch a file: its `ino`
+/// (the per-file download route's key), its `index` (track order), the `metadata.ext`/`size`, and
+/// the `mimeType`. Everything else the server sends (scan tags, birthtimes, embedded cover art) is
+/// dropped by tolerant decoding.
+public struct AudioFileInfo: Decodable, Sendable {
+    /// 1-based track order within the item's file list (`1` for the first file in the live shape).
+    public let index: Int?
+    /// The file's inode string — the key the download route uses (`/file/:ino/download`).
+    public let ino: String
+    public let metadata: AudioFileMetadata?
+    public let mimeType: String?
+    public let duration: Double?
+
+    /// The file extension WITHOUT a leading dot (`"mp3"` from a `metadata.ext` of `".mp3"`), or
+    /// `nil` when the server omits it. Callers building a local filename append `.<fileExtension>`.
+    public var fileExtension: String? {
+        guard let ext = metadata?.ext, !ext.isEmpty else { return nil }
+        return ext.hasPrefix(".") ? String(ext.dropFirst()) : ext
+    }
+}
+
+/// The nested `metadata` block of an `AudioFileInfo` — only `ext`/`filename`/`size` matter to the
+/// downloader; the rest of the server's file-scan metadata is dropped by tolerant decoding.
+public struct AudioFileMetadata: Decodable, Sendable {
+    public let ext: String?
+    public let filename: String?
+    public let size: Int?
 }
 
 /// Expanded book metadata. `authorName`/`narratorName`/`seriesName` are server-computed
@@ -570,14 +606,18 @@ public struct PodcastMetadata: Decodable, Sendable {
 /// (M1c-c Task 1). `season`/`episode` are STRINGS (`"1"`, not `1` — a live correction over the
 /// M1c-a source-only guess, matching `ShelfEpisodeEntity.RecentEpisodeRef` and the `cachedEpisode`
 /// table's `season`/`episode` columns). `enclosure.length` is likewise a STRING (`"3723859"`).
-/// `audioFile`/`audioTrack` (the server's internal per-file scan metadata) are intentionally NOT
-/// modeled here — playback goes through `ABSClient.playEpisode`'s own session envelope
-/// (`audioTracks`), not the RSS enclosure or file-scan metadata; tolerant decoding drops them.
+/// `audioTrack` (the server's internal per-track scan metadata) is intentionally NOT modeled here —
+/// PLAYBACK goes through `ABSClient.playEpisode`'s own session envelope (`audioTracks`). The single
+/// `audioFile`, however, IS modeled (M2a): its `ino` is what the per-file download route keys on, so
+/// the offline downloader reads `episode.audioFile.ino` to enqueue a podcast episode's one file.
 public struct PodcastEpisode: Decodable, Sendable, Identifiable {
     public let id: String
     /// The owning podcast's library-item id (the `itemID` half of the 3-part `cachedProgress` PK).
     public let libraryItemId: String?
     public let podcastId: String?
+    /// The episode's single downloadable audio file (`ino`/`ext`/`size`), for offline download —
+    /// distinct from the streaming `audioTrack`. Optional/tolerant: absent in search/shelf projections.
+    public let audioFile: AudioFileInfo?
     /// Track index within the season/feed; `null` in the live capture (kept optional).
     public let index: Int?
     public let season: String?
