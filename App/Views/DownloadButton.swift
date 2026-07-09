@@ -56,12 +56,16 @@ struct DownloadButton: View {
 
     private var episode: String { episodeID ?? "" }
     private var side: CGFloat { compact ? 20 : 28 }
+    /// Stroke width of the determinate in-progress ring — proportional to the button size, floored so
+    /// it stays visible at the compact (20pt) size.
+    private var ringWidth: CGFloat { max(2, side * 0.1) }
 
     var body: some View {
         Button(action: tap) { glyph }
             .buttonStyle(.plain)
             .disabled(app.activeConnectionID == nil)
             .accessibilityLabel(accessibilityLabel)
+            .accessibilityHint(accessibilityHint)
             // Self-observe ONLY in `.selfObserved` mode — `.provided` rows share the parent's one
             // observation, so opening a per-row stream here would defeat the perf fix.
             .task(id: observeKey) { if case .selfObserved = source { await observe() } }
@@ -82,13 +86,23 @@ struct DownloadButton: View {
                     .font(.system(size: side * 0.75))
                     .foregroundStyle(.red)
             case .inProgress(let fraction):
+                // A DETERMINATE ring (M2a final review #8): `ProgressView(value:).circular` IGNORES
+                // the value on iOS/iPadOS and renders an indeterminate spinner, so download progress
+                // was invisible. Draw the ring by hand — a faint track + an accent arc trimmed to the
+                // fraction, rotated so 0% starts at 12 o'clock. Opaque/plain (never glass), matching
+                // the rest of this secondary affordance.
                 ZStack {
-                    ProgressView(value: fraction)
-                        .progressViewStyle(.circular)
+                    Circle()
+                        .stroke(Color.secondary.opacity(0.25), lineWidth: ringWidth)
+                    Circle()
+                        .trim(from: 0, to: max(0.02, fraction))
+                        .stroke(Color.accentColor, style: StrokeStyle(lineWidth: ringWidth, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
                     Image(systemName: "xmark")
                         .font(.system(size: side * 0.32, weight: .bold))
                         .foregroundStyle(.secondary)
                 }
+                .padding(ringWidth)
             case .notDownloaded:
                 Image(systemName: "arrow.down.circle")
                     .font(.system(size: side))
@@ -98,19 +112,36 @@ struct DownloadButton: View {
         .frame(width: side, height: side)
     }
 
+    /// The STATE description only (M2a final review #9). The action instruction moved to
+    /// `accessibilityHint` — baking "Double tap to…" into the label made VoiceOver double-announce
+    /// it (the button trait already speaks the activation gesture).
     private var accessibilityLabel: String {
         switch ViewState.from(download) {
-        case .downloaded: return "Downloaded. Double tap to delete."
-        case .failed: return "Download failed. Double tap to retry."
-        case .inProgress: return "Downloading. Double tap to cancel."
+        case .downloaded: return "Downloaded"
+        case .failed: return "Download failed"
+        case .inProgress: return "Downloading"
         case .notDownloaded: return "Download"
+        }
+    }
+
+    /// What activating the button DOES — VoiceOver reads this as the hint after the label + trait, so
+    /// it never collides with the system's own "Double tap to activate" announcement.
+    private var accessibilityHint: String {
+        switch ViewState.from(download) {
+        case .downloaded: return "Deletes the download"
+        case .failed: return "Retries the download"
+        case .inProgress: return "Cancels the download"
+        case .notDownloaded: return "Downloads for offline listening"
         }
     }
 
     private func tap() {
         switch ViewState.from(download) {
         case .downloaded, .inProgress:
-            Task { await app.downloads.delete(itemID: itemID, episodeID: episodeID) }
+            // Route through `AppState.deleteDownload` (M2a final review #5), which retires playback
+            // first if this is the item currently playing FROM LOCAL FILES — so a manual delete never
+            // pulls files out from under a live `AVPlayer` (the auto-delete path already guards this).
+            Task { await app.deleteDownload(itemID: itemID, episodeID: episodeID) }
         case .failed, .notDownloaded:
             Task { await app.downloads.download(itemID: itemID, episodeID: episodeID) }
         }

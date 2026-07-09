@@ -180,7 +180,10 @@ struct DownloadsView: View {
     }
 
     private func delete(_ row: Row) {
-        Task { await app.downloads.delete(itemID: row.itemID, episodeID: row.episodeID.isEmpty ? nil : row.episodeID) }
+        // Route through `AppState.deleteDownload` (M2a final review #5): it retires playback first if
+        // this row is the item currently playing FROM LOCAL FILES, so a swipe/context-menu delete
+        // never removes files out from under a live `AVPlayer`.
+        Task { await app.deleteDownload(itemID: row.itemID, episodeID: row.episodeID.isEmpty ? nil : row.episodeID) }
     }
 
     // MARK: - Data

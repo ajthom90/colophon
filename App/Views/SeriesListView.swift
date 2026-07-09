@@ -83,14 +83,20 @@ struct SeriesListView: View {
     }
 
     private func load() async {
-        guard let client = app.client else {
-            if series.isEmpty { state = .failed("You're offline — series need a live connection.") }
-            return
-        }
         if series.isEmpty { state = .loading }
         do {
-            series = try await client.series(libraryID: library.id, limit: Self.fetchLimit)
-                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            // `browseFetch` applies the shared `!app.isOffline` fast-path (M2a Task 7 pattern,
+            // extended per final review #3): a `nil` result means the server is KNOWN-unreachable
+            // (`client` is still NON-nil offline — valid tokens, server down, link up — so a bare
+            // client-nil guard would fall through and hang a live `series` request to the transport
+            // timeout). Degrade to the cached/offline state instead of spinning.
+            guard let fetched = try await app.browseFetch({
+                try await $0.series(libraryID: library.id, limit: Self.fetchLimit)
+            }) else {
+                if series.isEmpty { state = .failed("You're offline — series need a live connection.") }
+                return
+            }
+            series = fetched.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             state = .loaded
         } catch {
             if series.isEmpty {

@@ -74,14 +74,18 @@ struct AuthorsListView: View {
     }
 
     private func load() async {
-        guard let client = app.client else {
-            if authors.isEmpty { state = .failed("You're offline — authors need a live connection.") }
-            return
-        }
         if authors.isEmpty { state = .loading }
         do {
-            authors = try await client.authors(libraryID: library.id)
-                .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            // `browseFetch` applies the shared `!app.isOffline` fast-path (M2a Task 7 pattern,
+            // extended per final review #3): a `nil` result means the server is KNOWN-unreachable
+            // (`client` is still NON-nil offline — valid tokens, server down, link up — so a bare
+            // client-nil guard would fall through and hang a live `authors` request). Degrade to the
+            // cached/offline state instead of spinning to the timeout.
+            guard let fetched = try await app.browseFetch({ try await $0.authors(libraryID: library.id) }) else {
+                if authors.isEmpty { state = .failed("You're offline — authors need a live connection.") }
+                return
+            }
+            authors = fetched.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
             state = .loaded
         } catch {
             if authors.isEmpty {
@@ -234,13 +238,18 @@ struct AuthorDetailView: View {
     }
 
     private func load() async {
-        guard let client = app.client else {
-            if detail == nil { state = .failed("You're offline — this author's books need a live connection.") }
-            return
-        }
         if detail == nil { state = .loading }
         do {
-            detail = try await client.author(id: author.id, include: "items")
+            // `browseFetch` applies the shared `!app.isOffline` fast-path (M2a Task 7 pattern,
+            // extended per final review #3): a `nil` result means the server is KNOWN-unreachable
+            // (`client` is NON-nil offline — valid tokens, server down, link up — so a bare
+            // client-nil guard would hang a live `author` request to the transport timeout). Degrade
+            // to the cached/offline state instead of spinning.
+            guard let fetched = try await app.browseFetch({ try await $0.author(id: author.id, include: "items") }) else {
+                if detail == nil { state = .failed("You're offline — this author's books need a live connection.") }
+                return
+            }
+            detail = fetched
             state = .loaded
         } catch {
             if detail == nil {

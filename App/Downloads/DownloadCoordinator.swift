@@ -299,6 +299,25 @@ final class DownloadCoordinator {
         try? cache.deleteDownload(connectionID: connectionID, itemID: itemID, episodeID: episode)
     }
 
+    /// Delete ALL on-disk download files for a whole CONNECTION — its entire
+    /// `<downloadsRoot>/<connectionID>` subtree (every item, every episode). Used by
+    /// `removeConnection` (M2a final review #6): forgetting a connection purges its cache rows, so
+    /// this reclaims the bytes too — otherwise a removed connection's audio leaks on disk forever.
+    /// The cache rows are the source of truth for the UI, so a best-effort directory removal here is
+    /// sufficient (no per-file cache bookkeeping). Safe offline (pure filesystem, no network).
+    func deleteAllFiles(connectionID: String) {
+        try? FileManager.default.removeItem(at: downloadsRoot.appending(path: connectionID))
+    }
+
+    /// Delete ALL on-disk download files for one ITEM — its `<downloadsRoot>/<connectionID>/<itemID>`
+    /// subtree (a book's tracks, or every downloaded episode of a podcast). Used when the server
+    /// reports an item was REMOVED (M2a final review #7): `cache.deleteItem` cascades away the
+    /// download rows but leaves the track files, so this reclaims them. Best-effort filesystem
+    /// removal; safe offline.
+    func deleteItemFiles(connectionID: String, itemID: String) {
+        try? FileManager.default.removeItem(at: downloadsRoot.appending(path: "\(connectionID)/\(itemID)"))
+    }
+
     // MARK: - Storage
 
     /// Total on-disk bytes across the active connection's downloaded files (the Downloads tab's

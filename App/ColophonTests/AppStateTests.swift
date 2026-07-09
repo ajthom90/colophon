@@ -2411,6 +2411,212 @@ struct SettingsPlumbingTests {
         #expect(meCountAfter == meCountBefore)
     }
 
+    // MARK: - M2a whole-branch final review fixes
+
+    /// Fix #1 (Important): an OFFLINE tap on a NON-downloaded item is a CLEAN NO-OP — it must NOT
+    /// retire the current (offline) playback, and must NOT hit the dead server's `/play`. `client` is
+    /// NON-nil offline (valid tokens, server down, link up), so the pre-fix `guard let client` fell
+    /// through: `retireCurrentSession()` stopped the current offline book, then `client.startPlayback`
+    /// hit the dead host. RED-verify: dropping `if isOffline { return }` makes `nowPlayingItemID` go
+    /// nil (retired) AND records a `/play` request → both assertions below fail.
+    @Test func offlineTapOnNonDownloadedItemIsCleanNoOp() async throws {
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()                     // nothing queued → the probe fails like a dead host
+        let tokenStore = InMemoryTokenStore()
+        let app = makeAppWithDownloads(dir: makeTempDir(), downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: tokenStore)
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try seedDownloadedBook(app, connectionID: "C1", itemID: "dl1", downloadsRoot: downloadsRoot,
+                               duration: 120, currentTime: 0)
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+
+        await app.activateConnection("C1")
+        var spins = 0
+        while !app.isOffline, spins < 5000 { await Task.yield(); spins += 1 }
+        #expect(app.isOffline)
+        #expect(app.client != nil)                          // NON-nil offline — isolates the isOffline no-op
+
+        // Current offline playback: the downloaded book plays from LOCAL files even offline.
+        await app.startPlayback(itemID: "dl1")
+        #expect(app.nowPlayingItemID == "dl1")
+        #expect(app.playback.playMethod == LocalPlaybackSession.playMethodLocal)
+        let recordedBefore = await transport.recorded.count
+
+        // Tap Play on a NON-downloaded item while offline → must be a clean no-op.
+        await app.startPlayback(itemID: "not-downloaded")
+
+        #expect(app.nowPlayingItemID == "dl1")                                          // current playback UNTOUCHED
+        #expect(app.playback.playMethod == LocalPlaybackSession.playMethodLocal)        // session not retired
+        let playCount = await transport.recorded.filter { ($0.url?.path ?? "").contains("/play") }.count
+        #expect(playCount == 0)                                                         // NO /play attempted
+        #expect(await transport.recorded.count == recordedBefore)                       // no network at all
+    }
+
+    /// Fix #2 (Important): SERVER recovery WITHOUT a link flap. The stored-token probe settling
+    /// ONLINE (`isOnline` false→true) must ITSELF trigger the reconnect reconcile — the NWPathMonitor
+    /// link edge never fires here (the DEVICE link stayed up; only the SERVER recovered), yet pending
+    /// offline sessions must still sync. RED-verify: removing the probe-success `reconcileAfterServer
+    /// Recovery` call leaves S1 unpushed/unpruned → the prune + local-all assertions fail.
+    @Test func probeSuccessTriggersReconcileWithoutLinkFlap() async throws {
+        let transport = MockTransport()
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: tokenStore)
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+        try seedLocalSession(app, id: "S1", connectionID: "C1", itemID: "A", timeListening: 10)
+
+        // FIFO for: probe /api/authorize, probe /api/libraries, then the recovery reconcile's
+        // /api/me (empty) + /api/session/local-all (S1 success). The trigger fires AFTER the probe's
+        // own libraries() completes, so nothing races the FIFO.
+        await transport.enqueue(status: 200, json: "{}")                                                   // /api/authorize
+        await transport.enqueue(status: 200, json: librariesOK)                                            // /api/libraries
+        await transport.enqueue(status: 200, json: #"{"id":"root","username":"root","mediaProgress":[]}"#) // /api/me
+        await transport.enqueue(status: 200, json: #"{"results":[{"id":"S1","success":true}]}"#)           // local-all
+
+        await app.activateConnection("C1")                  // the link NEVER flaps — only the probe drives this
+        var spins = 0
+        while ((try? app.cache.localSession(id: "S1")) ?? nil) != nil, spins < 5000 { await Task.yield(); spins += 1 }
+
+        #expect(app.isOnline == true)                                       // probe settled online
+        #expect(try app.cache.localSession(id: "S1") == nil)               // recovery reconcile pushed + pruned S1
+        let localAll = await transport.recorded.filter { ($0.url?.path ?? "").contains("session/local-all") }.count
+        #expect(localAll == 1)                                             // syncLocalSessions called exactly once
+    }
+
+    /// Fix #2 (the reentrancy guard, RED-verified by dropping it): the probe-success recovery
+    /// reconcile and a concurrent NWPathMonitor link edge do NOT double-run — the `isReconciling`
+    /// guard drops the second, so `me()` is hit exactly once even when BOTH signals fire.
+    @Test func serverRecoveryAndLinkEdgeReconcileOnlyOnce() async throws {
+        let transport = GatedTransport(gatePath: "api/me")
+        await transport.enqueue(status: 200, json: statusOK)
+        await transport.enqueue(status: 200, json: loginOK)
+        await transport.enqueue(status: 200, json: librariesOK)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try seedLocalSession(app, id: "S1", connectionID: cid, itemID: "A", timeListening: 10)
+        await transport.enqueue(status: 200, json: #"{"id":"root","username":"root","mediaProgress":[]}"#)
+        await transport.enqueue(status: 200, json: #"{"results":[{"id":"S1","success":true}]}"#)
+
+        // Signal one (stands in for the probe-success recovery): parks on the me() gate.
+        let first = Task { await app.reconcileOnReconnect() }
+        while await transport.requestCount(pathContains: "api/me") == 0 { await Task.yield() }
+        // Signal two via the REAL link-edge seam while #1 is in flight: dropped by isReconciling.
+        app.handleNetworkPathUpdate(isSatisfied: false)
+        app.handleNetworkPathUpdate(isSatisfied: true)
+        for _ in 0..<200 { await Task.yield() }
+        #expect(await transport.requestCount(pathContains: "api/me") == 1)   // NOT double-run
+
+        await transport.openGate()
+        await first.value
+        #expect(try app.cache.localSession(id: "S1") == nil)
+    }
+
+    /// Fix #3 (Important): the shared browse fast-path the Series/Authors views route through
+    /// (`browseFetch`) SKIPS the network when the server is known-unreachable — it returns `nil` and
+    /// records NO request. `client` is NON-nil offline, so this isolates the `isOffline` gate from the
+    /// nil-client short-circuit (the exact trap the pre-fix bare-client guard fell into). RED-verify:
+    /// dropping `!isOffline` from `browseFetch` runs the closure → a doomed request is recorded → the
+    /// no-request assertion fails.
+    @Test func browseFetchSkipsNetworkWhenServerKnownUnreachable() async throws {
+        let transport = MockTransport()                     // nothing queued → the probe fails like a dead host
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: tokenStore)
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+        await app.activateConnection("C1")
+        var spins = 0
+        while !app.isOffline, spins < 5000 { await Task.yield(); spins += 1 }
+        #expect(app.isOffline)
+        #expect(app.client != nil)
+        let before = await transport.recorded.count
+
+        let series = try await app.browseFetch { try await $0.series(libraryID: "L1", limit: 10) }
+        let authors = try await app.browseFetch { try await $0.authors(libraryID: "L1") }
+        let author = try await app.browseFetch { try await $0.author(id: "aut1", include: "items") }
+
+        #expect(series == nil)                                   // degraded to offline — no value
+        #expect(authors == nil)
+        #expect(author == nil)
+        #expect(await transport.recorded.count == before)        // NO /series, /authors, /author request issued
+    }
+
+    /// Fix #3 (online, no regression): the SAME helper DOES run the fetch and record a request when
+    /// the server is reachable — the gate is a genuine no-op online.
+    @Test func browseFetchRunsFetchWhenOnline() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: #"{"results":[],"total":0}"#)   // the /series response
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        #expect(app.isOffline == false)
+        let before = await transport.recorded.count
+
+        _ = try await app.browseFetch { try await $0.series(libraryID: "lib1", limit: 10) }
+
+        let seriesReqs = await transport.recorded.filter { ($0.url?.path ?? "").contains("/series") }.count
+        #expect(seriesReqs >= 1)                                 // real fetch happened; online path unregressed
+        #expect(await transport.recorded.count > before)
+    }
+
+    /// Fix #5 (Minor): a MANUAL delete of the download you're playing FROM LOCAL FILES retires the
+    /// session FIRST, so no live `AVPlayer` is left pointed at just-deleted files. RED-verify:
+    /// reverting `deleteDownload` to a bare `downloads.delete` leaves `nowPlayingItemID == "dl1"`
+    /// while the files vanish → the retire assertion fails.
+    @Test func manualDeleteOfCurrentlyPlayingLocalDownloadRetiresPlaybackFirst() async throws {
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: makeTempDir(), downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        let fileURL = try seedDownloadedBook(app, connectionID: "C1", itemID: "dl1", downloadsRoot: downloadsRoot,
+                                             duration: 120, currentTime: 0)
+        await app.activateConnection("C1")
+        await app.startPlayback(itemID: "dl1")
+        #expect(app.nowPlayingItemID == "dl1")
+        #expect(app.isPlayingFromLocalFiles(itemID: "dl1", episodeID: nil))
+        #expect(FileManager.default.fileExists(atPath: fileURL.path))
+
+        await app.deleteDownload(itemID: "dl1", episodeID: nil)
+
+        #expect(app.nowPlayingItemID == nil)                                          // playback retired first
+        #expect(try app.cache.download(connectionID: "C1", itemID: "dl1", episodeID: "") == nil)   // row removed
+        #expect(!FileManager.default.fileExists(atPath: fileURL.path))                // files removed
+    }
+
+    /// Fix #5 (guard scope): deleting a DIFFERENT (not-currently-playing) download must NOT disturb
+    /// the live session — only the item playing from local files is protected.
+    @Test func manualDeleteOfADifferentDownloadDoesNotDisturbPlayback() async throws {
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: makeTempDir(), downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try seedDownloadedBook(app, connectionID: "C1", itemID: "dl1", downloadsRoot: downloadsRoot,
+                               duration: 120, currentTime: 0)
+        let otherURL = try seedDownloadedBook(app, connectionID: "C1", itemID: "dl2", downloadsRoot: downloadsRoot,
+                                              duration: 60, currentTime: 0, title: "Other Book")
+        await app.activateConnection("C1")
+        await app.startPlayback(itemID: "dl1")
+        #expect(app.nowPlayingItemID == "dl1")
+
+        await app.deleteDownload(itemID: "dl2", episodeID: nil)
+
+        #expect(app.nowPlayingItemID == "dl1")                                        // live session untouched
+        #expect(try app.cache.download(connectionID: "C1", itemID: "dl2", episodeID: "") == nil)   // dl2 removed
+        #expect(!FileManager.default.fileExists(atPath: otherURL.path))
+    }
+
     // MARK: - Podcast auto-delete-after-finished (M2a Task 8)
 
     /// The pure eligibility decision (`AppState.shouldAutoDeleteFinishedEpisode`) against the spec's

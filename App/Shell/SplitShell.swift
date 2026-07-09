@@ -170,12 +170,18 @@ struct SplitShell: View {
                 SeriesListView(library: library)
                     .navigationDestination(for: SeriesSummary.self) { SeriesDetailView(library: library, series: $0) }
                     .itemDetailDestination()
+                    // Parity with .search/.library/.home (and the iPhone shell): the series surface
+                    // is network-backed, so it shows the offline banner when the server is unreachable.
+                    .offlineIndicator()
             }
         case .authors(let library):
             NavigationStack {
                 AuthorsListView(library: library)
                     .navigationDestination(for: AuthorSummary.self) { AuthorDetailView(library: library, author: $0) }
                     .itemDetailDestination()
+                    // Parity with .search/.library/.home (and the iPhone shell): authors are
+                    // network-backed, so surface the offline banner when the server is unreachable.
+                    .offlineIndicator()
             }
         case .home, .none:
             NavigationStack { HomeView().offlineIndicator() }
