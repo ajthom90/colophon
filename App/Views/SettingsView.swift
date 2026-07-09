@@ -15,6 +15,10 @@ struct SettingsView: View {
     // Default + options come from `AppState` — the single source of truth also read by
     // `AppState.storedSkipInterval()` and the live-update `onChange` in `ColophonApp`.
     @AppStorage("colophon.skipInterval") private var skipInterval = AppState.defaultSkipInterval
+    // M2a Task 8: podcast "delete after finished" — default OFF (the key literal matches
+    // `AppState.deleteAfterFinishedKey`, the same plain-`UserDefaults.standard` convention as the
+    // three keys above; `AppState` reads it directly since it isn't a `View`).
+    @AppStorage("colophon.deleteDownloadedEpisodesAfterFinishing") private var deleteEpisodesAfterFinishing = false
 
     private let rates: [Double] = [0.75, 1.0, 1.25, 1.5, 1.75, 2.0]
     private let skipIntervals = AppState.skipIntervalOptions
@@ -36,6 +40,11 @@ struct SettingsView: View {
                         Text("\(interval)s").tag(interval)
                     }
                 }
+            }
+            Section {
+                Toggle("Delete Downloaded Episodes After Finishing", isOn: $deleteEpisodesAfterFinishing)
+            } footer: {
+                Text("When on, a downloaded podcast episode's files are removed automatically once you finish listening to it. Books are never deleted automatically.")
             }
         }
         .formStyle(.grouped)

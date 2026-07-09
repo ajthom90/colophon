@@ -34,6 +34,11 @@ struct LibraryGridView: View {
     /// The cache's title-ordered id list — the fallback order until a server refresh captures one.
     @State private var observedOrder: [String] = []
     @State private var progressByItem: [String: CachedProgress] = [:]
+    /// This library's book-level download state (M2a Task 8), keyed by `itemID` — feeds each
+    /// `CoverCard`'s compact `DownloadStateBadge` so the grid shows what's offline-available at a
+    /// glance. A podcast ITEM is never itself downloaded (only its episodes are), so a podcast card
+    /// simply finds no entry here and shows no badge.
+    @State private var downloadStateByItem: [String: String] = [:]
     @State private var didReceiveItems = false
     @State private var loadError: String?
     @State private var showingFilter = false
@@ -66,6 +71,7 @@ struct LibraryGridView: View {
             }
             .task(id: library.id) { await observeItems() }
             .task(id: library.id) { await observeProgress() }
+            .task(id: library.id) { await observeDownloads() }
             .task(id: browseKey) { await refresh() }
             // A library switch clears the facet filter — another library's author/series IDs won't
             // match (fires on CHANGE only, so a fresh grid still starts from its default nil filter).
@@ -87,7 +93,8 @@ struct LibraryGridView: View {
                             author: item.authorName,
                             duration: item.duration,
                             progress: progressByItem[item.id],
-                            isPodcast: library.mediaType == "podcast")
+                            isPodcast: library.mediaType == "podcast",
+                            downloadState: downloadStateByItem[item.id])
                     }
                 }
                 .padding()
@@ -212,6 +219,23 @@ struct LibraryGridView: View {
             }
         } catch {
             // Best-effort live pills; the grid still paints without progress.
+        }
+    }
+
+    /// Book-level download state for this grid's badges (M2a Task 8) — every `CachedDownload` row is
+    /// itself either a book (`episodeID` empty) or a podcast episode; only the book-shaped rows key
+    /// onto an ITEM this grid renders directly, so episode rows are filtered out here (their badge
+    /// lives on `EpisodeRow`/`EpisodeCard` instead, joined per-episode there).
+    private func observeDownloads() async {
+        downloadStateByItem = [:]
+        do {
+            for try await rows in app.cache.observeDownloads(connectionID: library.connectionID) {
+                downloadStateByItem = Dictionary(
+                    rows.filter { $0.episodeID.isEmpty }.map { ($0.itemID, $0.state) },
+                    uniquingKeysWith: { _, latest in latest })
+            }
+        } catch {
+            // Best-effort live badges; the grid still paints without them.
         }
     }
 

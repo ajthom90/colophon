@@ -18,6 +18,11 @@ struct ShelfRow: View {
     /// Resolves an episode's OWN `cachedProgress` row by `(podcastItemID, episodeID)` — distinct from
     /// any book-style progress on the same item and from any sibling episode's progress.
     let episodeProgressFor: (String, String) -> CachedProgress?
+    /// This book's own `CachedDownload.state` (M2a Task 8), or `nil` — feeds `CoverCard`'s badge.
+    var downloadStateFor: (String) -> String? = { _ in nil }
+    /// This episode's own `CachedDownload.state`, keyed like `episodeProgressFor` — feeds
+    /// `EpisodeCard`'s badge.
+    var episodeDownloadStateFor: (String, String) -> String? = { _, _ in nil }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -57,7 +62,8 @@ struct ShelfRow: View {
                 // Prefer the entity's OWN mediaType (live-verified present on every recently-added
                 // entity); fall back to the shelf's type only if the entity ever omits it.
                 isPodcast: ShelfCardRouting.isPodcastBookEntity(
-                    entityMediaType: book.mediaType, shelfType: shelf.type))
+                    entityMediaType: book.mediaType, shelfType: shelf.type),
+                downloadState: downloadStateFor(book.id))
         case .author(let author):
             AuthorCard(name: author.name)
         case .episode(let episode):
@@ -69,7 +75,8 @@ struct ShelfRow: View {
                     podcastTitle: episode.media?.metadata.title ?? "Podcast",
                     duration: recentEpisode.effectiveDuration,
                     updatedAt: nil,
-                    progress: episodeProgressFor(episode.id, episodeID))
+                    progress: episodeProgressFor(episode.id, episodeID),
+                    downloadState: episodeDownloadStateFor(episode.id, episodeID))
             } else {
                 // No episode id to build a route from — an unrecognized/degenerate shelf projection;
                 // never renders a non-tappable/dead card (see `EpisodeCard`'s sibling doc comment).

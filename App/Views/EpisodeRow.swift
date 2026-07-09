@@ -83,6 +83,13 @@ struct EpisodeRow: View {
                 }
                 .accessibilityElement(children: .combine)
                 Spacer(minLength: 8)
+
+                // Per-episode download affordance (M2a Task 8) — compact, plain, never glass. Its own
+                // glyph (down-arrow/progress-ring/checkmark/retry) already communicates this episode's
+                // offline state, so it doubles as this row's "download-state badge" — a separate
+                // decorative overlay would be redundant (`CoverCard`/`EpisodeCard`, which have no
+                // control of their own, get the passive `DownloadStateBadge` instead).
+                DownloadButton(itemID: episode.itemID, episodeID: episode.episodeID, compact: true)
             }
             .padding(.vertical, 4)
             .contentShape(Rectangle())

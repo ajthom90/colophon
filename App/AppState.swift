@@ -122,6 +122,11 @@ final class AppState {
     /// `UserDefaults.standard` keys directly instead.
     static let defaultRateKey = "colophon.defaultRate"
     static let skipIntervalKey = "colophon.skipInterval"
+    /// M2a Task 8: the podcast "Delete downloaded episodes after finishing" toggle (default OFF).
+    /// `SettingsView` owns the `@AppStorage` Toggle; `maybeAutoDeleteFinishedEpisode` below reads
+    /// the same key directly (same unset-reads-as-off convention — `UserDefaults.bool` already
+    /// returns `false` for an absent key, matching the documented default with no extra plumbing).
+    static let deleteAfterFinishedKey = "colophon.deleteDownloadedEpisodesAfterFinishing"
 
     /// Single source of truth for the skip-interval setting (Task 4), shared by `SettingsView`'s
     /// `@AppStorage` default + Picker options, `storedSkipInterval()` below, and the live-update
@@ -396,7 +401,21 @@ final class AppState {
         // because the callback fires synchronously from the (MainActor) controller and the advance
         // is async; `[weak self]` avoids a retain cycle (AppState owns `playback`).
         playback.onBookFinished = { [weak self] in
-            Task { await self?.advanceToNext() }
+            guard let self else { return }
+            // M2a Task 8: podcast auto-delete-after-finished, the OFFLINE half. `cachedProgress`'s
+            // `isFinished` is server-authoritative (see `maybeAutoDeleteFinishedEpisode`'s doc) and
+            // never set locally, so a purely offline listen-to-completion (no reconnect yet) would
+            // otherwise wait on a future `me()`/socket round trip to learn it just finished. This
+            // fires the SAME check immediately from the "playback truly reached the end" signal —
+            // captured NOW (before `advanceToNext`, scheduled below, can retire/replace the session)
+            // so it names the JUST-finished item, not whatever plays next. `nowPlayingEpisodeID` nil
+            // (a book) short-circuits before any lookup — a book is never touched.
+            if let connectionID = self.playingConnectionID, let episodeID = self.nowPlayingEpisodeID,
+               let itemID = self.nowPlayingItemID {
+                Task { await self.maybeAutoDeleteFinishedEpisode(
+                    connectionID: connectionID, itemID: itemID, episodeID: episodeID, isFinished: true) }
+            }
+            Task { await self.advanceToNext() }
         }
         // Feed the download coordinator the LIVE active client + connection id (both change on a
         // connection switch / sign-out), so `download` re-derives URLs against the current client
@@ -907,6 +926,11 @@ final class AppState {
             try? cache.upsertProgress(CachedProgress(
                 connectionID: connectionID, itemID: update.itemID, episodeID: update.episodeID,
                 currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate))
+            // M2a Task 8: podcast auto-delete-after-finished — the live single-item "cachedProgress
+            // isFinished update" trigger. No-op for a book / an undownloaded item / an unfinished
+            // episode / the toggle off (see `maybeAutoDeleteFinishedEpisode`'s doc).
+            await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: update.itemID,
+                                                 episodeID: update.episodeID ?? "", isFinished: update.isFinished)
         case .progressBatch(let updates):
             let batch = updates.map { update in
                 CachedProgress(
@@ -914,6 +938,11 @@ final class AppState {
                     currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate)
             }
             try? cache.upsertProgressBatch(batch)
+            // Same auto-delete trigger, batched (a `user_updated` push can carry several items' progress).
+            for update in updates {
+                await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: update.itemID,
+                                                     episodeID: update.episodeID ?? "", isFinished: update.isFinished)
+            }
         case .itemChanged(let id):
             try? await patchItem(id: id, connectionID: connectionID)
         case .itemsChanged(let ids):
@@ -1173,6 +1202,13 @@ final class AppState {
                 lastUpdate: entry.lastUpdate ?? now)
         }
         try? cache.upsertProgressBatch(batch)
+        // Same auto-delete trigger as `apply(_:)`'s socket cases (M2a Task 8) — a `me()` join can
+        // be the FIRST place a just-finished episode's `isFinished` is learned (e.g. after a
+        // relaunch, before any socket event lands).
+        for cp in batch {
+            await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: cp.itemID,
+                                                 episodeID: cp.episodeID, isFinished: cp.isFinished)
+        }
         // Reuse the same `me()` payload to keep the now-playing book's bookmarks fresh (Task 6):
         // `me().bookmarks[]` is the source of truth, filtered to the playing item. Cheap, and
         // ignored by the store when no book is playing (`nowPlayingItemID` nil) or the item differs.
@@ -1605,8 +1641,8 @@ final class AppState {
         let pending = (try? cache.localSessions(connectionID: connectionID)) ?? []
         // Reconcile each pending session's (item, episode) progress: newer SERVER wins locally.
         for key in Set(pending.map { LocalKey(itemID: $0.itemID, episodeID: $0.episodeID) }) {
-            reconcileServerProgress(view: view, connectionID: connectionID,
-                                    itemID: key.itemID, episodeID: key.episodeID)
+            await reconcileServerProgress(view: view, connectionID: connectionID,
+                                          itemID: key.itemID, episodeID: key.episodeID)
         }
         guard !pending.isEmpty else { return }
 
@@ -1638,17 +1674,63 @@ final class AppState {
     /// `lastUpdate`, so this is doubly safe; the explicit comparison keeps the intent legible and
     /// avoids a needless write when the server has nothing newer.
     private func reconcileServerProgress(view: ProgressReconcileView, connectionID: String,
-                                         itemID: String, episodeID: String) {
+                                         itemID: String, episodeID: String) async {
         guard let server = view.progress(itemID: itemID, episodeID: episodeID) else { return }
         let local = (try? cache.progress(connectionID: connectionID, itemID: itemID,
                                          episodeID: episodeID.isEmpty ? nil : episodeID)) ?? nil
         let serverLastUpdate = server.lastUpdate ?? 0
         guard serverLastUpdate > (local?.lastUpdate ?? 0) else { return }   // else keep local
+        let isFinished = server.isFinished ?? false
         try? cache.upsertProgress(CachedProgress(
             connectionID: connectionID, itemID: itemID,
             episodeID: episodeID.isEmpty ? nil : episodeID,
-            currentTime: server.currentTime ?? 0, isFinished: server.isFinished ?? false,
+            currentTime: server.currentTime ?? 0, isFinished: isFinished,
             lastUpdate: serverLastUpdate))
+        // Same auto-delete trigger (M2a Task 8) — the offline-reconnect reconcile is exactly where a
+        // downloaded episode finished OFFLINE first learns the server's `isFinished` after reconnect.
+        await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: itemID,
+                                             episodeID: episodeID, isFinished: isFinished)
+    }
+
+    // MARK: - Podcast auto-delete-after-finished (M2a Task 8)
+
+    /// Pure eligibility decision for the "Delete downloaded episodes after finishing" preference —
+    /// no cache/`UserDefaults` dependency, so it's directly unit-testable against the spec's exact
+    /// four conservative cases: a downloaded, FINISHED EPISODE with the toggle ON is eligible; a BOOK
+    /// (`episodeID` empty — "never delete a book"), an UNFINISHED episode ("never delete an unfinished
+    /// episode"), a not-currently-downloaded episode (nothing to delete), or the toggle OFF are never
+    /// eligible. `internal` (not `private`), like `apply(_:)` above, so tests can drive it directly.
+    static func shouldAutoDeleteFinishedEpisode(
+        episodeID: String, isFinished: Bool, isDownloaded: Bool, toggleOn: Bool
+    ) -> Bool {
+        !episodeID.isEmpty && isFinished && isDownloaded && toggleOn
+    }
+
+    /// Called from every place `cachedProgress` receives a fresh `isFinished` value for an
+    /// item/episode — the live socket `.progressUpdated`/`.progressBatch` (`apply(_:)`),
+    /// `refreshProgress`'s `me()` join, and the offline-reconnect reconcile's
+    /// `reconcileServerProgress` (Task 6) — exactly the "progress → finished" signal the spec's
+    /// podcast auto-delete keys on ("book-finished/onBookFinished or the cachedProgress isFinished
+    /// update"; this app additionally wires `playback.onBookFinished` in `init`, for the purely
+    /// OFFLINE finish that hasn't reached the server yet — see that closure's comment). Looks up the
+    /// episode's CURRENT download state fresh (rather than threading it through every call site) and
+    /// the toggle, then defers to the pure decision above. `internal` (not `private`) for direct
+    /// testing, matching `apply(_:)`'s own precedent.
+    ///
+    /// `downloads.delete` is itself idempotent (a no-op when there's no matching cache row), so a
+    /// repeat call for an already-deleted episode — e.g. the socket path AND `onBookFinished` both
+    /// firing for the same finish — is harmless; no separate de-dup bookkeeping is needed.
+    func maybeAutoDeleteFinishedEpisode(
+        connectionID: String, itemID: String, episodeID: String, isFinished: Bool
+    ) async {
+        let isDownloaded = ((try? cache.download(
+            connectionID: connectionID, itemID: itemID, episodeID: episodeID)) ?? nil)?
+            .download.state == DownloadCoordinator.State.downloaded
+        let toggleOn = UserDefaults.standard.bool(forKey: Self.deleteAfterFinishedKey)
+        guard Self.shouldAutoDeleteFinishedEpisode(
+            episodeID: episodeID, isFinished: isFinished, isDownloaded: isDownloaded, toggleOn: toggleOn
+        ) else { return }
+        await downloads.delete(itemID: itemID, episodeID: episodeID)
     }
 
     /// Rebuild the server `LocalPlaybackSession` payload from a persisted `cachedLocalSession` row —

@@ -157,17 +157,24 @@ struct ItemDetailView: View {
 
     private var playSection: some View {
         VStack(spacing: 10) {
-            Button {
-                Task { await app.startPlayback(itemID: route.itemID) }
-            } label: {
-                Label(playLabel, systemImage: "play.fill")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
+            HStack(spacing: 12) {
+                Button {
+                    Task { await app.startPlayback(itemID: route.itemID) }
+                } label: {
+                    Label(playLabel, systemImage: "play.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
+                }
+                .buttonStyle(.glassProminent)
+                .controlSize(.large)
+                .fontDesign(.default)
+
+                // Download affordance (M2a Task 8) — plain, secondary, NEVER glass; the Play button
+                // above keeps this surface's one sanctioned `.glassProminent`. Bound to this book's
+                // own download state: download → progress → downloaded → delete.
+                DownloadButton(itemID: route.itemID, episodeID: nil)
             }
-            .buttonStyle(.glassProminent)
-            .controlSize(.large)
-            .fontDesign(.default)
 
             // Up-next queue affordances (Task 8) — native, opaque (never glass): enqueue this book
             // to play right after the current one, or at the end of the queue. Enabled only while a

@@ -2410,4 +2410,125 @@ struct SettingsPlumbingTests {
         let meCountAfter = await transport.recorded.filter { ($0.url?.path ?? "").hasSuffix("/api/me") }.count
         #expect(meCountAfter == meCountBefore)
     }
+
+    // MARK: - Podcast auto-delete-after-finished (M2a Task 8)
+
+    /// The pure eligibility decision (`AppState.shouldAutoDeleteFinishedEpisode`) against the spec's
+    /// exact conservative truth table — no cache/`UserDefaults` dependency, so every flip is asserted
+    /// independently: a downloaded, FINISHED EPISODE with the toggle ON is the only eligible case; a
+    /// BOOK (empty `episodeID`), an UNFINISHED episode, a not-currently-downloaded episode, and the
+    /// toggle OFF are each individually disqualifying.
+    @Test func autoDeleteDecisionTableMatchesTheConservativeSpec() {
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(
+            episodeID: "ep1", isFinished: true, isDownloaded: true, toggleOn: true) == true)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // a book — never
+            episodeID: "", isFinished: true, isDownloaded: true, toggleOn: true) == false)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // unfinished — never
+            episodeID: "ep1", isFinished: false, isDownloaded: true, toggleOn: true) == false)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // not downloaded — nothing to delete
+            episodeID: "ep1", isFinished: true, isDownloaded: false, toggleOn: true) == false)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // toggle off — never
+            episodeID: "ep1", isFinished: true, isDownloaded: true, toggleOn: false) == false)
+    }
+
+    /// END-TO-END wiring: a downloaded episode's progress reaching `isFinished` via the live socket
+    /// path (`apply(.progressUpdated(...))` — one of the "cachedProgress isFinished update" trigger
+    /// sites) with the Settings toggle ON actually calls `DownloadCoordinator.delete` — the cache row
+    /// AND the on-disk file are both gone afterward, not just a decision made.
+    @Test func autoDeleteRemovesDownloadedFinishedEpisodeWhenToggleOn() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(true, forKey: AppState.deleteAfterFinishedKey)
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        let fileURL = try seedDownloadedEpisode(app, connectionID: "C1", itemID: "pod1", episodeID: "ep1",
+                                                downloadsRoot: downloadsRoot, duration: 400, currentTime: 90)
+        await app.activateConnection("C1")   // no tokens → offline; sets activeConnectionID, no client needed
+
+        await app.apply(.progressUpdated(ProgressUpdate(
+            itemID: "pod1", episodeID: "ep1", currentTime: 400, isFinished: true, lastUpdate: 2)))
+
+        #expect(try app.cache.download(connectionID: "C1", itemID: "pod1", episodeID: "ep1") == nil)
+        #expect(!FileManager.default.fileExists(atPath: fileURL.path))
+        #expect(await transport.recorded.isEmpty)   // no network — delete is entirely local
+    }
+
+    /// The toggle's OFF (default) half: the identical finished-episode signal leaves the download
+    /// untouched.
+    @Test func autoDeleteLeavesDownloadUntouchedWhenToggleOff() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(false, forKey: AppState.deleteAfterFinishedKey)   // explicit OFF
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try seedDownloadedEpisode(app, connectionID: "C1", itemID: "pod1", episodeID: "ep1",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 90)
+        await app.activateConnection("C1")
+
+        await app.apply(.progressUpdated(ProgressUpdate(
+            itemID: "pod1", episodeID: "ep1", currentTime: 400, isFinished: true, lastUpdate: 2)))
+
+        #expect(try app.cache.download(connectionID: "C1", itemID: "pod1", episodeID: "ep1") != nil)
+    }
+
+    /// "Never delete a book": the SAME finished signal, toggle ON, for a BOOK (`episodeID` nil →
+    /// empty) leaves its download untouched — the spec's conservative guard, not just an incidental
+    /// side effect of the episode-only wiring.
+    @Test func autoDeleteNeverAppliesToABook() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(true, forKey: AppState.deleteAfterFinishedKey)
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try seedDownloadedBook(app, connectionID: "C1", itemID: "book1",
+                               downloadsRoot: downloadsRoot, duration: 300, currentTime: 0)
+        await app.activateConnection("C1")
+
+        await app.apply(.progressUpdated(ProgressUpdate(
+            itemID: "book1", episodeID: nil, currentTime: 300, isFinished: true, lastUpdate: 2)))
+
+        #expect(try app.cache.download(connectionID: "C1", itemID: "book1") != nil)
+    }
+
+    /// "Never delete an unfinished episode": toggle ON, downloaded episode, but `isFinished == false`
+    /// — untouched.
+    @Test func autoDeleteNeverAppliesToAnUnfinishedEpisode() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(true, forKey: AppState.deleteAfterFinishedKey)
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try seedDownloadedEpisode(app, connectionID: "C1", itemID: "pod1", episodeID: "ep1",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 90)
+        await app.activateConnection("C1")
+
+        await app.apply(.progressUpdated(ProgressUpdate(
+            itemID: "pod1", episodeID: "ep1", currentTime: 90, isFinished: false, lastUpdate: 2)))
+
+        #expect(try app.cache.download(connectionID: "C1", itemID: "pod1", episodeID: "ep1") != nil)
+    }
 }
