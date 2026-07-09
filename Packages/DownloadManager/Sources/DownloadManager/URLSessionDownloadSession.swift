@@ -9,8 +9,13 @@ import Foundation
 /// `urlSession(_:downloadTask:didFinishDownloadingTo:)`, and
 /// `urlSession(_:task:didCompleteWithError:)` — into the seam's `AsyncStream<DownloadEvent>` surface.
 ///
-/// Downloads are routed by `taskDescription` (set to the caller's `fileID`) rather than the
-/// process-local `taskIdentifier`, so routing keeps working after a relaunch reconstructs the tasks.
+/// **Routing:** event channels are keyed by `URLSessionTask.taskIdentifier` (unique per task within
+/// the session), NOT by `fileID`. This is what makes the `start` supersede contract safe: when a
+/// re-`start` for a live `fileID` cancels the prior task, that prior task's late `didCompleteWithError`
+/// closes ITS OWN (old) channel and cannot clobber the new transfer's stream. A `fileID → task` map
+/// (via `taskDescription`, which the system preserves across relaunch) backs the caller-facing
+/// `cancel`/`pause`/`attach` lookups.
+///
 /// The completed temp file handed to `didFinishDownloadingTo` is valid only until that method
 /// returns, so it is moved into a stable staging directory synchronously before the `.finished`
 /// event is yielded.
@@ -25,9 +30,11 @@ public final class URLSessionDownloadSession: NSObject, DownloadSession, @unchec
     private let stagingDirectory: URL
 
     private var session: URLSession!
-    private var streams: [String: AsyncStream<DownloadEvent>] = [:]
-    private var continuations: [String: AsyncStream<DownloadEvent>.Continuation] = [:]
-    private var tasks: [String: URLSessionDownloadTask] = [:]
+    /// Channels keyed by `taskIdentifier`.
+    private var streamsByTask: [Int: AsyncStream<DownloadEvent>] = [:]
+    private var continuationsByTask: [Int: AsyncStream<DownloadEvent>.Continuation] = [:]
+    /// The current task for each `fileID` — backs caller-facing `cancel`/`pause`/`attach`.
+    private var taskByID: [String: URLSessionDownloadTask] = [:]
     private var backgroundCompletionHandler: (@Sendable () -> Void)?
 
     public init(identifier: String, fileManager: FileManager = .default) {
@@ -46,23 +53,31 @@ public final class URLSessionDownloadSession: NSObject, DownloadSession, @unchec
     // MARK: - DownloadSession
 
     public func start(id: String, request: URLRequest, resumeData: Data?) -> AsyncStream<DownloadEvent> {
-        let stream = lock.withLock { channelLocked(id: id) }
+        // Supersede any live transfer for `id`. Cancelling the prior task lets IT close its own
+        // channel (keyed by its taskIdentifier) via `didCompleteWithError` — the new task below
+        // gets a fresh taskIdentifier and channel, so there is no clobber and no leaked task.
+        let prior = lock.withLock { taskByID[id] }
+        prior?.cancel()
+
         let task = resumeData.map { session.downloadTask(withResumeData: $0) }
             ?? session.downloadTask(with: request)
         task.taskDescription = id
-        lock.withLock { tasks[id] = task }
+        let stream = lock.withLock { () -> AsyncStream<DownloadEvent> in
+            taskByID[id] = task
+            return channelLocked(taskID: task.taskIdentifier)
+        }
         task.resume()
         return stream
     }
 
     public func cancel(id: String) async {
-        let task = lock.withLock { tasks[id] }
+        let task = lock.withLock { taskByID[id] }
         task?.cancel()
         // `didCompleteWithError` fires with a cancellation error → `.cancelled(nil)`.
     }
 
     public func cancelProducingResumeData(id: String) async -> Data? {
-        guard let task = lock.withLock({ tasks[id] }) else { return nil }
+        guard let task = lock.withLock({ taskByID[id] }) else { return nil }
         return await withCheckedContinuation { (cont: CheckedContinuation<Data?, Never>) in
             task.cancel(byProducingResumeData: { cont.resume(returning: $0) })
         }
@@ -75,8 +90,9 @@ public final class URLSessionDownloadSession: NSObject, DownloadSession, @unchec
     }
 
     /// Re-attach to transfers the background session is still tracking after an app relaunch,
-    /// repopulating the id→task map so `cancel`/`pause` continue to work. Returns the `fileID`s of
-    /// the outstanding downloads. Only Sendable `String`s cross the continuation boundary.
+    /// repopulating the `fileID → task` map so `cancel`/`pause`/`attach` continue to work. Returns
+    /// the `fileID`s of the outstanding downloads. Only Sendable `String`s cross the continuation
+    /// boundary. (The manager-level reconcile that consumes this is wired in a later task.)
     public func reattachOutstandingTasks() async -> [String] {
         await withCheckedContinuation { (cont: CheckedContinuation<[String], Never>) in
             session.getAllTasks { tasks in
@@ -85,7 +101,7 @@ public final class URLSessionDownloadSession: NSObject, DownloadSession, @unchec
                     for task in tasks {
                         guard let download = task as? URLSessionDownloadTask,
                               let id = task.taskDescription else { continue }
-                        self.tasks[id] = download
+                        self.taskByID[id] = download
                         ids.append(id)
                     }
                     return ids
@@ -95,39 +111,45 @@ public final class URLSessionDownloadSession: NSObject, DownloadSession, @unchec
         }
     }
 
-    /// Attach a fresh event stream to an already-outstanding transfer (e.g. after a relaunch)
-    /// without starting a new task. Buffered events emitted before the attach are preserved.
-    public func attach(id: String) -> AsyncStream<DownloadEvent> {
-        lock.withLock { channelLocked(id: id) }
-    }
-
-    // MARK: - Channels (caller must hold `lock`)
-
-    private func channelLocked(id: String) -> AsyncStream<DownloadEvent> {
-        if let existing = streams[id] { return existing }
-        let (stream, continuation) = AsyncStream.makeStream(
-            of: DownloadEvent.self, bufferingPolicy: .bufferingNewest(64)
-        )
-        streams[id] = stream
-        continuations[id] = continuation
-        return stream
-    }
-
-    /// Get (creating if needed) the continuation for `id`, so delegate events that arrive before a
-    /// consumer attaches are still buffered rather than dropped.
-    private func continuation(for id: String) -> AsyncStream<DownloadEvent>.Continuation {
+    /// Attach a fresh event stream to an already-outstanding transfer for `id` (e.g. after a
+    /// relaunch + `reattachOutstandingTasks`) without starting a new task. Buffered events emitted
+    /// before the attach are preserved. Returns `nil` if no outstanding task is tracked for `id`.
+    public func attach(id: String) -> AsyncStream<DownloadEvent>? {
         lock.withLock {
-            _ = channelLocked(id: id)
-            return continuations[id]!
+            guard let task = taskByID[id] else { return nil }
+            return channelLocked(taskID: task.taskIdentifier)
         }
     }
 
-    private func closeChannel(id: String) {
+    // MARK: - Channels (caller must hold `lock` for `channelLocked`)
+
+    private func channelLocked(taskID: Int) -> AsyncStream<DownloadEvent> {
+        if let existing = streamsByTask[taskID] { return existing }
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: DownloadEvent.self, bufferingPolicy: .bufferingNewest(64)
+        )
+        streamsByTask[taskID] = stream
+        continuationsByTask[taskID] = continuation
+        return stream
+    }
+
+    /// Get (creating if needed) the continuation for a task, so delegate events that arrive before
+    /// a consumer attaches are buffered rather than dropped.
+    private func continuation(forTask taskID: Int) -> AsyncStream<DownloadEvent>.Continuation {
         lock.withLock {
-            continuations[id]?.finish()
-            continuations[id] = nil
-            streams[id] = nil
-            tasks[id] = nil
+            _ = channelLocked(taskID: taskID)
+            return continuationsByTask[taskID]!
+        }
+    }
+
+    private func closeChannel(forTask taskID: Int, id: String?) {
+        lock.withLock {
+            continuationsByTask[taskID]?.finish()
+            continuationsByTask[taskID] = nil
+            streamsByTask[taskID] = nil
+            // Only clear the id→task mapping if it still points at THIS task (a re-`start` may have
+            // already repointed it at a newer task).
+            if let id, taskByID[id]?.taskIdentifier == taskID { taskByID[id] = nil }
         }
     }
 }
@@ -142,8 +164,7 @@ extension URLSessionDownloadSession: URLSessionDownloadDelegate {
         totalBytesWritten: Int64,
         totalBytesExpectedToWrite: Int64
     ) {
-        guard let id = downloadTask.taskDescription else { return }
-        continuation(for: id).yield(
+        continuation(forTask: downloadTask.taskIdentifier).yield(
             .progress(bytesWritten: totalBytesWritten, totalBytesExpected: totalBytesExpectedToWrite)
         )
     }
@@ -153,7 +174,6 @@ extension URLSessionDownloadSession: URLSessionDownloadDelegate {
         downloadTask: URLSessionDownloadTask,
         didFinishDownloadingTo location: URL
     ) {
-        guard let id = downloadTask.taskDescription else { return }
         // The temp file is reclaimed the instant this method returns — stage it synchronously.
         let staged = stagingDirectory.appendingPathComponent(UUID().uuidString)
         do {
@@ -162,9 +182,10 @@ extension URLSessionDownloadSession: URLSessionDownloadDelegate {
                 try fileManager.removeItem(at: staged)
             }
             try fileManager.moveItem(at: location, to: staged)
-            continuation(for: id).yield(.finished(temporaryURL: staged))
+            continuation(forTask: downloadTask.taskIdentifier).yield(.finished(temporaryURL: staged))
         } catch {
-            continuation(for: id).yield(.failed(asSendableError(error), resumeData: nil))
+            continuation(forTask: downloadTask.taskIdentifier)
+                .yield(.failed(asSendableError(error), resumeData: nil))
         }
     }
 
@@ -173,18 +194,18 @@ extension URLSessionDownloadSession: URLSessionDownloadDelegate {
         task: URLSessionTask,
         didCompleteWithError error: (any Error)?
     ) {
-        guard let id = task.taskDescription else { return }
         if let error {
             let resumeData = (error as NSError)
                 .userInfo[NSURLSessionDownloadTaskResumeData] as? Data
             if (error as NSError).code == NSURLErrorCancelled {
-                continuation(for: id).yield(.cancelled(resumeData: resumeData))
+                continuation(forTask: task.taskIdentifier).yield(.cancelled(resumeData: resumeData))
             } else {
-                continuation(for: id).yield(.failed(asSendableError(error), resumeData: resumeData))
+                continuation(forTask: task.taskIdentifier)
+                    .yield(.failed(asSendableError(error), resumeData: resumeData))
             }
         }
         // On success the `.finished` event was already yielded in `didFinishDownloadingTo`.
-        closeChannel(id: id)
+        closeChannel(forTask: task.taskIdentifier, id: task.taskDescription)
     }
 
     public func urlSessionDidFinishEvents(forBackgroundURLSession session: URLSession) {

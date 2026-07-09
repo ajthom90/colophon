@@ -26,6 +26,12 @@ public enum DownloadEvent: Sendable {
 public protocol DownloadSession: Sendable {
     /// Start (or, when `resumeData` is non-nil, resume) a download for `request`, keyed by the
     /// opaque `id`. Returns a stream of progress events terminated by exactly one terminal event.
+    ///
+    /// **Supersede contract:** calling `start` for an `id` that still has a live transfer
+    /// supersedes it — the session cancels the prior transfer, closes its (already-handed-out)
+    /// stream, and returns a brand-new single-consumer stream. Implementations must guarantee the
+    /// superseded transfer cannot keep running untracked, and its late completion must not affect
+    /// the new stream.
     func start(id: String, request: URLRequest, resumeData: Data?) -> AsyncStream<DownloadEvent>
     /// Cancel the download for `id`, discarding partial data. The stream ends with `.cancelled(nil)`.
     func cancel(id: String) async

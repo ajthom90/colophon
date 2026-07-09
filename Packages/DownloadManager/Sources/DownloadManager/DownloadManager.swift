@@ -73,8 +73,10 @@ public actor DownloadManager: DownloadManaging {
     private let session: any DownloadSession
     private let fileManager: FileManager
 
-    /// Bookkeeping for one in-flight transfer.
+    /// Bookkeeping for one in-flight transfer. `token` distinguishes generations of the same
+    /// `fileID`: a stale consumer from a superseded transfer is ignored in `handle`.
     private struct Transfer {
+        let token: UUID
         let destination: URL
         let continuation: AsyncStream<DownloadUpdate>.Continuation
         var consumer: Task<Void, Never>?
@@ -97,23 +99,29 @@ public actor DownloadManager: DownloadManaging {
         request: URLRequest,
         destination: URL,
         resumeData: Data?
-    ) -> AsyncStream<DownloadUpdate> {
-        // Replace any prior in-flight transfer for this id.
-        if let existing = transfers[fileID] {
+    ) async -> AsyncStream<DownloadUpdate> {
+        // Replace any prior in-flight transfer for this id: stop consuming + finish the old stream,
+        // then `session.cancel(id:)` so the underlying (background) task is torn down and does NOT
+        // keep running untracked. See the `DownloadSession.start` supersede contract.
+        if let existing = transfers.removeValue(forKey: fileID) {
             existing.consumer?.cancel()
             existing.continuation.finish()
+            await session.cancel(id: fileID)
         }
 
+        let token = UUID()
         let (stream, continuation) = AsyncStream.makeStream(
             of: DownloadUpdate.self, bufferingPolicy: .bufferingNewest(64)
         )
         let events = session.start(id: fileID, request: request, resumeData: resumeData)
-        transfers[fileID] = Transfer(destination: destination, continuation: continuation, consumer: nil)
+        transfers[fileID] = Transfer(
+            token: token, destination: destination, continuation: continuation, consumer: nil
+        )
         lastState[fileID] = .downloading(receivedBytes: 0, totalBytes: 0)
 
         let consumer = Task { [weak self] in
             for await event in events {
-                await self?.handle(event: event, fileID: fileID)
+                await self?.handle(event: event, fileID: fileID, token: token)
             }
         }
         transfers[fileID]?.consumer = consumer
@@ -152,8 +160,9 @@ public actor DownloadManager: DownloadManaging {
 
     // MARK: - Event handling
 
-    private func handle(event: DownloadEvent, fileID: String) {
-        guard let transfer = transfers[fileID] else { return }
+    private func handle(event: DownloadEvent, fileID: String, token: UUID) {
+        // Ignore events from a superseded transfer generation (a re-enqueue replaced this one).
+        guard let transfer = transfers[fileID], transfer.token == token else { return }
         switch event {
         case let .progress(written, total):
             emit(fileID: fileID, state: .downloading(receivedBytes: written, totalBytes: total))

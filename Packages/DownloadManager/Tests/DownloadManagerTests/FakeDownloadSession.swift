@@ -34,6 +34,9 @@ final class FakeDownloadSession: DownloadSession, @unchecked Sendable {
             of: DownloadEvent.self, bufferingPolicy: .bufferingNewest(64)
         )
         lock.withLock {
+            // Supersede contract: a re-`start` for a live id finishes the prior (single-consumer)
+            // stream before handing back a fresh one — a faithful mirror of the real session.
+            _continuations[id]?.finish()
             _starts.append(Start(id: id, resumeData: resumeData))
             _continuations[id] = continuation
         }

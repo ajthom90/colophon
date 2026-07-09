@@ -179,6 +179,60 @@ private func exists(_ url: URL) -> Bool { FileManager.default.fileExists(atPath:
     #expect(flag.value)
 }
 
+@Test func reEnqueueOfInFlightFileSupersedesPriorTransfer() async throws {
+    let fake = FakeDownloadSession()
+    let manager = DownloadManager(session: fake)
+    let dir = try makeTempDir()
+    let destination = dir.appendingPathComponent("track.m4b")
+
+    let first = await manager.enqueue(fileID: "f1", request: request, destination: destination)
+    fake.emitProgress(id: "f1", bytesWritten: 20, totalBytesExpected: 100)
+
+    // Re-enqueue the SAME in-flight id → the prior transfer is cancelled/superseded and the new
+    // one becomes the tracked transfer with a fresh stream.
+    let second = await manager.enqueue(fileID: "f1", request: request, destination: destination)
+
+    #expect(fake.cancelledIDs == ["f1"])        // prior task was cancelled before restart
+    #expect(fake.starts.count == 2)             // exactly one restart
+
+    // The first (superseded) stream terminates without ever reaching `.downloaded`.
+    let firstStates = await drain(first)
+    #expect(firstStates.last != .downloaded)
+
+    // Completing "f1" now drives the NEW transfer to downloaded on the fresh stream only.
+    let source = try makeTempFile(bytes: 100, in: dir)
+    fake.complete(id: "f1", temporaryURL: source)
+    let secondStates = await drain(second)
+
+    #expect(secondStates.last == .downloaded)
+    #expect(exists(destination))
+    #expect(await manager.state(for: "f1") == .downloaded)
+}
+
+@Test func moveFailureReportsFailedAndCleansUp() async throws {
+    let fake = FakeDownloadSession()
+    let manager = DownloadManager(session: fake)
+    let dir = try makeTempDir()
+    // A FILE where the destination's parent directory must be → `createDirectory` (inside the
+    // atomic move) throws, exercising the manager's own move-failure catch branch.
+    let blocker = dir.appendingPathComponent("parent-is-a-file")
+    try Data("x".utf8).write(to: blocker)
+    let destination = blocker.appendingPathComponent("track.m4b")
+
+    let stream = await manager.enqueue(fileID: "f1", request: request, destination: destination)
+    let source = try makeTempFile(bytes: 100, in: dir)
+    fake.complete(id: "f1", temporaryURL: source)
+
+    let states = await drain(stream)
+
+    guard case .failed = states.last else {
+        Issue.record("expected terminal .failed, got \(String(describing: states.last))")
+        return
+    }
+    #expect(!exists(source))            // staged temp cleaned up
+    #expect(!exists(destination))       // no partial file left behind
+}
+
 @Test func cancelUnknownFileIsANoOp() async throws {
     let fake = FakeDownloadSession()
     let manager = DownloadManager(session: fake)
