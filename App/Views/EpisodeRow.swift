@@ -27,6 +27,12 @@ struct EpisodeRow: View {
     let onPlay: () -> Void
     /// Enqueue THIS episode into the up-next queue — invoked by the context-menu "Add to Queue".
     let onAddToQueue: () -> Void
+    /// Whether the context-menu "Add to Queue" action is enabled — mirrors the book path's
+    /// `nowPlayingItemID == nil` guard (`CoverCard`/`ItemDetailView`): there's only a "current" item
+    /// to queue after while something is playing, and the queue UI is only reachable from
+    /// `FullPlayerView`, which needs an active session. Defaults to `true` so existing callers are
+    /// unaffected; the caller (`PodcastDetailView`) passes the live guard.
+    var canAddToQueue: Bool = true
 
     private var isFinished: Bool { progress?.isFinished ?? false }
 
@@ -84,6 +90,7 @@ struct EpisodeRow: View {
         .contextMenu {
             Button(action: onPlay) { Label("Play", systemImage: "play.fill") }
             Button(action: onAddToQueue) { Label("Add to Queue", systemImage: "text.append") }
+                .disabled(!canAddToQueue)
         }
     }
 

@@ -181,6 +181,10 @@ struct EpisodeDetailView: View {
             .controlSize(.large)
             .fontDesign(.default)
 
+            // Enabled only while something is playing — there's a "current" now-playing item to
+            // queue after (matches ItemDetailView's book Add-to-Queue guard; the queue UI is only
+            // reachable from FullPlayerView, which needs an active session, so queuing here while
+            // nothing plays would strand the episode in an unreachable queue).
             Button {
                 app.addToQueue(itemID: route.podcastItemID,
                                 title: episode.title ?? "Untitled Episode",
@@ -194,6 +198,7 @@ struct EpisodeDetailView: View {
             .controlSize(.large)
             .font(.subheadline.weight(.medium))
             .fontDesign(.default)
+            .disabled(app.nowPlayingItemID == nil)
         }
         .padding(.horizontal)
     }

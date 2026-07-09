@@ -167,7 +167,8 @@ struct PodcastDetailView: View {
                 podcastItemID: route.itemID, episodeID: episode.episodeID,
                 podcastTitle: displayTitle, updatedAt: route.updatedAt),
             onPlay: { startEpisodePlayback(episode) },
-            onAddToQueue: { addEpisodeToQueue(episode) })
+            onAddToQueue: { addEpisodeToQueue(episode) },
+            canAddToQueue: app.nowPlayingItemID != nil)
     }
 
     /// The loading / empty / error state, shown in place of the episode sections when there are no
