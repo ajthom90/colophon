@@ -155,6 +155,32 @@ final class AppState {
     /// probe succeeds; distinguishes "browsing cached rows offline" from "connected and syncing".
     private(set) var isOnline = false
 
+    /// Whether the active connection's server probe is STILL IN FLIGHT — true from the moment a
+    /// cached-first `activateConnection` publishes `phase == .connected` (BEFORE the token-store
+    /// await, so there is no gap) until that connection's `POST /api/authorize` probe settles
+    /// (success or failure). It exists ONLY to keep `isOffline` (below) from firing a FALSE POSITIVE
+    /// during that initial window: `isOnline` is transiently `false` while the probe runs even when
+    /// the server is perfectly reachable, so `phase == .connected && !isOnline` ALONE (the condition
+    /// the review proposed) would wrongly report "offline" for the ~probe-duration of every healthy
+    /// cached-first resume — the `activateConnection` code path publishes `.connected` BEFORE the
+    /// probe, so `phase` does not disambiguate it (contrary to the review note; verified against the
+    /// activation flow). Gating additionally on `!isProbingConnection` engages the offline fallback
+    /// only once the server is KNOWN-unreachable (the probe has failed), which is the review's actual
+    /// stated intent. A fresh `connect()` login publishes `isOnline == true` before `.connected`, so
+    /// it never enters this window.
+    private var isProbingConnection = false
+
+    /// The single "browsing cached content with a KNOWN-unreachable server" signal the offline-aware
+    /// browse keys on (M2a Task 7): a connection is active (`phase == .connected`), its server probe
+    /// has settled `false` (`!isOnline && !isProbingConnection`). This is exactly the review's
+    /// `phase == .connected && !isOnline`, corrected with `!isProbingConnection` to exclude the
+    /// initial in-flight-probe false positive (see `isProbingConnection`). It covers the primary
+    /// real-world offline case — a self-hosted SERVER stopped while the DEVICE's network link is
+    /// fine (`isNetworkAvailable` stays `true`, so the raw link is the WRONG signal to gate on) —
+    /// and drives both the browse fast-paths (`refreshItems`/`HomeView`/`SearchModel`) and the
+    /// shell's `OfflineIndicator` banner, so all four agree.
+    var isOffline: Bool { phase == .connected && !isOnline && !isProbingConnection }
+
     /// Raw OS network-path availability (`NWPathMonitor`) — the LINK state (Wi-Fi/cellular up),
     /// which knows NOTHING about the active server or auth. Deliberately SEPARATE from `isOnline`,
     /// and the two relate cleanly rather than duplicate:
@@ -578,6 +604,9 @@ final class AppState {
         // needs sign-in, and it's live.
         needsSignIn.remove(connection.id)
         isOnline = true
+        // A fresh login never entered the cached-first probe window; clear the flag defensively so a
+        // prior activation's stale in-flight mark can't leave `isOffline` mis-reading this live one.
+        isProbingConnection = false
         persistLastActive(connection.id)
         loadConnections()
         phase = .connected
@@ -690,6 +719,12 @@ final class AppState {
         errorMessage = nil
         refreshBanner = nil
         isOnline = false
+        // Mark the probe in-flight NOW — synchronously, at the same point `phase` becomes `.connected`
+        // and BEFORE the token-store await below — so `isOffline` is never transiently true in the
+        // gap between publishing `.connected` and the probe actually starting (that gap is a real
+        // suspension point a view's `.task` can run inside). Cleared on every settled outcome:
+        // the no-tokens branch, and all three probe exit paths.
+        isProbingConnection = true
         activeLibraryID = nil
         activeConnectionID = id
         persistLastActive(id)
@@ -708,6 +743,9 @@ final class AppState {
             client = nil
             auth = nil
             needsSignIn.insert(id)
+            // No probe will run — this connection is settled OFFLINE (needs sign-in), so `isOffline`
+            // may now report true.
+            isProbingConnection = false
             return
         }
         guard connectionEpoch == myEpoch else { return }
@@ -730,6 +768,7 @@ final class AppState {
                 guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.needsSignIn.remove(id)
                 self.isOnline = true
+                self.isProbingConnection = false   // probe settled ONLINE
                 self.startSocket(url: url, auth: auth)
                 if let libs = try? await client.libraries() {
                     guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
@@ -741,6 +780,7 @@ final class AppState {
             } catch ABSError.reauthRequired, ABSError.notAuthenticated {
                 guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
+                self.isProbingConnection = false   // probe settled (needs sign-in) → offline
                 self.needsSignIn.insert(id)
             } catch {
                 // Host down / transport error: stay in cached-only offline mode. `isOnline ==
@@ -748,6 +788,7 @@ final class AppState {
                 // offline case.
                 guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
+                self.isProbingConnection = false   // probe settled OFFLINE (server unreachable)
             }
         }
     }
@@ -962,15 +1003,15 @@ final class AppState {
         var lastTotal = 0
         var completed = false
         do {
-            // Fast-path (M2a Task 7, offline-aware browse): the raw network link is down — a real
-            // request below would only fail after the OS's own multi-second connect timeout, which
-            // reads as a hung spinner to the user. Skip straight into the SAME graceful-degradation
-            // catch branch below (a cached library → `refreshBanner`, not a throw; a not-yet-cached
-            // library → the existing `ContentUnavailableView`/retry path) rather than waiting out a
-            // doomed request. `isNetworkAvailable` defaults `true` and is changed only by the
-            // reachability monitor (or its `handleNetworkPathUpdate` test seam), so this is a no-op
-            // for every existing online test/path.
-            guard isNetworkAvailable else { throw ABSError.offline }
+            // Fast-path (M2a Task 7, offline-aware browse): the server is KNOWN-unreachable (a
+            // cached-first activation whose probe failed — the common self-hosted "server stopped,
+            // device online" case, which the raw link state `isNetworkAvailable` can't see). A real
+            // request would only fail after the transport's timeout, reading as a hung spinner; skip
+            // straight into the SAME graceful-degradation catch below (cached library → `refreshBanner`,
+            // not a throw; not-yet-cached → the existing `ContentUnavailableView`/retry path). Keyed on
+            // `isOffline` (NOT the raw link, NOT bare `!isOnline`) so it's a genuine no-op online AND
+            // during the initial in-flight probe (see `isOffline`/`isProbingConnection`).
+            if isOffline { throw ABSError.offline }
             for page in 0..<Self.refreshPageSafetyBound {
                 let result = try await client.items(
                     libraryID: libraryID, limit: limit, page: page,

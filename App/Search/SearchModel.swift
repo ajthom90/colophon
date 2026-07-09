@@ -183,12 +183,14 @@ final class SearchModel {
                     .map { ItemRow(cachedItem: $0, isPodcast: isPodcastLibrary) }
             },
             serverSearch: { query in
-                // `app.isNetworkAvailable` (M2a Task 7): with the link down, a live search request
-                // would otherwise sit until the OS's own connect timeout before failing — this
-                // closure is always called through `try?` (never surfaces its own error UI), so
-                // failing fast just clears `isSearching` sooner and leaves the instant local/FTS
-                // tier as the whole result, instead of a spinner that outlives the offline state.
-                guard let client = app.client, app.isNetworkAvailable else { throw ABSError.offline }
+                // `app.isOffline` (M2a Task 7): the server is KNOWN-unreachable (probe failed — the
+                // self-hosted "server stopped, device online" case the raw link can't see). A live
+                // search request would only fail after the transport timeout; this closure is always
+                // called through `try?` (never surfaces its own error UI), so failing fast just clears
+                // `isSearching` sooner and leaves the instant local/FTS tier as the whole result,
+                // instead of a spinner that outlives the offline state. Keyed on `isOffline` (not the
+                // raw link, not bare `!isOnline`) so an online query and the initial probe still fire.
+                guard let client = app.client, !app.isOffline else { throw ABSError.offline }
                 return try await client.searchLibrary(libraryID: libraryID, query: query)
             },
             debounce: debounce)

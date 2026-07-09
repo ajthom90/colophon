@@ -654,6 +654,133 @@ struct AppStateTests {
         #expect(await transport.recorded.isEmpty)
     }
 
+    // MARK: - Offline-aware browse guards (M2a Task 7, fix round 2)
+
+    /// Drives an `AppState` into the "cached-offline, server KNOWN-unreachable" state — a token'd
+    /// cached-first activation whose `/authorize` probe FAILS (a `MockTransport` with nothing queued
+    /// throws like a dead host) — and waits for the detached probe to SETTLE so `isOffline` is
+    /// authoritative. `client` is NON-nil here (built before the probe), so a guard test isolates the
+    /// `isOffline` decision rather than the trivial nil-client short-circuit. Seeds one cached item so
+    /// the browse fallback (a `refreshBanner` over still-usable rows) can engage. This is exactly the
+    /// state a real self-hosted "server stopped, device online" launch reaches once its probe fails.
+    private func makeOfflineActivatedApp() async throws -> (AppState, MockTransport) {
+        let transport = MockTransport()                    // nothing queued → the probe fails like a dead host
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: tokenStore)
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try app.cache.upsertLibraries([CachedLibrary(id: "L1", connectionID: "C1", name: "Books",
+                                                     mediaType: "book", displayOrder: 0)], connectionID: "C1")
+        try app.cache.upsertItemsPage([CachedItem(id: "i1", connectionID: "C1", libraryID: "L1",
+                                                  title: "Cached Book", authorName: nil, duration: 1, updatedAt: 1)],
+                                      connectionID: "C1", libraryID: "L1")
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+
+        await app.activateConnection("C1")
+        // Wait for the detached probe to SETTLE (fail) so `isProbingConnection` clears and `isOffline`
+        // is authoritative.
+        var spins = 0
+        while !app.isOffline, spins < 5000 { await Task.yield(); spins += 1 }
+        return (app, transport)
+    }
+
+    /// OFFLINE (server known-unreachable): `refreshItems` SHORT-CIRCUITS to the cache — it issues NO
+    /// `/items` request (which would hang against a dead host) and instead engages the non-blocking
+    /// `refreshBanner` over the still-usable cached rows. RED-verify: reverting the guard to the raw
+    /// link (`isNetworkAvailable`, which stays `true` when only the SERVER is down) makes a doomed
+    /// `/items` request get recorded → `itemsAfter == itemsBefore` fails.
+    @Test func refreshItemsShortCircuitsToCacheWhenServerKnownUnreachable() async throws {
+        let (app, transport) = try await makeOfflineActivatedApp()
+        #expect(app.isOffline)                                  // precondition: probe settled offline…
+        #expect(app.client != nil)                              // …with a live client (isolates the isOffline guard)
+        let itemsBefore = await transport.recorded.filter { ($0.url?.path ?? "").contains("/items") }.count
+
+        try await app.refreshItems(libraryID: "L1")
+
+        let itemsAfter = await transport.recorded.filter { ($0.url?.path ?? "").contains("/items") }.count
+        #expect(itemsAfter == itemsBefore)                      // NO doomed /items request attempted
+        #expect(app.refreshBanner?.libraryID == "L1")           // offline fallback engaged (cache stays usable)
+        #expect(app.errorMessage == nil)                        // never a blocking alert
+    }
+
+    /// ONLINE (no regression): the SAME `refreshItems` DOES issue a real `/items` request when the
+    /// server is reachable — the guard is a genuine no-op online. Complements the offline test above.
+    @Test func refreshItemsStillFetchesFromServerWhenOnline() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: itemsPageJSON(total: 1, results: ["i1"]))
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        #expect(app.isOffline == false)                         // a fresh login is online — the guard must NOT fire
+
+        try await app.refreshItems(libraryID: "lib1")
+
+        let itemsCount = await transport.recorded.filter { ($0.url?.path ?? "").contains("/items") }.count
+        #expect(itemsCount >= 1)                                // real fetch happened; online path unregressed
+    }
+
+    /// OFFLINE: `SearchModel`'s server tier is skipped — it makes NO `/search` request (the instant
+    /// local FTS tier is the whole result). Uses the token'd-offline app so `client` is non-nil,
+    /// isolating the `isOffline` guard from the nil-client short-circuit. RED-verify: reverting to
+    /// `isNetworkAvailable` records a doomed `/search` request → `searchCount == 0` fails.
+    @Test func searchModelServerTierSkippedWhenServerKnownUnreachable() async throws {
+        let (app, transport) = try await makeOfflineActivatedApp()
+        #expect(app.isOffline)
+        let model = SearchModel(app: app, connectionID: "C1", libraryID: "L1",
+                                libraryMediaType: "book", debounce: .milliseconds(1))
+        model.updateQuery("war")
+        await model.pendingSearch?.value
+
+        let searchCount = await transport.recorded.filter { ($0.url?.path ?? "").contains("/search") }.count
+        #expect(searchCount == 0)                               // NO doomed server search attempted
+    }
+
+    /// ONLINE (no regression): the SAME `SearchModel` DOES hit `/search` when the server is reachable.
+    @Test func searchModelServerTierRunsWhenOnline() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        await transport.enqueue(status: 200, json: "{}")        // the /search response
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        #expect(app.isOffline == false)
+        let model = SearchModel(app: app, connectionID: cid, libraryID: "lib1",
+                                libraryMediaType: "book", debounce: .milliseconds(1))
+        model.updateQuery("war")
+        await model.pendingSearch?.value
+
+        let searchCount = await transport.recorded.filter { ($0.url?.path ?? "").contains("/search") }.count
+        #expect(searchCount >= 1)                               // real server search happened; online unregressed
+    }
+
+    /// The `isOffline` signal must NOT false-positive during the INITIAL in-flight probe — the flaw a
+    /// bare `phase == .connected && !isOnline` would have (the cached-first activation publishes
+    /// `.connected` BEFORE the probe, so `phase` alone doesn't exclude it). With the probe parked on a
+    /// gate: `phase == .connected`, `isOnline == false`, yet `isOffline` is FALSE (still probing). Only
+    /// once the probe SETTLES as a failure does `isOffline` become true. RED-verify: dropping
+    /// `&& !isProbingConnection` from `isOffline` makes the mid-probe `isOffline == false` assertion fail.
+    @Test func isOfflineDoesNotFalsePositiveDuringInitialProbe() async throws {
+        let transport = GatedTransport(gatePath: "/api/authorize")   // park the probe mid-authorize
+        let tokenStore = InMemoryTokenStore()
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: tokenStore)
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try await tokenStore.save(TokenPair(accessToken: "acc", refreshToken: "ref"), for: "C1")
+
+        await app.activateConnection("C1")                       // returns; probe launched, parks on the gate
+        while await transport.requestCount(pathContains: "/api/authorize") == 0 { await Task.yield() }
+
+        // MID-PROBE: connected + not-yet-online, but NOT "offline" — the browse guards must not fire.
+        #expect(app.phase == .connected)
+        #expect(app.isOnline == false)
+        #expect(app.isOffline == false)                          // ← the false-positive guard
+
+        await transport.openGate()                               // no response queued → authorize throws → probe fails
+        var spins = 0
+        while !app.isOffline, spins < 5000 { await Task.yield(); spins += 1 }
+        #expect(app.isOffline == true)                           // settled offline → fallback now engages
+    }
+
     /// Playback policy (Global Constraints): switching the active connection mid-listen does NOT
     /// touch the player. Connect A + play, switch to B, and playback keeps running — the session's
     /// `PlaybackSessionHandle` owns its own client, independent of the now-swapped `self.client`.

@@ -32,22 +32,24 @@ struct RootShell: View {
 
 // MARK: - Offline indicator (M2a Task 7 — offline-aware browse)
 
-/// A small, non-blocking top-docked label shown on Home/Library/Search while the ACTIVE connection
-/// has no live server (`!app.isOnline`) — those surfaces already fall back to the cache/downloads
-/// (see `AppState.refreshItems`'s/`HomeView.loadShelves`'s/`SearchModel`'s `isNetworkAvailable`
-/// fast-paths, which skip a doomed network wait rather than spin), so this is purely informational:
-/// never an alert, never blocking interaction. Deliberately NOT applied to the Downloads tab/sidebar
-/// entry (`DownloadsView` is fully local — nothing there depends on the network, so the banner would
-/// be redundant noise). Shared by both shells (`PhoneShell`'s three network-backed tabs, `SplitShell`'s
-/// Home/Search/library detail cases) via the `.offlineIndicator()` modifier below — mirrors
-/// `LibrariesView`'s own inline connection-offline banner, reused here as a shell-level chrome
-/// element instead of being duplicated into every leaf view.
+/// A small, non-blocking top-docked label shown on Home/Library/Search while the ACTIVE connection's
+/// server is KNOWN-unreachable (`app.isOffline` — see its doc) — those surfaces already fall back to
+/// the cache/downloads (see `AppState.refreshItems`'s/`HomeView.loadShelves`'s/`SearchModel`'s
+/// `isOffline` fast-paths, which skip a doomed network wait rather than spin), so this is purely
+/// informational: never an alert, never blocking interaction. Keyed on the SAME `isOffline` the
+/// guards use so all four agree — and so it does NOT flash during a healthy launch's initial probe
+/// (when `isOnline` is transiently false but the server is fine). Deliberately NOT applied to the
+/// Downloads tab/sidebar entry (`DownloadsView` is fully local — nothing there depends on the
+/// network, so the banner would be redundant noise). Shared by both shells (`PhoneShell`'s three
+/// network-backed tabs, `SplitShell`'s Home/Search/library detail cases) via the `.offlineIndicator()`
+/// modifier below — mirrors `LibrariesView`'s own inline connection-offline banner, reused here as a
+/// shell-level chrome element instead of being duplicated into every leaf view.
 private struct OfflineIndicator: ViewModifier {
     @Environment(AppState.self) private var app
 
     func body(content: Content) -> some View {
         content.safeAreaInset(edge: .top) {
-            if app.activeConnectionID != nil, !app.isOnline {
+            if app.isOffline {
                 HStack(spacing: 6) {
                     Image(systemName: "wifi.slash")
                     Text("Offline — showing cached content")

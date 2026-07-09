@@ -17,12 +17,28 @@ public struct URLSessionTransport: Transport {
     let session: URLSession
     public let followRedirects: Bool
 
-    public init(session: URLSession = .shared, followRedirects: Bool = true) {
+    /// Default per-request timeout backstop (M2a Task 7). 20s: comfortably above a slow-but-working
+    /// large-library page — a 50-item `/items` page over a slow link lands in single-digit seconds —
+    /// yet it fails a REACHABLE-BUT-UNRESPONSIVE host (a self-hosted server dropped mid-session, or a
+    /// black-holed/firewall-dropped connection that neither the OS link-state nor the server probe
+    /// flip until the next reconnect) far sooner than `URLSession`'s 60s default, at which point the
+    /// browse surfaces' existing cache-fallback catch (`refreshBanner`/`ContentUnavailableView`)
+    /// engages instead of presenting an ~60s "infinite" spinner. A connection-refused host (e.g. the
+    /// dev server stopped, port closed) still fails near-instantly and never waits this out.
+    public static let defaultRequestTimeout: TimeInterval = 20
+
+    public init(session: URLSession = .shared, followRedirects: Bool = true,
+                requestTimeout: TimeInterval = URLSessionTransport.defaultRequestTimeout) {
         self.followRedirects = followRedirects
+        // `session.configuration` hands back a COPY, so mutating it never touches `.shared`'s own
+        // config. We always build a fresh session from that copy with the request-timeout backstop
+        // applied (per-request responsiveness ceiling); `timeoutIntervalForResource` is left at its
+        // sane 7-day default (the overall resource ceiling, not the per-attempt one this bounds).
+        let configuration = session.configuration
+        configuration.timeoutIntervalForRequest = requestTimeout
         if followRedirects {
-            self.session = session
+            self.session = URLSession(configuration: configuration)
         } else {
-            let configuration = session.configuration
             self.session = URLSession(
                 configuration: configuration,
                 delegate: NoRedirectSessionDelegate(),

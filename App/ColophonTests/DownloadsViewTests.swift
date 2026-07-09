@@ -75,12 +75,18 @@ struct DownloadsViewTests {
         #expect(small != large)
     }
 
-    /// The Downloads tab's own row identity (`Row.id`) must match `CachedDownload.id` exactly —
-    /// `ForEach` diffing depends on it, and a mismatch would make SwiftUI treat every progress tick
-    /// as a brand-new row (losing swipe/context-menu state and animating a spurious insert/remove).
-    @Test func rowIdentityMatchesTheUnderlyingDownloadsID() {
-        let d = download(itemID: "book-1", episodeID: "ep-1")
-        let row = DownloadsView.makeRow(d, item: nil, episode: nil)
-        #expect(row.id == d.id)
+    /// A book download and a podcast-EPISODE download that SHARE the same `itemID` (a podcast item
+    /// whose show-level and episode-level downloads coexist — or two distinct episodes of one show)
+    /// must produce DISTINCT row identities, or `ForEach` would collapse them into one row (dropping
+    /// the other download from the list entirely, and confusing swipe/delete targeting). This asserts
+    /// the identity is scoped by `(itemID, episodeID)`, not `itemID` alone — a property that WOULD
+    /// fail if `Row.id` keyed off `itemID`.
+    @Test func downloadsSharingAnItemIDButDifferingByEpisodeGetDistinctRowIdentities() {
+        let book = DownloadsView.makeRow(download(itemID: "pod-1", episodeID: ""), item: nil, episode: nil)
+        let epA = DownloadsView.makeRow(download(itemID: "pod-1", episodeID: "ep-A"), item: nil, episode: nil)
+        let epB = DownloadsView.makeRow(download(itemID: "pod-1", episodeID: "ep-B"), item: nil, episode: nil)
+        #expect(book.id != epA.id)
+        #expect(epA.id != epB.id)
+        #expect(Set([book.id, epA.id, epB.id]).count == 3)
     }
 }

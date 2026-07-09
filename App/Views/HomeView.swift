@@ -147,11 +147,12 @@ struct HomeView: View {
     /// (only surfaces the error state when there's nothing to show).
     private func loadShelves() async {
         guard let library = activeLibrary else { return }
-        // `app.isNetworkAvailable` (M2a Task 7): with no client this was already offline; with a
-        // client but no network link, a live `personalizedShelves` call would otherwise hang until
-        // the OS's own connect timeout before failing — skip it and degrade immediately instead, so
-        // Home never shows a spinner that outlives the user's patience.
-        guard let client = app.client, app.isNetworkAvailable else {
+        // `app.isOffline` (M2a Task 7): the server is KNOWN-unreachable (probe failed — the common
+        // self-hosted "server stopped, device online" case the raw link state can't see). A live
+        // `personalizedShelves` call would only fail after the transport timeout, reading as a hung
+        // spinner — degrade immediately instead. Keyed on `isOffline` (not the raw link, not bare
+        // `!isOnline`), so a healthy launch and the initial in-flight probe both proceed normally.
+        guard let client = app.client, !app.isOffline else {
             if shelves.isEmpty {
                 state = .failed("You're offline — Home shelves need a live connection.")
             }
