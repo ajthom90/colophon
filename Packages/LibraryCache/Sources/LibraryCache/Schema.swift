@@ -133,6 +133,55 @@ enum Schema {
                 t.primaryKey(["connectionID", "itemID"])
             }
         }
+        // v4 (M2a Task 2): download records. ALTER/CREATE-only, like v2 and v3 — v1/v2/v3's
+        // bodies above are NEVER touched. Two brand-new tables, both additive (no existing data
+        // to preserve), so a v1(+v2+v3) database upgrades in place gaining just these tables:
+        //
+        //   - `cachedDownload`: one row per downloadable unit (a whole book, or a single podcast
+        //     episode). PK `(connectionID, itemID, episodeID)` mirrors `cachedProgress`'s 3-part
+        //     convention (`episodeID` "" = book-level download, non-empty = one episode). Tracks
+        //     the download's AGGREGATE lifecycle (`state`) and byte counts across every file.
+        //   - `cachedDownloadFile`: the per-audio-file breakdown for one download (a book can
+        //     span several audio files; a podcast episode is normally exactly one). PK adds
+        //     `trackIndex` to the parent's key. A CHILD TABLE, not a JSON column on
+        //     `cachedDownload` — chosen so a single file's progress tick or failure is a targeted
+        //     row upsert/read instead of a full JSON-column decode-mutate-reencode-write, the
+        //     same reasoning that put podcast episodes in `cachedEpisode` rather than a JSON
+        //     column on `cachedItem`. `localRelativePath` is RELATIVE to a caller-owned downloads
+        //     root — never an absolute path, since an absolute path breaks across app-container
+        //     moves (e.g. an OS update relocating the sandbox).
+        //
+        // Pinning: a downloaded item's `cachedItemDetail` (v2) row must already be present so the
+        // item stays browsable offline (title/author/chapters/tracks). No new column is added
+        // here for that — `cachedItemDetail` is already keyed `(connectionID, itemID)`; the
+        // DOWNLOAD ORCHESTRATOR (Task 4) is responsible for fetching+pinning detail before
+        // enqueuing a download's files, and for keeping it pinned (never evicted) while any
+        // `cachedDownload` row references that item.
+        migrator.registerMigration("v4") { db in
+            try db.create(table: "cachedDownload") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")   // "" = book/no episode
+                t.column("state", .text).notNull()             // queued/downloading/downloaded/failed
+                t.column("receivedBytes", .integer).notNull().defaults(to: 0)
+                t.column("totalBytes", .integer).notNull().defaults(to: 0)
+                t.column("updatedAt", .integer).notNull()
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+            try db.create(table: "cachedDownloadFile") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")   // "" = book/no episode
+                t.column("trackIndex", .integer).notNull()
+                t.column("ino", .text).notNull()
+                t.column("localRelativePath", .text).notNull()   // RELATIVE to the downloads root
+                t.column("receivedBytes", .integer).notNull().defaults(to: 0)
+                t.column("totalBytes", .integer).notNull().defaults(to: 0)
+                t.column("state", .text).notNull()             // queued/downloading/downloaded/failed
+                t.column("mimeType", .text)
+                t.primaryKey(["connectionID", "itemID", "episodeID", "trackIndex"])
+            }
+        }
         return migrator
     }
 }

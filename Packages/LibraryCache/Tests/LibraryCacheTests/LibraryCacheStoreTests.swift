@@ -672,4 +672,329 @@ import Testing
         #expect(try store.playbackRate(connectionID: "C1", itemID: "i2") == 2.0)
         #expect(try store.playbackRate(connectionID: "C2", itemID: "i1") == 0.75)
     }
+
+    // MARK: - v4: download records (Task 2)
+
+    @Test func downloadRoundTripWithMultiFileChildren() throws {
+        let store = try makeStore()
+        let download = CachedDownload(connectionID: "C1", itemID: "i1", episodeID: nil,
+                                      state: "downloading", receivedBytes: 50, totalBytes: 200, updatedAt: 100)
+        try store.upsertDownload(download)
+        try store.upsertDownloadFile(CachedDownloadFile(
+            connectionID: "C1", itemID: "i1", trackIndex: 0, ino: "ino1",
+            localRelativePath: "C1/i1/track-0.m4b", receivedBytes: 50, totalBytes: 100,
+            state: "downloaded", mimeType: "audio/mp4"))
+        try store.upsertDownloadFile(CachedDownloadFile(
+            connectionID: "C1", itemID: "i1", trackIndex: 1, ino: "ino2",
+            localRelativePath: "C1/i1/track-1.m4b", receivedBytes: 0, totalBytes: 100, state: "queued"))
+
+        let fetched = try #require(try store.download(connectionID: "C1", itemID: "i1"))
+        #expect(fetched.download.state == "downloading")
+        #expect(fetched.download.receivedBytes == 50)
+        #expect(fetched.download.totalBytes == 200)
+        #expect(fetched.files.map(\.trackIndex) == [0, 1])
+        // Per-file relative paths preserved exactly — RELATIVE, not absolute.
+        #expect(fetched.files[0].localRelativePath == "C1/i1/track-0.m4b")
+        #expect(fetched.files[1].localRelativePath == "C1/i1/track-1.m4b")
+        #expect(fetched.files[0].ino == "ino1")
+        #expect(fetched.files[0].state == "downloaded")
+        #expect(fetched.files[0].mimeType == "audio/mp4")
+        #expect(fetched.files[1].state == "queued")
+
+        #expect(try store.download(connectionID: "C1", itemID: "missing") == nil)
+    }
+
+    /// A podcast-episode download (`episodeID` non-empty) and a book-level download (`episodeID`
+    /// `""`) coexist independently under the SAME connection+item — mirrors
+    /// `episodeProgressDistinctFromBookProgress`'s proof for `cachedProgress`.
+    @Test func episodeDownloadDistinctFromBookDownload() throws {
+        let store = try makeStore()
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", episodeID: nil,
+                                                state: "downloaded", receivedBytes: 100, totalBytes: 100, updatedAt: 1))
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", episodeID: "e1",
+                                                state: "queued", updatedAt: 2))
+
+        #expect(try store.download(connectionID: "C1", itemID: "i1")?.download.state == "downloaded")
+        #expect(try store.download(connectionID: "C1", itemID: "i1", episodeID: "e1")?.download.state == "queued")
+    }
+
+    @Test func downloadsListsAllForConnectionNewestFirst() throws {
+        let store = try makeStore()
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", state: "downloaded", updatedAt: 100))
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i2", episodeID: "e1", state: "queued", updatedAt: 200))
+        try store.upsertDownload(CachedDownload(connectionID: "C2", itemID: "i9", state: "downloaded", updatedAt: 50))
+
+        #expect(try store.downloads(connectionID: "C1").map(\.itemID) == ["i2", "i1"])   // newest updatedAt first
+        #expect(try store.downloads(connectionID: "C2").map(\.itemID) == ["i9"])          // scoped: untouched
+    }
+
+    @Test func observeDownloadsEmitsOnUpsert() async throws {
+        let store = try makeStore()
+        let observation = store.observeDownloads(connectionID: "C1")
+        var iterator = observation.makeAsyncIterator()
+        let initial = try await iterator.next()
+        #expect(initial == [])                                                   // nothing cached yet
+
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", state: "queued", updatedAt: 1))
+        let afterEnqueue = try await iterator.next()
+        #expect(afterEnqueue?.map(\.itemID) == ["i1"])
+        #expect(afterEnqueue?.first?.state == "queued")
+
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", state: "downloaded",
+                                                receivedBytes: 100, totalBytes: 100, updatedAt: 2))
+        let afterComplete = try await iterator.next()
+        #expect(afterComplete?.first?.state == "downloaded")
+        #expect(afterComplete?.first?.receivedBytes == 100)
+    }
+
+    @Test func deleteDownloadRemovesParentAndFiles() throws {
+        let store = try makeStore()
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", state: "downloaded",
+                                                receivedBytes: 200, totalBytes: 200, updatedAt: 1))
+        try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C1", itemID: "i1", trackIndex: 0,
+                                                         ino: "ino1", localRelativePath: "p0",
+                                                         receivedBytes: 100, totalBytes: 100, state: "downloaded"))
+        try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C1", itemID: "i1", trackIndex: 1,
+                                                         ino: "ino2", localRelativePath: "p1",
+                                                         receivedBytes: 100, totalBytes: 100, state: "downloaded"))
+        // An unrelated download must survive the delete.
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i2", state: "downloaded",
+                                                receivedBytes: 50, totalBytes: 50, updatedAt: 1))
+        try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C1", itemID: "i2", trackIndex: 0,
+                                                         ino: "ino9", localRelativePath: "p9",
+                                                         receivedBytes: 50, totalBytes: 50, state: "downloaded"))
+
+        try store.deleteDownload(connectionID: "C1", itemID: "i1")
+
+        #expect(try store.download(connectionID: "C1", itemID: "i1") == nil)
+        #expect(try store.download(connectionID: "C1", itemID: "i2")?.files.count == 1)   // untouched
+        #expect(try store.totalDownloadedBytes(connectionID: "C1") == 50)                 // only i2's file remains
+    }
+
+    @Test func totalDownloadedBytesSumsFileRowsPerConnection() throws {
+        let store = try makeStore()
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", state: "downloading",
+                                                receivedBytes: 150, totalBytes: 300, updatedAt: 1))
+        try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C1", itemID: "i1", trackIndex: 0,
+                                                         ino: "ino1", localRelativePath: "p0",
+                                                         receivedBytes: 100, totalBytes: 100, state: "downloaded"))
+        try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C1", itemID: "i1", trackIndex: 1,
+                                                         ino: "ino2", localRelativePath: "p1",
+                                                         receivedBytes: 50, totalBytes: 200, state: "downloading"))
+        try store.upsertDownload(CachedDownload(connectionID: "C2", itemID: "i9", state: "downloaded",
+                                                receivedBytes: 999, totalBytes: 999, updatedAt: 1))
+        try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C2", itemID: "i9", trackIndex: 0,
+                                                         ino: "ino9", localRelativePath: "p9",
+                                                         receivedBytes: 999, totalBytes: 999, state: "downloaded"))
+
+        #expect(try store.totalDownloadedBytes(connectionID: "C1") == 150)
+        #expect(try store.totalDownloadedBytes(connectionID: "C2") == 999)
+        #expect(try store.totalDownloadedBytes(connectionID: "C3") == 0)   // no downloads at all
+    }
+
+    @Test func deleteConnectionCascadesToDownloads() throws {
+        let store = try makeStore()
+        for c in ["C1", "C2"] {
+            try store.upsertDownload(CachedDownload(connectionID: c, itemID: "i1", state: "downloaded",
+                                                    receivedBytes: 10, totalBytes: 10, updatedAt: 1))
+            try store.upsertDownloadFile(CachedDownloadFile(connectionID: c, itemID: "i1", trackIndex: 0,
+                                                             ino: "ino-\(c)", localRelativePath: "p-\(c)",
+                                                             receivedBytes: 10, totalBytes: 10, state: "downloaded"))
+        }
+
+        try store.deleteConnection(connectionID: "C1")
+
+        // C1: parent + file rows gone.
+        #expect(try store.download(connectionID: "C1", itemID: "i1") == nil)
+        #expect(try store.totalDownloadedBytes(connectionID: "C1") == 0)
+        // C2: fully intact.
+        #expect(try store.download(connectionID: "C2", itemID: "i1")?.download.state == "downloaded")
+        #expect(try store.totalDownloadedBytes(connectionID: "C2") == 10)
+    }
+
+    @Test func deleteItemCascadesToDownloads() throws {
+        let store = try makeStore()
+        for id in ["i1", "i2"] {
+            try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: id, state: "downloaded",
+                                                    receivedBytes: 10, totalBytes: 10, updatedAt: 1))
+            try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C1", itemID: id, trackIndex: 0,
+                                                             ino: "ino-\(id)", localRelativePath: "p-\(id)",
+                                                             receivedBytes: 10, totalBytes: 10, state: "downloaded"))
+        }
+
+        try store.deleteItem(connectionID: "C1", itemID: "i1")
+
+        // i1: parent + file rows gone.
+        #expect(try store.download(connectionID: "C1", itemID: "i1") == nil)
+        // i2: untouched.
+        #expect(try store.download(connectionID: "C1", itemID: "i2")?.download.state == "downloaded")
+        #expect(try store.totalDownloadedBytes(connectionID: "C1") == 10)
+    }
+
+    /// Builds a genuine v1+v2+v3-ONLY database file (registers "v1", "v2", "v3", replicating the
+    /// frozen migrations byte-for-byte — same discipline as `seedV1OnlyDatabase`/
+    /// `seedV1V2OnlyDatabase`, one migration further) with real `cachedItem`/`cachedItemDetail`/
+    /// `cachedItemPref` rows, then closes it. Reopening through the production
+    /// `LibraryCacheStore` runs v1+v2+v3+v4, so v4's two `CREATE TABLE`s (additive — no `ALTER`)
+    /// are proven against a genuinely pre-existing v1+v2+v3 file rather than a fresh already-v4
+    /// store.
+    private func seedV1V2V3OnlyDatabase(at url: URL) throws {
+        let dbQueue = try DatabaseQueue(path: url.path)
+        var migrator = DatabaseMigrator()
+        migrator.registerMigration("v1") { db in
+            try db.create(table: "cachedConnection") { t in
+                t.primaryKey("id", .text)
+                t.column("address", .text).notNull()
+                t.column("name", .text).notNull()
+                t.column("username", .text).notNull()
+                t.column("authMethod", .text).notNull()
+                t.column("sortIndex", .integer).notNull()
+            }
+            try db.create(table: "cachedLibrary") { t in
+                t.column("id", .text).notNull()
+                t.column("connectionID", .text).notNull().indexed()
+                t.column("name", .text).notNull()
+                t.column("mediaType", .text).notNull()
+                t.column("displayOrder", .integer).notNull()
+                t.primaryKey(["connectionID", "id"])
+            }
+            try db.create(table: "cachedItem") { t in
+                t.column("id", .text).notNull()
+                t.column("connectionID", .text).notNull().indexed()
+                t.column("libraryID", .text).notNull().indexed()
+                t.column("title", .text).notNull()
+                t.column("authorName", .text)
+                t.column("duration", .double)
+                t.column("updatedAt", .integer)
+                t.primaryKey(["connectionID", "id"])
+            }
+            try db.create(table: "cachedProgress") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")
+                t.column("currentTime", .double).notNull()
+                t.column("isFinished", .boolean).notNull()
+                t.column("lastUpdate", .integer).notNull()
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+            try db.create(virtualTable: "itemFTS", using: FTS5()) { t in
+                t.synchronize(withTable: "cachedItem")
+                t.tokenizer = .unicode61()
+                t.column("title")
+                t.column("authorName")
+            }
+        }
+        migrator.registerMigration("v2") { db in
+            try db.alter(table: "cachedItem") { t in
+                t.add(column: "subtitle", .text)
+                t.add(column: "narratorName", .text)
+                t.add(column: "seriesName", .text)
+                t.add(column: "genresJSON", .text)
+                t.add(column: "publishedYear", .text)
+                t.add(column: "descriptionSnippet", .text)
+            }
+            try db.create(table: "cachedItemDetail") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("description", .text)
+                t.column("publisher", .text)
+                t.column("isbn", .text)
+                t.column("asin", .text)
+                t.column("language", .text)
+                t.column("explicit", .boolean)
+                t.column("abridged", .boolean)
+                t.column("publishedDate", .text)
+                t.column("chaptersJSON", .text)
+                t.primaryKey(["connectionID", "itemID"])
+            }
+            try db.create(table: "cachedEpisode") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull()
+                t.column("idx", .integer)
+                t.column("season", .text)
+                t.column("episode", .text)
+                t.column("episodeType", .text)
+                t.column("title", .text)
+                t.column("subtitle", .text)
+                t.column("episodeDescription", .text)
+                t.column("pubDate", .text)
+                t.column("publishedAt", .integer)
+                t.column("durationSeconds", .double)
+                t.column("sizeBytes", .integer)
+                t.column("guid", .text)
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+        }
+        migrator.registerMigration("v3") { db in
+            try db.create(table: "cachedItemPref") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("playbackRate", .double)
+                t.primaryKey(["connectionID", "itemID"])
+            }
+        }
+        try migrator.migrate(dbQueue)
+        try dbQueue.write { db in
+            try db.execute(sql: """
+                INSERT INTO cachedItem (id, connectionID, libraryID, title, authorName, duration, updatedAt,
+                                         subtitle, narratorName, seriesName, genresJSON, publishedYear, descriptionSnippet)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: ["i1", "C1", "L1", "Dracula", "Bram Stoker", 100.0, 1,
+                            "A Novel", "Narrator Name", "Gothic Classics", "[\"Horror\"]", "1897", "A count..."])
+            try db.execute(sql: """
+                INSERT INTO cachedItemDetail (connectionID, itemID, description, publisher)
+                VALUES (?, ?, ?, ?)
+                """,
+                arguments: ["C1", "i1", "Full description", "Acme Pub"])
+            try db.execute(sql: """
+                INSERT INTO cachedItemPref (connectionID, itemID, playbackRate)
+                VALUES (?, ?, ?)
+                """,
+                arguments: ["C1", "i1", 1.5])
+        }
+        try dbQueue.close()   // release the file so the real store can reopen it
+    }
+
+    /// THE sabotage-provable v4 migration test (same rigor as `v2AddsDetailColumnsPreservingV1Rows`
+    /// and `v3AddsPrefTablePreservingV1V2Rows`): seed a genuine v1+v2+v3-only file, reopen through
+    /// the production store (runs v1+v2+v3+v4 — v4's two `CREATE TABLE`s executed against real
+    /// pre-existing tables), and assert (1) the v1 row + its v2 columns survive untouched, (2) the
+    /// v2 `cachedItemDetail` row survives, (3) the v3 `cachedItemPref` row survives, and (4) the
+    /// new `cachedDownload`/`cachedDownloadFile` tables exist, are queryable, and round-trip a
+    /// real download.
+    @Test func v4AddsDownloadTablesPreservingV1V2V3Rows() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dbURL = dir.appending(path: "cache.sqlite")
+
+        try seedV1V2V3OnlyDatabase(at: dbURL)                   // genuine v1+v2+v3-only file on disk
+        let store = try LibraryCacheStore(databaseURL: dbURL)   // reopen → runs v1+v2+v3+v4 (CREATE TABLE only)
+
+        // The pre-existing v1 row + its v2 columns survive, values intact.
+        let fetched = try store.items(connectionID: "C1", libraryID: "L1").first
+        #expect(fetched?.id == "i1")
+        #expect(fetched?.title == "Dracula")
+        #expect(fetched?.authorName == "Bram Stoker")
+        #expect(fetched?.subtitle == "A Novel")
+        #expect(fetched?.genres == ["Horror"])
+        // The pre-existing v2 detail row survives.
+        #expect(try store.itemDetail(connectionID: "C1", itemID: "i1")?.publisher == "Acme Pub")
+        // The pre-existing v3 pref row survives.
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == 1.5)
+
+        // The new v4 tables exist, are queryable (a missing table would throw), and round-trip a
+        // real download + its per-file breakdown.
+        #expect(try store.download(connectionID: "C1", itemID: "i1") == nil)
+        try store.upsertDownload(CachedDownload(connectionID: "C1", itemID: "i1", state: "downloading",
+                                                receivedBytes: 10, totalBytes: 100, updatedAt: 5))
+        try store.upsertDownloadFile(CachedDownloadFile(connectionID: "C1", itemID: "i1", trackIndex: 0,
+                                                         ino: "ino1", localRelativePath: "C1/i1/track-0.m4b",
+                                                         receivedBytes: 10, totalBytes: 100, state: "downloading"))
+        let download = try #require(try store.download(connectionID: "C1", itemID: "i1"))
+        #expect(download.download.state == "downloading")
+        #expect(download.files.map(\.localRelativePath) == ["C1/i1/track-0.m4b"])
+        #expect(try store.totalDownloadedBytes(connectionID: "C1") == 10)
+    }
 }

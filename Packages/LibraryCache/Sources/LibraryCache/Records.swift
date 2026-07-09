@@ -309,6 +309,121 @@ public struct CachedItemPref: Codable, FetchableRecord, PersistableRecord, Senda
     }
 }
 
+/// A download's AGGREGATE record for a book or podcast episode (M2a `v4`). PK
+/// `(connectionID, itemID, episodeID)` mirrors `CachedProgress`'s 3-part convention —
+/// `episodeID` `""` means a book-level download. Tracks the overall lifecycle/byte counts across
+/// every file in the download; the per-file breakdown (one row per audio track) lives in the
+/// child table `CachedDownloadFile`, keyed by this row's PK plus `trackIndex`. `state` is a plain
+/// string (`"queued"`/`"downloading"`/`"downloaded"`/`"failed"`) — the same convention as
+/// `CachedLibrary.mediaType`/`CachedConnection.authMethod`; the caller (`DownloadCoordinator`,
+/// Task 4) owns the meaning of the values. A downloaded item's `CachedItemDetail` (v2) row MUST
+/// already be pinned so the item stays browsable offline — that pinning is the download
+/// orchestrator's responsibility (Task 4), not this record's.
+public struct CachedDownload: Codable, FetchableRecord, PersistableRecord, Sendable, Identifiable, Equatable, Hashable {
+    public static let databaseTableName = "cachedDownload"
+
+    public var connectionID: String
+    public var itemID: String
+    /// Empty string means a book-level download (no episode) — mirrors `CachedProgress.episodeID`.
+    public var episodeID: String
+    public var state: String
+    public var receivedBytes: Int
+    public var totalBytes: Int
+    public var updatedAt: Int
+
+    public var id: String { connectionID + "/" + itemID + "/" + episodeID }
+
+    public init(
+        connectionID: String,
+        itemID: String,
+        episodeID: String? = nil,
+        state: String,
+        receivedBytes: Int = 0,
+        totalBytes: Int = 0,
+        updatedAt: Int
+    ) {
+        self.connectionID = connectionID
+        self.itemID = itemID
+        self.episodeID = episodeID ?? ""
+        self.state = state
+        self.receivedBytes = receivedBytes
+        self.totalBytes = totalBytes
+        self.updatedAt = updatedAt
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case connectionID, itemID, episodeID, state, receivedBytes, totalBytes, updatedAt
+    }
+}
+
+/// One audio file within a `CachedDownload`'s per-file breakdown (a book download can span
+/// several files; a podcast episode download is normally exactly one). PK
+/// `(connectionID, itemID, episodeID, trackIndex)` — the parent `CachedDownload`'s PK plus the
+/// file's position in the item's track list. `localRelativePath` is RELATIVE to a caller-owned
+/// downloads root — NEVER an absolute path: an absolute path breaks across app-container moves
+/// (e.g. an OS update relocating the app's sandbox between launches), so the coordinator
+/// (Task 4) resolves this against the CURRENT downloads root at read time.
+public struct CachedDownloadFile: Codable, FetchableRecord, PersistableRecord, Sendable, Identifiable, Equatable, Hashable {
+    public static let databaseTableName = "cachedDownloadFile"
+
+    public var connectionID: String
+    public var itemID: String
+    /// Empty string means the file belongs to a book-level download — mirrors the parent's `episodeID`.
+    public var episodeID: String
+    public var trackIndex: Int
+    public var ino: String
+    /// RELATIVE to the downloads root — never an absolute path.
+    public var localRelativePath: String
+    public var receivedBytes: Int
+    public var totalBytes: Int
+    public var state: String
+    public var mimeType: String?
+
+    public var id: String { connectionID + "/" + itemID + "/" + episodeID + "/" + String(trackIndex) }
+
+    public init(
+        connectionID: String,
+        itemID: String,
+        episodeID: String? = nil,
+        trackIndex: Int,
+        ino: String,
+        localRelativePath: String,
+        receivedBytes: Int = 0,
+        totalBytes: Int = 0,
+        state: String,
+        mimeType: String? = nil
+    ) {
+        self.connectionID = connectionID
+        self.itemID = itemID
+        self.episodeID = episodeID ?? ""
+        self.trackIndex = trackIndex
+        self.ino = ino
+        self.localRelativePath = localRelativePath
+        self.receivedBytes = receivedBytes
+        self.totalBytes = totalBytes
+        self.state = state
+        self.mimeType = mimeType
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case connectionID, itemID, episodeID, trackIndex, ino, localRelativePath, receivedBytes,
+             totalBytes, state, mimeType
+    }
+}
+
+/// A download's parent row plus its per-file breakdown, ordered by `trackIndex` — the shape
+/// `LibraryCacheStore.download(connectionID:itemID:episodeID:)` returns. Not itself a DB record
+/// (no table of its own); a plain composed value for callers that need both halves together.
+public struct CachedDownloadWithFiles: Sendable, Equatable, Hashable {
+    public var download: CachedDownload
+    public var files: [CachedDownloadFile]
+
+    public init(download: CachedDownload, files: [CachedDownloadFile]) {
+        self.download = download
+        self.files = files
+    }
+}
+
 public extension Array where Element == CachedProgress {
     /// Indexes a connection's progress rows by `itemID` — the merge rule shared by every
     /// progress-pill surface (Home shelves, the library grid, and M1c-a Task 9's author/series
