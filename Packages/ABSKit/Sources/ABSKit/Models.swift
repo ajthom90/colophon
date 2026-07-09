@@ -617,3 +617,75 @@ public struct DeviceInfo: Encodable, Sendable {
         self.clientVersion = clientVersion; self.manufacturer = manufacturer; self.model = model
     }
 }
+
+// MARK: - Local-session batch reconcile (M2a Task 3)
+
+/// The client-synthesized local-session payload for OFFLINE playback of downloaded audio —
+/// distinct from `PlaybackSessionEnvelope.rawData` (the SERVER's own `/play` response, replayed
+/// back through `ABSClient.postLocalSession`'s upsert): a session that started fully offline
+/// never had a server `/play` call to capture, so this models the full shape the server's
+/// `PlaybackSession` constructor consumes for BOTH `POST /api/session/local` (a lone instance)
+/// and `POST /api/session/local-all` (the array in `{sessions, deviceInfo}`) — verified against
+/// ABS `PlaybackSessionManager.syncLocalSession`'s `construct(session)`, which reads exactly
+/// `id`/`libraryItemId`/`episodeId`/`mediaType`/`duration`/`playMethod`/`deviceInfo`/
+/// `timeListening`/`startTime`/`currentTime`/`startedAt`/`updatedAt` off the incoming object
+/// (NOT `audioTracks` — a local session never streamed, so there is nothing to enumerate).
+///
+/// - `id` is a CLIENT-GENERATED UUID (spec §3's "client-generated UUID id") — the server has
+///   never seen this session, so there is no server id to reuse.
+/// - `playMethod` defaults to `playMethodLocal` (`3`, ABS's `PlayMethod.LOCAL` — confirmed
+///   against the live dev server's source, `server/utils/constants.js`; `0`/`1`/`2` are
+///   direct-play/direct-stream/transcode, all meaningless for audio that was never streamed
+///   from the server).
+/// - `timeListened` encodes as `timeListening` (the server's field name here — matches
+///   `postLocalSession`'s `object["timeListening"]`), NOT `timeListened` — that key name is only
+///   for the UNRELATED `/session/:id/sync`+`/close` delta-payload shape
+///   (`ABSClient.postSessionPayload`), a different endpoint family with a different body shape.
+public struct LocalPlaybackSession: Encodable, Sendable {
+    /// ABS's `PlayMethod.LOCAL` (server `server/utils/constants.js`), confirmed live this task.
+    public static let playMethodLocal = 3
+
+    public let id: String
+    public let libraryItemId: String
+    public let episodeId: String?
+    public let mediaType: String
+    public let currentTime: Double
+    public let timeListened: Double
+    public let duration: Double
+    public let playMethod: Int
+    public let deviceInfo: DeviceInfo
+    public let startedAt: Int
+    public let updatedAt: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, libraryItemId, episodeId, mediaType, currentTime
+        case timeListened = "timeListening"
+        case duration, playMethod, deviceInfo, startedAt, updatedAt
+    }
+
+    public init(
+        id: String = UUID().uuidString,
+        libraryItemId: String,
+        episodeId: String? = nil,
+        mediaType: String,
+        currentTime: Double,
+        timeListened: Double,
+        duration: Double,
+        deviceInfo: DeviceInfo,
+        startedAt: Int,
+        updatedAt: Int,
+        playMethod: Int = LocalPlaybackSession.playMethodLocal
+    ) {
+        self.id = id
+        self.libraryItemId = libraryItemId
+        self.episodeId = episodeId
+        self.mediaType = mediaType
+        self.currentTime = currentTime
+        self.timeListened = timeListened
+        self.duration = duration
+        self.playMethod = playMethod
+        self.deviceInfo = deviceInfo
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+    }
+}

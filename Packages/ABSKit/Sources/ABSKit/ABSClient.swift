@@ -144,6 +144,17 @@ public final class ABSClient: Sendable {
         try await authorizedSend(get("api/me"), as: MeUser.self)
     }
 
+    /// A typed, keyed view over `me()`'s `mediaProgress[]` for last-write-wins reconcile
+    /// (Task 6): callers look up a pending local session's server-side counterpart by
+    /// `(libraryItemId, episodeId)` and compare `MediaProgressEntry.lastUpdate` against the local
+    /// session's `updatedAt` — newer SERVER progress wins locally (spec §3); otherwise the local
+    /// session is what still needs pushing via `syncLocalSessions`. Built from a SINGLE `me()`
+    /// call — `me()` already exists and already carries everything needed, so this never
+    /// refetches redundantly.
+    public func progressReconcileView() async throws -> ProgressReconcileView {
+        ProgressReconcileView(entries: try await me().mediaProgress ?? [])
+    }
+
     public func coverURL(itemID: String, width: Int, updatedAt: Int?) -> URL {
         var comps = URLComponents(url: baseURL.appending(path: "api/items/\(itemID)/cover"),
                                   resolvingAgainstBaseURL: false)!
@@ -166,6 +177,26 @@ public final class ABSClient: Sendable {
         var comps = URLComponents(url: baseURL.appending(path: "api/authors/\(authorID)/image"),
                                   resolvingAgainstBaseURL: false)!
         comps.queryItems = [.init(name: "width", value: String(width))]
+        return comps.url!
+    }
+
+    /// `GET /api/items/:id/file/:ino/download?token=<accessToken>` — the per-file download route
+    /// (NEVER the zip endpoint; range/resume is server-supported via Express `sendFile`).
+    /// Downloads run in a background `URLSession` OUTSIDE this client's authorized-request
+    /// machinery (Task 4's `DownloadCoordinator`/`DownloadManager` — no shared session, no
+    /// Bearer-header 401-refresh loop reachable from a background delegate callback), so the
+    /// token travels as a plain `token` query parameter instead of an `Authorization` header —
+    /// unlike `coverURL`/`authorImageURL` (genuinely unauthenticated), this endpoint IS gated, so
+    /// the token is required. `async throws` (not a plain URL builder) because it needs a live
+    /// access token (`auth.currentAccessToken()`) — the SAME auth source every other
+    /// authenticated call uses, just carried differently for this one background-session caller.
+    /// `URLComponents.queryItems` percent-encodes the token correctly (it may contain JWT
+    /// characters like `.`/`-`/`_`); `URL.appending(path:)` does the same for `itemID`/`ino`.
+    public func fileDownloadURL(itemID: String, ino: String) async throws -> URL {
+        let token = try await auth.currentAccessToken()
+        var comps = URLComponents(url: baseURL.appending(path: "api/items/\(itemID)/file/\(ino)/download"),
+                                  resolvingAgainstBaseURL: false)!
+        comps.queryItems = [.init(name: "token", value: token)]
         return comps.url!
     }
 
@@ -203,6 +234,30 @@ public struct PlaybackSessionEnvelope: Sendable {
     public let session: PlaybackSession
     public let rawData: Data
     public init(session: PlaybackSession, rawData: Data) { self.session = session; self.rawData = rawData }
+}
+
+/// A keyed view over `MeUser.mediaProgress[]`, built by `ABSClient.progressReconcileView()`.
+/// Keys by `(libraryItemId, episodeId)` — the same 3-part identity `LibraryCache`'s
+/// `cachedProgress` PK and `LocalPlaybackSession` use — so the offline reconcile (Task 6) can
+/// look up a pending local session's server-side counterpart in O(1) and compare
+/// `MediaProgressEntry.lastUpdate` against the local session's `updatedAt`.
+public struct ProgressReconcileView: Sendable {
+    struct Key: Hashable, Sendable { let libraryItemId: String; let episodeId: String? }
+    private let byKey: [Key: MediaProgressEntry]
+
+    init(entries: [MediaProgressEntry]) {
+        var map: [Key: MediaProgressEntry] = [:]
+        for entry in entries {
+            map[Key(libraryItemId: entry.libraryItemId, episodeId: entry.episodeId)] = entry
+        }
+        byKey = map
+    }
+
+    /// The server's progress for this item/episode, if any. `nil` means the server has no
+    /// record — a brand-new local session with nothing to reconcile against, always safe to push.
+    public subscript(libraryItemId: String, episodeId: String? = nil) -> MediaProgressEntry? {
+        byKey[Key(libraryItemId: libraryItemId, episodeId: episodeId)]
+    }
 }
 
 extension ABSClient {
@@ -273,6 +328,28 @@ extension ABSClient {
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: object)
+        _ = try await authorizedData(req)
+    }
+
+    /// `POST /api/session/local-all` `{sessions, deviceInfo}` — batch counterpart to
+    /// `postLocalSession`'s single-session upsert, for reconciling many offline-accrued local
+    /// sessions in one round trip after a reconnect (Task 6). Verified against ABS
+    /// `PlaybackSessionManager.syncLocalSessionsRequest`/`syncLocalSession`: the server builds
+    /// `new PlaybackSession(sessionJson)` per array element, then unconditionally overwrites
+    /// `session.deviceInfo = deviceInfo` using the TOP-LEVEL batch `deviceInfo` (a sibling of
+    /// `sessions`, not each session's own nested field) — so that field, not any per-session
+    /// value, is what the server actually applies to every session in the batch. Every session
+    /// queued by this app instance necessarily shares one device, so this derives the shared
+    /// `deviceInfo` from the batch's first session instead of taking a redundant separate
+    /// parameter. An empty `sessions` array is a no-op — nothing to reconcile, and there is no
+    /// `deviceInfo` to report.
+    public func syncLocalSessions(_ sessions: [LocalPlaybackSession]) async throws {
+        guard let deviceInfo = sessions.first?.deviceInfo else { return }
+        struct Body: Encodable { let sessions: [LocalPlaybackSession]; let deviceInfo: DeviceInfo }
+        var req = URLRequest(url: baseURL.appending(path: "api/session/local-all"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try ABSAPI.encoder.encode(Body(sessions: sessions, deviceInfo: deviceInfo))
         _ = try await authorizedData(req)
     }
 
