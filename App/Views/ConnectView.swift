@@ -47,6 +47,7 @@ struct ConnectView: View {
                     .textInputAutocapitalization(.never)
                     #endif
                     .disabled(status != nil)
+                    .onSubmit(submitServerURL)   // Return acts like the "Continue" button
                 if status == nil {
                     if let statusError {
                         Text(statusError).foregroundStyle(.red)
@@ -63,10 +64,9 @@ struct ConnectView: View {
                     Section("Password") {
                         TextField("Username", text: $username)
                         SecureField("Password", text: $password)
-                        Button(app.phase == .connecting ? "Connecting…" : "Sign In") {
-                            Task { await app.connect(serverURL: serverURL, username: username, password: password) }
-                        }
-                        .disabled(app.phase == .connecting)
+                            .onSubmit(signIn)   // Return acts like the "Sign In" button
+                        Button(app.phase == .connecting ? "Connecting…" : "Sign In", action: signIn)
+                            .disabled(app.phase == .connecting)
                     }
                 }
                 if supportsOpenID {
@@ -92,6 +92,21 @@ struct ConnectView: View {
             // first-run root instance there's nothing to pop, so this is a harmless no-op there.
             if phase == .connected { dismiss() }
         }
+    }
+
+    /// Return/Enter in the Server URL field probes the server — mirrors the "Continue" button,
+    /// guarded identically so a stray Return can't fire while a probe is in flight, the field is
+    /// empty, or the server's already been resolved (the field is disabled then, but belt-and-braces).
+    private func submitServerURL() {
+        guard status == nil, !isCheckingStatus, !serverURL.isEmpty else { return }
+        checkStatus()
+    }
+
+    /// Return/Enter in the Password field signs in — mirrors the "Sign In" button (same
+    /// `.connecting` guard, so a double-submit can't kick off a second connect).
+    private func signIn() {
+        guard app.phase != .connecting else { return }
+        Task { await app.connect(serverURL: serverURL, username: username, password: password) }
     }
 
     private func checkStatus() {
