@@ -24,11 +24,14 @@ import LibraryCache
 ///  - `.failed` → a red retry glyph → tap RE-DOWNLOADS via `DownloadCoordinator.download` (re-derives
 ///    a fresh URL — the same Retry semantics `DownloadsView` offers for a `.failed` row).
 ///
-/// Observes the connection's full download stream (`LibraryCacheStore.observeDownloads`, the SAME
-/// call `DownloadsView` drives) filtered client-side to THIS `(itemID, episodeID)` — there is no
-/// dedicated per-row cache observation API, and one row's worth of in-memory filtering on every
-/// emission is cheap; adding a new cache API for a single filtered row would duplicate the existing
-/// live path for no real benefit.
+/// **State source** — two modes, chosen by `source`:
+///  - `.selfObserved` (default; `ItemDetailView`/`EpisodeDetailView`, single instances): the button
+///    opens its OWN `observeDownloads` stream filtered to this `(itemID, episodeID)`. Fine for one
+///    instance per screen.
+///  - `.provided(CachedDownload?)` (`EpisodeRow`): the PARENT (`PodcastDetailView`) observes ALL of
+///    the podcast's downloads ONCE, indexes them by `episodeID`, and passes each row its own state —
+///    so an N-episode list has ONE shared `ValueObservation`, not N per-row trackers each re-querying
+///    on every byte tick. The button renders straight from the provided value and never self-observes.
 struct DownloadButton: View {
     @Environment(AppState.self) private var app
     let itemID: String
@@ -36,8 +39,20 @@ struct DownloadButton: View {
     let episodeID: String?
     /// Compact sizing for `EpisodeRow`'s trailing slot vs. the roomier detail-page placement.
     var compact: Bool = false
+    /// Where this button gets its download row — see the type doc. Defaults to self-observing so the
+    /// single-instance detail placements are unchanged.
+    var source: StateSource = .selfObserved
 
-    @State private var download: CachedDownload?
+    @State private var observed: CachedDownload?
+
+    /// This button's current download row: the parent-provided value in `.provided` mode, else the
+    /// self-observed one.
+    private var download: CachedDownload? {
+        switch source {
+        case .selfObserved: return observed
+        case .provided(let d): return d
+        }
+    }
 
     private var episode: String { episodeID ?? "" }
     private var side: CGFloat { compact ? 20 : 28 }
@@ -47,7 +62,9 @@ struct DownloadButton: View {
             .buttonStyle(.plain)
             .disabled(app.activeConnectionID == nil)
             .accessibilityLabel(accessibilityLabel)
-            .task(id: observeKey) { await observe() }
+            // Self-observe ONLY in `.selfObserved` mode — `.provided` rows share the parent's one
+            // observation, so opening a per-row stream here would defeat the perf fix.
+            .task(id: observeKey) { if case .selfObserved = source { await observe() } }
     }
 
     private var observeKey: String { "\(app.activeConnectionID ?? "")|\(itemID)|\(episode)" }
@@ -100,11 +117,11 @@ struct DownloadButton: View {
     }
 
     private func observe() async {
-        download = nil
+        observed = nil
         guard let connectionID = app.activeConnectionID else { return }
         do {
             for try await rows in app.cache.observeDownloads(connectionID: connectionID) {
-                download = rows.first { $0.itemID == itemID && $0.episodeID == episode }
+                observed = rows.first { $0.itemID == itemID && $0.episodeID == episode }
             }
         } catch {
             // Best-effort; leaves the button at its last-known state on an observation hiccup.
@@ -113,6 +130,15 @@ struct DownloadButton: View {
 }
 
 extension DownloadButton {
+    /// Where a `DownloadButton` sources its download row — see the type doc.
+    enum StateSource {
+        /// The button opens its own filtered `observeDownloads` stream (single-instance placements).
+        case selfObserved
+        /// The parent supplies (and shares one observation for) this row (`EpisodeRow` via
+        /// `PodcastDetailView`). `nil` = not downloaded.
+        case provided(CachedDownload?)
+    }
+
     /// The button's own reduced view-state, derived from an optional `CachedDownload` row — pure (no
     /// view/cache dependency), so the mapping is directly unit-testable. A `nil` row (never
     /// downloaded, or already deleted) and any state string outside the known four both fall back to
@@ -170,6 +196,9 @@ struct DownloadStateBadge: View {
         content()
             .foregroundStyle(.white)
             .frame(width: 20, height: 20)
-            .background(Circle().fill(Color.black.opacity(0.75)))
+            // A near-opaque dark disc (not translucent glass) with a hairline ring, so the badge
+            // reads clearly on any cover art — the "opaque, subtle" badge the UI mandate calls for.
+            .background(Circle().fill(Color.black.opacity(0.9)))
+            .overlay(Circle().strokeBorder(.white.opacity(0.25), lineWidth: 0.5))
     }
 }

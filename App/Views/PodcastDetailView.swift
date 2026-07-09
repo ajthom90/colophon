@@ -47,6 +47,10 @@ struct PodcastDetailView: View {
     @State private var episodes: [CachedEpisode] = []
     /// This item's per-episode progress, keyed by `episodeID` (book-style empty-episode rows excluded).
     @State private var progressByEpisode: [String: CachedProgress] = [:]
+    /// This podcast's per-episode download state, keyed by `episodeID` (M2a Task 8) — ONE shared
+    /// `observeDownloads` join (mirrors `progressByEpisode`) passed into each `EpisodeRow`'s
+    /// `DownloadButton`, so an N-episode list opens ONE observation rather than N per-row trackers.
+    @State private var downloadsByEpisode: [String: CachedDownload] = [:]
     /// The fetched detail — the ONLY source of the podcast's HTML description (podcast descriptions
     /// aren't cached; books' are). Nil until the background refresh lands.
     @State private var detail: PodcastDetail?
@@ -74,6 +78,7 @@ struct PodcastDetailView: View {
         .toolbar { sortMenu }
         .task(id: route.itemID) { await observeEpisodes() }
         .task(id: route.itemID) { await observeProgress() }
+        .task(id: route.itemID) { await observeDownloads() }
         .task(id: route.itemID) { await refresh() }
         .task(id: displayDescription) {
             // Parse the HTML description ONCE per value on the main actor (expensive), so the render
@@ -168,7 +173,8 @@ struct PodcastDetailView: View {
                 podcastTitle: displayTitle, updatedAt: route.updatedAt),
             onPlay: { startEpisodePlayback(episode) },
             onAddToQueue: { addEpisodeToQueue(episode) },
-            canAddToQueue: app.nowPlayingItemID != nil)
+            canAddToQueue: app.nowPlayingItemID != nil,
+            download: downloadsByEpisode[episode.episodeID])
     }
 
     /// The loading / empty / error state, shown in place of the episode sections when there are no
@@ -267,6 +273,25 @@ struct PodcastDetailView: View {
             }
         } catch {
             // Best-effort live finished/in-progress state; rows still render without it.
+        }
+    }
+
+    /// ONE shared download-state observation for the whole episode list (M2a Task 8) — indexed by
+    /// `episodeID` (this podcast's episode rows only), passed into each `EpisodeRow`'s
+    /// `DownloadButton` via `.provided`, so a long feed opens a single `ValueObservation` instead of
+    /// one per row. Mirrors `observeProgress` above exactly.
+    private func observeDownloads() async {
+        downloadsByEpisode = [:]
+        guard let connectionID = app.activeConnectionID else { return }
+        do {
+            for try await rows in app.cache.observeDownloads(connectionID: connectionID) {
+                downloadsByEpisode = Dictionary(
+                    rows.filter { $0.itemID == route.itemID && !$0.episodeID.isEmpty }
+                        .map { ($0.episodeID, $0) },
+                    uniquingKeysWith: { _, latest in latest })
+            }
+        } catch {
+            // Best-effort live download badges; rows still render (and the button self-manages taps).
         }
     }
 

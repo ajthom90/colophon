@@ -2415,20 +2415,26 @@ struct SettingsPlumbingTests {
 
     /// The pure eligibility decision (`AppState.shouldAutoDeleteFinishedEpisode`) against the spec's
     /// exact conservative truth table — no cache/`UserDefaults` dependency, so every flip is asserted
-    /// independently: a downloaded, FINISHED EPISODE with the toggle ON is the only eligible case; a
-    /// BOOK (empty `episodeID`), an UNFINISHED episode, a not-currently-downloaded episode, and the
-    /// toggle OFF are each individually disqualifying.
+    /// independently. The ONLY eligible case is a WITNESSED false→true transition (`wasFinished ==
+    /// false`) on a downloaded episode with the toggle ON. Every other prior state or field is
+    /// individually disqualifying — crucially the two that prevent the mass-delete bug: NO prior row
+    /// (`wasFinished == nil`, a fresh/rebuilt cache or first full-history sync) and ALREADY-finished
+    /// (`wasFinished == true`, a full-history reprocess).
     @Test func autoDeleteDecisionTableMatchesTheConservativeSpec() {
-        #expect(AppState.shouldAutoDeleteFinishedEpisode(
-            episodeID: "ep1", isFinished: true, isDownloaded: true, toggleOn: true) == true)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // witnessed false→true — the one eligible case
+            episodeID: "ep1", wasFinished: false, isFinished: true, isDownloaded: true, toggleOn: true) == true)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // NO prior row — not a transition (mass-delete guard)
+            episodeID: "ep1", wasFinished: nil, isFinished: true, isDownloaded: true, toggleOn: true) == false)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // already finished — reprocess, not a transition
+            episodeID: "ep1", wasFinished: true, isFinished: true, isDownloaded: true, toggleOn: true) == false)
         #expect(AppState.shouldAutoDeleteFinishedEpisode(     // a book — never
-            episodeID: "", isFinished: true, isDownloaded: true, toggleOn: true) == false)
-        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // unfinished — never
-            episodeID: "ep1", isFinished: false, isDownloaded: true, toggleOn: true) == false)
+            episodeID: "", wasFinished: false, isFinished: true, isDownloaded: true, toggleOn: true) == false)
+        #expect(AppState.shouldAutoDeleteFinishedEpisode(     // unfinished incoming — never
+            episodeID: "ep1", wasFinished: false, isFinished: false, isDownloaded: true, toggleOn: true) == false)
         #expect(AppState.shouldAutoDeleteFinishedEpisode(     // not downloaded — nothing to delete
-            episodeID: "ep1", isFinished: true, isDownloaded: false, toggleOn: true) == false)
+            episodeID: "ep1", wasFinished: false, isFinished: true, isDownloaded: false, toggleOn: true) == false)
         #expect(AppState.shouldAutoDeleteFinishedEpisode(     // toggle off — never
-            episodeID: "ep1", isFinished: true, isDownloaded: true, toggleOn: false) == false)
+            episodeID: "ep1", wasFinished: false, isFinished: true, isDownloaded: true, toggleOn: false) == false)
     }
 
     /// END-TO-END wiring: a downloaded episode's progress reaching `isFinished` via the live socket
@@ -2529,6 +2535,144 @@ struct SettingsPlumbingTests {
         await app.apply(.progressUpdated(ProgressUpdate(
             itemID: "pod1", episodeID: "ep1", currentTime: 90, isFinished: false, lastUpdate: 2)))
 
+        #expect(try app.cache.download(connectionID: "C1", itemID: "pod1", episodeID: "ep1") != nil)
+    }
+
+    /// CRITICAL regression (the mass-delete bug, `.progressBatch` path): a `user_updated` push carries
+    /// the WHOLE user object — the ENTIRE finished-episode history — every time. Re-processing it with
+    /// the toggle ON and MULTIPLE already-finished downloaded episodes must delete NOTHING (no
+    /// false→true transition is witnessed — every row was ALREADY finished). RED-verified: drop the
+    /// `wasFinished == false` gate from `shouldAutoDeleteFinishedEpisode` and BOTH downloads vanish.
+    @Test func fullHistoryProgressBatchReprocessDeletesNothingWithoutTransitions() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(true, forKey: AppState.deleteAfterFinishedKey)
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        // Two downloaded episodes, EACH already finished in the cache (prior isFinished == true) —
+        // the state a user reaches after finishing them over time with the toggle OFF.
+        try seedDownloadedEpisode(app, connectionID: "C1", itemID: "pod1", episodeID: "ep1",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 0)
+        try seedDownloadedEpisode(app, connectionID: "C1", itemID: "pod1", episodeID: "ep2",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 0)
+        try app.cache.upsertProgress(CachedProgress(connectionID: "C1", itemID: "pod1", episodeID: "ep1",
+                                                    currentTime: 400, isFinished: true, lastUpdate: 1))
+        try app.cache.upsertProgress(CachedProgress(connectionID: "C1", itemID: "pod1", episodeID: "ep2",
+                                                    currentTime: 400, isFinished: true, lastUpdate: 1))
+        await app.activateConnection("C1")
+
+        // The user just flipped the toggle ON; a `user_updated` push re-lists the whole finished history.
+        await app.apply(.progressBatch([
+            ProgressUpdate(itemID: "pod1", episodeID: "ep1", currentTime: 400, isFinished: true, lastUpdate: 2),
+            ProgressUpdate(itemID: "pod1", episodeID: "ep2", currentTime: 400, isFinished: true, lastUpdate: 2),
+        ]))
+
+        #expect(try app.cache.download(connectionID: "C1", itemID: "pod1", episodeID: "ep1") != nil)
+        #expect(try app.cache.download(connectionID: "C1", itemID: "pod1", episodeID: "ep2") != nil)
+    }
+
+    /// CRITICAL regression (the mass-delete bug, `refreshProgress()`/`me()` path): `GET /api/me`
+    /// returns the FULL mediaProgress history on every Home appear / foreground / pull-to-refresh. The
+    /// same "toggle ON + multiple already-finished downloaded episodes" state must survive it — the
+    /// history reprocess witnesses no transition, so nothing is deleted.
+    @Test func fullHistoryMeReprocessDeletesNothingWithoutTransitions() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(true, forKey: AppState.deleteAfterFinishedKey)
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try seedDownloadedEpisode(app, connectionID: cid, itemID: "pod1", episodeID: "ep1",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 0)
+        try seedDownloadedEpisode(app, connectionID: cid, itemID: "pod1", episodeID: "ep2",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 0)
+        try app.cache.upsertProgress(CachedProgress(connectionID: cid, itemID: "pod1", episodeID: "ep1",
+                                                    currentTime: 400, isFinished: true, lastUpdate: 1))
+        try app.cache.upsertProgress(CachedProgress(connectionID: cid, itemID: "pod1", episodeID: "ep2",
+                                                    currentTime: 400, isFinished: true, lastUpdate: 1))
+        await transport.enqueue(status: 200, json: #"""
+        {"id":"root","username":"root","mediaProgress":[
+          {"libraryItemId":"pod1","episodeId":"ep1","currentTime":400,"isFinished":true,"lastUpdate":500},
+          {"libraryItemId":"pod1","episodeId":"ep2","currentTime":400,"isFinished":true,"lastUpdate":500}
+        ]}
+        """#)
+
+        await app.refreshProgress()
+
+        #expect(try app.cache.download(connectionID: cid, itemID: "pod1", episodeID: "ep1") != nil)
+        #expect(try app.cache.download(connectionID: cid, itemID: "pod1", episodeID: "ep2") != nil)
+    }
+
+    /// The genuine transition still deletes even via the me() path: a prior UNFINISHED cached row →
+    /// the me() join reports it finished → false→true transition → deleted (proves the gate isn't
+    /// over-broad, i.e. it doesn't block real transitions, only history reprocesses).
+    @Test func meJoinDeletesOnGenuineFinishTransition() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(true, forKey: AppState.deleteAfterFinishedKey)
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        // Prior row is UNFINISHED (in-progress) — the me() join below flips it to finished.
+        try seedDownloadedEpisode(app, connectionID: cid, itemID: "pod1", episodeID: "ep1",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 90)
+        await transport.enqueue(status: 200, json: #"""
+        {"id":"root","username":"root","mediaProgress":[
+          {"libraryItemId":"pod1","episodeId":"ep1","currentTime":400,"isFinished":true,"lastUpdate":500}
+        ]}
+        """#)
+
+        await app.refreshProgress()
+
+        #expect(try app.cache.download(connectionID: cid, itemID: "pod1", episodeID: "ep1") == nil)
+    }
+
+    /// IMPORTANT guard: the CURRENTLY-PLAYING episode is never auto-deleted. A cross-device "mark
+    /// finished" socket push (a genuine false→true transition, toggle ON, downloaded) for the episode
+    /// you're actively streaming must NOT yank its file mid-stream — even though every other condition
+    /// for deletion holds.
+    @Test func autoDeleteNeverDeletesTheCurrentlyPlayingEpisode() async throws {
+        let restoreToggle = snapshotDefault(AppState.deleteAfterFinishedKey)
+        defer { restoreToggle() }
+        UserDefaults.standard.set(true, forKey: AppState.deleteAfterFinishedKey)
+
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        // Prior UNFINISHED progress (currentTime 90) so the push below is a real false→true transition.
+        try seedDownloadedEpisode(app, connectionID: "C1", itemID: "pod1", episodeID: "ep1",
+                                  downloadsRoot: downloadsRoot, duration: 400, currentTime: 90)
+        await app.activateConnection("C1")
+        await app.startPlayback(itemID: "pod1", episodeId: "ep1", podcastTitle: "Pod")
+        #expect(app.nowPlayingEpisodeID == "ep1")   // it IS the episode now playing
+
+        await app.apply(.progressUpdated(ProgressUpdate(
+            itemID: "pod1", episodeID: "ep1", currentTime: 400, isFinished: true, lastUpdate: 2)))
+
+        // Not deleted mid-stream, despite the real transition + downloaded + toggle on.
         #expect(try app.cache.download(connectionID: "C1", itemID: "pod1", episodeID: "ep1") != nil)
     }
 }
