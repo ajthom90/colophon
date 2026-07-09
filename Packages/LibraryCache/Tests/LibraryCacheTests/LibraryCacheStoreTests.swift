@@ -997,4 +997,245 @@ import Testing
         #expect(download.files.map(\.localRelativePath) == ["C1/i1/track-0.m4b"])
         #expect(try store.totalDownloadedBytes(connectionID: "C1") == 10)
     }
+
+    // MARK: - v5: persisted offline local sessions (Task 6)
+
+    private func makeLocalSession(
+        id: String, connectionID: String = "C1", itemID: String = "i1", episodeID: String? = nil,
+        timeListening: Double, currentTime: Double = 0, duration: Double = 100,
+        startedAt: Int = 1, updatedAt: Int = 1
+    ) -> CachedLocalSession {
+        CachedLocalSession(
+            id: id, connectionID: connectionID, itemID: itemID, episodeID: episodeID,
+            mediaType: (episodeID ?? "").isEmpty ? "book" : "podcast",
+            currentTime: currentTime, timeListening: timeListening, duration: duration,
+            startedAt: startedAt, updatedAt: updatedAt,
+            deviceId: "dev1", clientName: "Colophon", clientVersion: "1.0", manufacturer: "Apple", model: "iPhone")
+    }
+
+    @Test func localSessionRoundTripByUUID() throws {
+        let store = try makeStore()
+        try store.upsertLocalSession(makeLocalSession(id: "s1", timeListening: 42, currentTime: 63.5))
+        let fetched = try #require(try store.localSession(id: "s1"))
+        #expect(fetched.itemID == "i1")
+        #expect(fetched.timeListening == 42)
+        #expect(fetched.currentTime == 63.5)
+        #expect(fetched.mediaType == "book")
+        #expect(fetched.deviceId == "dev1")
+        #expect(try store.localSession(id: "missing") == nil)
+    }
+
+    /// The store's `upsertLocalSession` is a full-row upsert keyed by UUID: a re-upsert of the SAME
+    /// id OVERWRITES that row (the CALLER owns accumulating `timeListening` before upserting), while
+    /// a DIFFERENT id is a distinct row — so two offline sessions for the same item coexist.
+    @Test func localSessionUpsertOverwritesSameUUIDButKeepsDistinctUUIDs() throws {
+        let store = try makeStore()
+        try store.upsertLocalSession(makeLocalSession(id: "s1", timeListening: 10))
+        try store.upsertLocalSession(makeLocalSession(id: "s1", timeListening: 25))   // caller-accumulated total
+        try store.upsertLocalSession(makeLocalSession(id: "s2", itemID: "i1", timeListening: 7))   // new session, same item
+
+        #expect(try store.localSession(id: "s1")?.timeListening == 25)   // overwritten, not doubled
+        #expect(try store.localSession(id: "s2")?.timeListening == 7)
+        #expect(try store.localSessions(connectionID: "C1").count == 2)  // two rows for the same item
+    }
+
+    @Test func localSessionsListScopedToConnectionOldestStartedFirst() throws {
+        let store = try makeStore()
+        try store.upsertLocalSession(makeLocalSession(id: "s2", timeListening: 5, startedAt: 200))
+        try store.upsertLocalSession(makeLocalSession(id: "s1", timeListening: 5, startedAt: 100))
+        try store.upsertLocalSession(makeLocalSession(id: "s9", connectionID: "C2", timeListening: 5, startedAt: 50))
+
+        #expect(try store.localSessions(connectionID: "C1").map(\.id) == ["s1", "s2"])   // oldest startedAt first
+        #expect(try store.localSessions(connectionID: "C2").map(\.id) == ["s9"])          // scoped
+    }
+
+    @Test func deleteLocalSessionRemovesOnlyThatSession() throws {
+        let store = try makeStore()
+        try store.upsertLocalSession(makeLocalSession(id: "s1", timeListening: 5))
+        try store.upsertLocalSession(makeLocalSession(id: "s2", timeListening: 5))
+        try store.deleteLocalSession(id: "s1")
+        #expect(try store.localSession(id: "s1") == nil)
+        #expect(try store.localSession(id: "s2") != nil)
+    }
+
+    @Test func deleteConnectionCascadesToLocalSessions() throws {
+        let store = try makeStore()
+        try store.upsertLocalSession(makeLocalSession(id: "s1", connectionID: "C1", timeListening: 5))
+        try store.upsertLocalSession(makeLocalSession(id: "s9", connectionID: "C2", timeListening: 5))
+        try store.deleteConnection(connectionID: "C1")
+        #expect(try store.localSessions(connectionID: "C1").isEmpty)
+        #expect(try store.localSessions(connectionID: "C2").count == 1)   // scoped: untouched
+    }
+
+    /// Builds a genuine v1..v4-ONLY database file (replicating the frozen migrations byte-for-byte,
+    /// one migration further than `seedV1V2V3OnlyDatabase`), seeds real rows in each, then closes it —
+    /// so reopening through the production store runs v1..v4+v5 and v5's single additive `CREATE TABLE`
+    /// is proven against a genuinely pre-existing v1..v4 file, not a fresh already-v5 store.
+    private func seedV1V2V3V4OnlyDatabase(at url: URL) throws {
+        let dbQueue = try DatabaseQueue(path: url.path)
+        var migrator = DatabaseMigrator()
+        migrator.registerMigration("v1") { db in
+            try db.create(table: "cachedConnection") { t in
+                t.primaryKey("id", .text)
+                t.column("address", .text).notNull()
+                t.column("name", .text).notNull()
+                t.column("username", .text).notNull()
+                t.column("authMethod", .text).notNull()
+                t.column("sortIndex", .integer).notNull()
+            }
+            try db.create(table: "cachedLibrary") { t in
+                t.column("id", .text).notNull()
+                t.column("connectionID", .text).notNull().indexed()
+                t.column("name", .text).notNull()
+                t.column("mediaType", .text).notNull()
+                t.column("displayOrder", .integer).notNull()
+                t.primaryKey(["connectionID", "id"])
+            }
+            try db.create(table: "cachedItem") { t in
+                t.column("id", .text).notNull()
+                t.column("connectionID", .text).notNull().indexed()
+                t.column("libraryID", .text).notNull().indexed()
+                t.column("title", .text).notNull()
+                t.column("authorName", .text)
+                t.column("duration", .double)
+                t.column("updatedAt", .integer)
+                t.primaryKey(["connectionID", "id"])
+            }
+            try db.create(table: "cachedProgress") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")
+                t.column("currentTime", .double).notNull()
+                t.column("isFinished", .boolean).notNull()
+                t.column("lastUpdate", .integer).notNull()
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+            try db.create(virtualTable: "itemFTS", using: FTS5()) { t in
+                t.synchronize(withTable: "cachedItem")
+                t.tokenizer = .unicode61()
+                t.column("title")
+                t.column("authorName")
+            }
+        }
+        migrator.registerMigration("v2") { db in
+            try db.alter(table: "cachedItem") { t in
+                t.add(column: "subtitle", .text)
+                t.add(column: "narratorName", .text)
+                t.add(column: "seriesName", .text)
+                t.add(column: "genresJSON", .text)
+                t.add(column: "publishedYear", .text)
+                t.add(column: "descriptionSnippet", .text)
+            }
+            try db.create(table: "cachedItemDetail") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("description", .text)
+                t.column("publisher", .text)
+                t.column("isbn", .text)
+                t.column("asin", .text)
+                t.column("language", .text)
+                t.column("explicit", .boolean)
+                t.column("abridged", .boolean)
+                t.column("publishedDate", .text)
+                t.column("chaptersJSON", .text)
+                t.primaryKey(["connectionID", "itemID"])
+            }
+            try db.create(table: "cachedEpisode") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull()
+                t.column("idx", .integer)
+                t.column("season", .text)
+                t.column("episode", .text)
+                t.column("episodeType", .text)
+                t.column("title", .text)
+                t.column("subtitle", .text)
+                t.column("episodeDescription", .text)
+                t.column("pubDate", .text)
+                t.column("publishedAt", .integer)
+                t.column("durationSeconds", .double)
+                t.column("sizeBytes", .integer)
+                t.column("guid", .text)
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+        }
+        migrator.registerMigration("v3") { db in
+            try db.create(table: "cachedItemPref") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("playbackRate", .double)
+                t.primaryKey(["connectionID", "itemID"])
+            }
+        }
+        migrator.registerMigration("v4") { db in
+            try db.create(table: "cachedDownload") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")
+                t.column("state", .text).notNull()
+                t.column("receivedBytes", .integer).notNull().defaults(to: 0)
+                t.column("totalBytes", .integer).notNull().defaults(to: 0)
+                t.column("updatedAt", .integer).notNull()
+                t.primaryKey(["connectionID", "itemID", "episodeID"])
+            }
+            try db.create(table: "cachedDownloadFile") { t in
+                t.column("connectionID", .text).notNull()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")
+                t.column("trackIndex", .integer).notNull()
+                t.column("ino", .text).notNull()
+                t.column("localRelativePath", .text).notNull()
+                t.column("receivedBytes", .integer).notNull().defaults(to: 0)
+                t.column("totalBytes", .integer).notNull().defaults(to: 0)
+                t.column("state", .text).notNull()
+                t.column("mimeType", .text)
+                t.column("durationSeconds", .double)
+                t.primaryKey(["connectionID", "itemID", "episodeID", "trackIndex"])
+            }
+        }
+        try migrator.migrate(dbQueue)
+        try dbQueue.write { db in
+            try db.execute(sql: """
+                INSERT INTO cachedItem (id, connectionID, libraryID, title, authorName, duration, updatedAt,
+                                         subtitle, narratorName, seriesName, genresJSON, publishedYear, descriptionSnippet)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: ["i1", "C1", "L1", "Dracula", "Bram Stoker", 100.0, 1,
+                            "A Novel", "Narrator Name", "Gothic Classics", "[\"Horror\"]", "1897", "A count..."])
+            try db.execute(sql: "INSERT INTO cachedItemPref (connectionID, itemID, playbackRate) VALUES (?, ?, ?)",
+                           arguments: ["C1", "i1", 1.5])
+            try db.execute(sql: """
+                INSERT INTO cachedDownload (connectionID, itemID, episodeID, state, receivedBytes, totalBytes, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                arguments: ["C1", "i1", "", "downloaded", 100, 100, 5])
+        }
+        try dbQueue.close()
+    }
+
+    /// THE sabotage-provable v5 migration test (same rigor as the v2/v3/v4 ones): seed a genuine
+    /// v1..v4-only file, reopen through the production store (runs v1..v4+v5 — v5's single additive
+    /// `CREATE TABLE` executed against real pre-existing tables), and assert the v1 row + its v2
+    /// columns, the v3 pref row, and the v4 download row all survive untouched, then that the new
+    /// `cachedLocalSession` table exists, is queryable, and round-trips a real offline session.
+    @Test func v5AddsLocalSessionTablePreservingV1V2V3V4Rows() throws {
+        let dir = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let dbURL = dir.appending(path: "cache.sqlite")
+
+        try seedV1V2V3V4OnlyDatabase(at: dbURL)                 // genuine v1..v4-only file on disk
+        let store = try LibraryCacheStore(databaseURL: dbURL)   // reopen → runs v1..v4+v5 (CREATE TABLE only)
+
+        // Pre-existing rows across every earlier migration survive, values intact.
+        #expect(try store.items(connectionID: "C1", libraryID: "L1").first?.title == "Dracula")
+        #expect(try store.items(connectionID: "C1", libraryID: "L1").first?.genres == ["Horror"])
+        #expect(try store.playbackRate(connectionID: "C1", itemID: "i1") == 1.5)
+        #expect(try store.download(connectionID: "C1", itemID: "i1")?.download.state == "downloaded")
+
+        // The new v5 table exists, is queryable (a missing table would throw), and round-trips.
+        #expect(try store.localSessions(connectionID: "C1").isEmpty)
+        try store.upsertLocalSession(makeLocalSession(id: "s1", timeListening: 30, currentTime: 55))
+        #expect(try store.localSession(id: "s1")?.timeListening == 30)
+        #expect(try store.localSessions(connectionID: "C1").map(\.id) == ["s1"])
+    }
 }

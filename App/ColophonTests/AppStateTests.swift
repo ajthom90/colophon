@@ -2041,4 +2041,246 @@ struct SettingsPlumbingTests {
         #expect(app.playback.playMethod == 0)                            // streamed, not local
         #expect(app.playback.loadedTrackURLs.allSatisfy { !$0.isFileURL })   // server URLs, not file
     }
+
+    // MARK: - Local-session sync-back + reachability (M2a Task 6)
+
+    /// Seed a SEALED (not currently-playing) pending offline session directly into the store.
+    @discardableResult
+    private func seedLocalSession(
+        _ app: AppState, id: String, connectionID: String, itemID: String, episodeID: String? = nil,
+        timeListening: Double, currentTime: Double = 0, duration: Double = 100,
+        startedAt: Int = 1, updatedAt: Int = 1
+    ) throws -> CachedLocalSession {
+        let session = CachedLocalSession(
+            id: id, connectionID: connectionID, itemID: itemID, episodeID: episodeID,
+            mediaType: (episodeID ?? "").isEmpty ? "book" : "podcast",
+            currentTime: currentTime, timeListening: timeListening, duration: duration,
+            startedAt: startedAt, updatedAt: updatedAt,
+            deviceId: "dev", clientName: "Colophon", clientVersion: "1.0", manufacturer: "Apple", model: "iPhone")
+        try app.cache.upsertLocalSession(session)
+        return session
+    }
+
+    /// The `timeListening` values of the sessions in the last `POST /api/session/local-all` body
+    /// recorded by a `GatedTransport` (proves what actually reached the server).
+    private func lastLocalAllTimeListening(_ transport: GatedTransport) async -> [String: Double] {
+        let reqs = await transport.recordedRequests(pathContains: "session/local-all")
+        guard let body = reqs.last?.httpBody,
+              let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let sessions = obj["sessions"] as? [[String: Any]] else { return [:] }
+        var out: [String: Double] = [:]
+        for s in sessions {
+            if let id = s["id"] as? String, let tl = s["timeListening"] as? Double { out[id] = tl }
+        }
+        return out
+    }
+
+    /// Offline ticks ACCUMULATE into ONE `cachedLocalSession` row (timeListening sums the per-tick
+    /// deltas — never resets, never doubles); a SECOND offline session for the SAME item is a NEW row.
+    @Test func offlineTicksAccrueOneRowAccumulatingSecondSessionIsNewRow() async throws {
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = MockTransport()
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        try app.cache.upsertConnection(CachedConnection(id: "C1", address: "http://s:13378", name: "Home",
+                                                        username: "root", authMethod: "local", sortIndex: 0))
+        try seedDownloadedBook(app, connectionID: "C1", itemID: "dl1",
+                               downloadsRoot: downloadsRoot, duration: 120, currentTime: 0)
+        await app.activateConnection("C1")
+        await app.startPlayback(itemID: "dl1")
+        #expect(app.playback.playMethod == LocalPlaybackSession.playMethodLocal)
+
+        _ = await app.playback.onSyncDue?(SyncPayload(currentTime: 30, timeListened: 10))
+        _ = await app.playback.onSyncDue?(SyncPayload(currentTime: 50, timeListened: 15))
+
+        var rows = try app.cache.localSessions(connectionID: "C1")
+        #expect(rows.count == 1)                       // ONE row for the session
+        #expect(rows[0].timeListening == 25)           // 10 + 15 accumulated (not 15, not 50)
+        #expect(rows[0].currentTime == 50)
+        #expect(rows[0].itemID == "dl1")
+        #expect(await transport.recorded.isEmpty)      // NO network
+
+        // Seal the session and start a fresh offline playback of the SAME item → a NEW row.
+        await app.closeCurrentSession()
+        await app.startPlayback(itemID: "dl1")
+        _ = await app.playback.onSyncDue?(SyncPayload(currentTime: 12, timeListened: 5))
+
+        rows = try app.cache.localSessions(connectionID: "C1")
+        #expect(rows.count == 2)                                       // a distinct second row
+        #expect(rows.map(\.timeListening).sorted() == [5, 25])         // the first row untouched at 25
+    }
+
+    /// The reconnect reconcile, EXACT spec order: `GET /api/me` last-write-wins (newer SERVER
+    /// progress wins locally, older is kept) → `POST /api/session/local-all` the pending sessions →
+    /// PRUNE ONLY rows whose `success == true`; a `success == false` row STAYS pending (never dropped).
+    @Test func reconnectReconcileServerNewerWinsPushesPrunesSuccessKeepsFailure() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+
+        // Local progress: A is OLDER than the server (server should win); B is NEWER (local kept).
+        try app.cache.upsertProgress(CachedProgress(connectionID: cid, itemID: "A", currentTime: 10,
+                                                    isFinished: false, lastUpdate: 100))
+        try app.cache.upsertProgress(CachedProgress(connectionID: cid, itemID: "B", currentTime: 88,
+                                                    isFinished: false, lastUpdate: 500))
+        try seedLocalSession(app, id: "S1", connectionID: cid, itemID: "A", timeListening: 40)
+        try seedLocalSession(app, id: "S2", connectionID: cid, itemID: "B", timeListening: 30)
+
+        await transport.enqueue(status: 200, json: #"""
+        {"id":"root","username":"root","mediaProgress":[
+          {"libraryItemId":"A","episodeId":null,"currentTime":55,"isFinished":false,"lastUpdate":200},
+          {"libraryItemId":"B","episodeId":null,"currentTime":20,"isFinished":false,"lastUpdate":300}
+        ]}
+        """#)
+        await transport.enqueue(status: 200, json: #"""
+        {"results":[{"id":"S1","success":true},{"id":"S2","success":false,"error":"Media item not found"}]}
+        """#)
+
+        await app.reconcileOnReconnect()
+
+        // (a) last-write-wins: A took the server's newer value; B kept its newer local value.
+        #expect(try app.cache.progress(connectionID: cid, itemID: "A")?.currentTime == 55)
+        #expect(try app.cache.progress(connectionID: cid, itemID: "A")?.lastUpdate == 200)
+        #expect(try app.cache.progress(connectionID: cid, itemID: "B")?.currentTime == 88)   // local kept
+        // (b) local-all POSTed with BOTH pending sessions.
+        let localAll = await transport.recorded.first { ($0.url?.path ?? "").contains("session/local-all") }
+        let body = try #require(localAll?.httpBody)
+        let obj = try #require(try JSONSerialization.jsonObject(with: body) as? [String: Any])
+        let ids = Set(((obj["sessions"] as? [[String: Any]]) ?? []).compactMap { $0["id"] as? String })
+        #expect(ids == ["S1", "S2"])
+        // (c) prune ONLY the success — the failure STAYS pending.
+        #expect(try app.cache.localSession(id: "S1") == nil)        // synced → pruned
+        #expect(try app.cache.localSession(id: "S2") != nil)        // rejected → kept (never dropped)
+        #expect(app.isOnline == true)                               // me() answered → online
+    }
+
+    /// ADVERSARIAL CONCURRENCY (the guard, RED-verified by dropping it): a tick landing DURING a
+    /// reconcile is neither LOST nor DUPLICATED. The currently-playing offline session accrues a tick
+    /// while `local-all` is parked mid-reconcile; because the live session is never pruned (and a
+    /// row changed mid-reconcile is never pruned), its accrued tail survives — and a later reconcile
+    /// pushes the correct SINGLE total, never double-counted.
+    @Test func tickLandingMidReconcileIsNeitherLostNorDuplicated() async throws {
+        let dir = makeTempDir()
+        let downloadsRoot = makeTempDir()
+        let transport = GatedTransport(gatePath: "session/local-all")
+        await transport.enqueue(status: 200, json: statusOK)
+        await transport.enqueue(status: 200, json: loginOK)
+        await transport.enqueue(status: 200, json: librariesOK)
+        let app = makeAppWithDownloads(dir: dir, downloadsRoot: downloadsRoot,
+                                       transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        #expect(app.isOnline == true)
+
+        // Downloaded book plays from LOCAL files even while online (downloads-first) → a live offline
+        // session accruing on the SAME connection that now has a live client.
+        try seedDownloadedBook(app, connectionID: cid, itemID: "dl1",
+                               downloadsRoot: downloadsRoot, duration: 120, currentTime: 0)
+        await app.startPlayback(itemID: "dl1")
+        #expect(app.playback.playMethod == LocalPlaybackSession.playMethodLocal)
+        _ = await app.playback.onSyncDue?(SyncPayload(currentTime: 30, timeListened: 20))   // accrue 20
+        let sid = try #require(try app.cache.localSessions(connectionID: cid).first).id
+        #expect(try app.cache.localSession(id: sid)?.timeListening == 20)
+
+        // me() (empty) then local-all (parked on the gate).
+        await transport.enqueue(status: 200, json: #"{"id":"root","username":"root","mediaProgress":[]}"#)
+        await transport.enqueue(status: 200, json: #"{"results":[{"id":"\#(sid)","success":true}]}"#)
+
+        let reconcile = Task { await app.reconcileOnReconnect() }
+        while await transport.requestCount(pathContains: "session/local-all") == 0 { await Task.yield() }
+
+        // A tick lands mid-reconcile (local-all still parked): accrue +5 onto the live session.
+        _ = await app.playback.onSyncDue?(SyncPayload(currentTime: 35, timeListened: 5))
+
+        await transport.openGate()
+        await reconcile.value
+
+        // The live session was NOT pruned, and the mid-reconcile tick was neither lost nor doubled.
+        let after = try #require(try app.cache.localSession(id: sid))
+        #expect(after.timeListening == 25)                          // 20 + 5, exactly once (not 20, not 45)
+
+        // No double-count across the seam: seal it and reconcile again — the server sees 25 ONCE, then pruned.
+        await app.closeCurrentSession()
+        await transport.enqueue(status: 200, json: #"{"id":"root","username":"root","mediaProgress":[]}"#)
+        await transport.enqueue(status: 200, json: #"{"results":[{"id":"\#(sid)","success":true}]}"#)
+        await app.reconcileOnReconnect()
+        #expect(await lastLocalAllTimeListening(transport)[sid] == 25)   // posted total is 25, never 45
+        #expect(try app.cache.localSession(id: sid) == nil)             // sealed + synced → pruned
+    }
+
+    /// ADVERSARIAL CONCURRENCY (the reentrancy guard, RED-verified by dropping it): two rapid
+    /// OFFLINE→ONLINE transitions do NOT double-start the reconcile. The first holds `isReconciling`
+    /// (parked on `me()`); the second is dropped, so only ONE `me()` round trip is in flight.
+    @Test func reconcileNotDoubleStartedOnTwoRapidTransitions() async throws {
+        let transport = GatedTransport(gatePath: "api/me")
+        await transport.enqueue(status: 200, json: statusOK)
+        await transport.enqueue(status: 200, json: loginOK)
+        await transport.enqueue(status: 200, json: librariesOK)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try seedLocalSession(app, id: "S1", connectionID: cid, itemID: "A", timeListening: 10)
+
+        await transport.enqueue(status: 200, json: #"{"id":"root","username":"root","mediaProgress":[]}"#)
+        await transport.enqueue(status: 200, json: #"{"results":[{"id":"S1","success":true}]}"#)
+
+        // First transition: reconcile #1 parks on the me() gate (isReconciling held).
+        let first = Task { await app.reconcileOnReconnect() }
+        while await transport.requestCount(pathContains: "api/me") == 0 { await Task.yield() }
+
+        // Second transition while #1 is in-flight: dropped by the reentrancy guard.
+        let second = Task { await app.reconcileOnReconnect() }
+        for _ in 0..<200 { await Task.yield() }
+        #expect(await transport.requestCount(pathContains: "api/me") == 1)   // NOT double-started
+
+        await transport.openGate()
+        await first.value
+        await second.value
+        #expect(try app.cache.localSession(id: "S1") == nil)                 // the one reconcile completed + pruned
+    }
+
+    /// The NWPathMonitor wiring: an OFFLINE→ONLINE path edge TRIGGERS the reconnect reconcile (and a
+    /// redundant satisfied update does NOT). Drives the deterministic seam `handleNetworkPathUpdate`.
+    @Test func networkPathOfflineToOnlineEdgeTriggersReconcile() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(dir: makeTempDir(), transport: transport, tokenStore: InMemoryTokenStore())
+        app.playback.muted = true
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let cid = try #require(app.activeConnectionID)
+        try seedLocalSession(app, id: "S1", connectionID: cid, itemID: "A", timeListening: 10)
+        await transport.enqueue(status: 200, json: #"{"id":"root","username":"root","mediaProgress":[]}"#)
+        await transport.enqueue(status: 200, json: #"{"results":[{"id":"S1","success":true}]}"#)
+
+        // Link drops, then returns — the false→true edge fires the reconcile.
+        app.handleNetworkPathUpdate(isSatisfied: false)
+        #expect(app.isNetworkAvailable == false)
+        app.handleNetworkPathUpdate(isSatisfied: true)
+        #expect(app.isNetworkAvailable == true)
+
+        var guardCount = 0
+        while (try? app.cache.localSession(id: "S1")) ?? nil != nil {
+            await Task.yield()
+            guardCount += 1
+            if guardCount > 5000 { break }
+        }
+        #expect(try app.cache.localSession(id: "S1") == nil)   // the edge triggered a reconcile that pruned S1
+        #expect(app.isOnline == true)
+
+        // A redundant satisfied update (already available) is NOT a new edge → no second reconcile
+        // (there are no more queued responses; a second me() would throw — harmless — but the me()
+        // count must not climb from another triggered reconcile).
+        let meCountBefore = await transport.recorded.filter { ($0.url?.path ?? "").hasSuffix("/api/me") }.count
+        app.handleNetworkPathUpdate(isSatisfied: true)
+        for _ in 0..<200 { await Task.yield() }
+        let meCountAfter = await transport.recorded.filter { ($0.url?.path ?? "").hasSuffix("/api/me") }.count
+        #expect(meCountAfter == meCountBefore)
+    }
 }

@@ -33,6 +33,12 @@ actor GatedTransport: Transport {
         recorded.filter { ($0.url?.path ?? "").contains(substring) }.count
     }
 
+    /// Recorded requests whose URL path contains `substring`, in order — for asserting a POST's
+    /// `httpBody` (e.g. the `local-all` batch's session payloads).
+    func recordedRequests(pathContains substring: String) -> [URLRequest] {
+        recorded.filter { ($0.url?.path ?? "").contains(substring) }
+    }
+
     func send(_ request: URLRequest) async throws -> HTTPResponse {
         recorded.append(request)
         if !gateOpen, (request.url?.path ?? "").contains(gatePath) {

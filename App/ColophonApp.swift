@@ -73,6 +73,10 @@ struct ColophonApp: App {
             .environment(app)
             .task {
                 app.loadConnections()
+                // Start the continuous NWPathMonitor reachability signal (M2a Task 6): its
+                // OFFLINE→ONLINE link edge triggers the reconnect reconcile (offline local sessions
+                // → server). Idempotent; safe to call on every WindowGroup task re-entry.
+                app.startReachabilityMonitoring()
                 #if DEBUG
                 await app.runAutoConnectIfRequested()
                 #endif

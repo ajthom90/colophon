@@ -35,10 +35,12 @@ public struct LibraryCacheStore: Sendable {
 
     /// Removes a connection and every row scoped to it — the `cachedConnection` row plus its
     /// `cachedLibrary`, `cachedItem` (and, via the FTS5 `synchronize` trigger, its search-index
-    /// rows), `cachedItemDetail`, `cachedEpisode`, `cachedProgress`, `cachedDownload`, and
-    /// `cachedDownloadFile` rows — in ONE transaction. Used by `AppState.removeConnection` so a
-    /// "forget this server" leaves no orphaned cache (including no orphaned downloaded files'
-    /// bookkeeping) behind. Other connections are untouched.
+    /// rows), `cachedItemDetail`, `cachedEpisode`, `cachedProgress`, `cachedDownload`,
+    /// `cachedDownloadFile`, and `cachedLocalSession` rows — in ONE transaction. Used by
+    /// `AppState.removeConnection` so a "forget this server" leaves no orphaned cache (including no
+    /// orphaned downloaded files' bookkeeping and no orphaned pending offline sessions) behind — the
+    /// only place a pending offline session is dropped, a deliberate user-driven purge, not a silent
+    /// loss. Other connections are untouched.
     public func deleteConnection(connectionID: String) throws {
         try pool.write { db in
             _ = try CachedItem.filter(Column("connectionID") == connectionID).deleteAll(db)
@@ -47,6 +49,7 @@ public struct LibraryCacheStore: Sendable {
             _ = try CachedProgress.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedDownload.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedDownloadFile.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedLocalSession.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedLibrary.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedConnection.filter(Column("id") == connectionID).deleteAll(db)
         }
@@ -355,5 +358,40 @@ public struct LibraryCacheStore: Sendable {
                 arguments: [connectionID]
             ) ?? 0
         }
+    }
+
+    // MARK: - v5: persisted offline local sessions (Task 6)
+
+    /// Upserts one offline `cachedLocalSession` row by its client-generated UUID (`id`). Used both
+    /// to INSERT a fresh session (first accrual tick of a new offline playback) and to UPDATE the
+    /// current session (subsequent ticks bump `currentTime`/`timeListening`/`updatedAt`). The caller
+    /// owns the ACCUMULATION of `timeListening` (read-modify-write of the row's running total) — this
+    /// is a plain full-row upsert, so a caller MUST pass the already-accumulated total, not a delta.
+    public func upsertLocalSession(_ session: CachedLocalSession) throws {
+        try pool.write { try session.upsert($0) }
+    }
+
+    /// One offline session by its UUID, or nil — the read half of the accrual read-modify-write, and
+    /// the reconcile's re-read to detect a tick that landed mid-reconcile (an advanced `updatedAt`).
+    public func localSession(id: String) throws -> CachedLocalSession? {
+        try pool.read { try CachedLocalSession.fetchOne($0, key: id) }
+    }
+
+    /// Every pending offline session for a connection, oldest-started first — the reconcile's input
+    /// set (each becomes a `LocalPlaybackSession` posted to `POST /api/session/local-all`). Ordered
+    /// by `startedAt` so a stable, chronological batch is posted.
+    public func localSessions(connectionID: String) throws -> [CachedLocalSession] {
+        try pool.read {
+            try CachedLocalSession.filter(Column("connectionID") == connectionID)
+                .order(Column("startedAt"))
+                .fetchAll($0)
+        }
+    }
+
+    /// Prunes ONE offline session by its UUID — called after the server accepts it
+    /// (`LocalSessionSyncResult.success == true`). A rejected/failed session is deliberately NOT
+    /// pruned (its offline listen time is never silently dropped — Task 3/6 contract).
+    public func deleteLocalSession(id: String) throws {
+        try pool.write { _ = try CachedLocalSession.filter(key: id).deleteAll($0) }
     }
 }

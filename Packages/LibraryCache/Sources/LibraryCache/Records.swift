@@ -419,6 +419,85 @@ public struct CachedDownloadFile: Codable, FetchableRecord, PersistableRecord, S
     }
 }
 
+/// One PERSISTED offline playback session (M2a `v5`, Task 6) — a book or podcast episode that was
+/// played from downloaded files while the server was unreachable, and whose accrued listening time
+/// must survive an app kill and reconcile to the server on the next reconnect. Keyed by a
+/// CLIENT-GENERATED session UUID (`id`), NOT the 3-part `(connection,item,episode)` PK: a fresh
+/// offline playback of the SAME item mints a NEW row (new UUID), so several sessions for one item
+/// coexist and each reconciles independently (the server dedupes by this UUID via
+/// `POST /api/session/local-all`). `timeListening` is ACCUMULATED — the caller adds each sync
+/// tick's listened-delta onto the row's running total (never overwriting, never double-adding), so
+/// it is the session's total offline listen time. `currentTime`/`updatedAt` advance on every tick;
+/// `startedAt` is fixed at session start. The `deviceId`/`clientName`/`clientVersion`/
+/// `manufacturer`/`model` columns carry the `DeviceInfo` bits needed to rebuild an
+/// `ABSKit.LocalPlaybackSession` at reconcile time WITHOUT a live device lookup (the device that
+/// accrued the session may differ from the one reconciling it after, e.g., a restore). `mediaType`
+/// (`"book"`/`"podcast"`) is likewise captured so the payload is complete offline.
+public struct CachedLocalSession: Codable, FetchableRecord, PersistableRecord, Sendable, Identifiable, Equatable, Hashable {
+    public static let databaseTableName = "cachedLocalSession"
+
+    /// The CLIENT-GENERATED session UUID — the primary key, and the id posted to the server so a
+    /// resync of the same session is idempotent (last-write-wins by `updatedAt` server-side).
+    public var id: String
+    public var connectionID: String
+    public var itemID: String
+    /// Empty string means a book-level session (no episode) — mirrors `CachedProgress.episodeID`.
+    public var episodeID: String
+    /// `"book"` or `"podcast"` — the ABS session `mediaType`.
+    public var mediaType: String
+    public var currentTime: Double
+    /// ACCUMULATED total offline listen seconds for THIS session (the caller sums per-tick deltas).
+    public var timeListening: Double
+    public var duration: Double
+    public var startedAt: Int
+    public var updatedAt: Int
+    // DeviceInfo bits (to rebuild a LocalPlaybackSession offline, with no live device lookup).
+    public var deviceId: String
+    public var clientName: String
+    public var clientVersion: String
+    public var manufacturer: String
+    public var model: String
+
+    public init(
+        id: String,
+        connectionID: String,
+        itemID: String,
+        episodeID: String? = nil,
+        mediaType: String,
+        currentTime: Double,
+        timeListening: Double,
+        duration: Double,
+        startedAt: Int,
+        updatedAt: Int,
+        deviceId: String,
+        clientName: String,
+        clientVersion: String,
+        manufacturer: String,
+        model: String
+    ) {
+        self.id = id
+        self.connectionID = connectionID
+        self.itemID = itemID
+        self.episodeID = episodeID ?? ""
+        self.mediaType = mediaType
+        self.currentTime = currentTime
+        self.timeListening = timeListening
+        self.duration = duration
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+        self.deviceId = deviceId
+        self.clientName = clientName
+        self.clientVersion = clientVersion
+        self.manufacturer = manufacturer
+        self.model = model
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, connectionID, itemID, episodeID, mediaType, currentTime, timeListening, duration,
+             startedAt, updatedAt, deviceId, clientName, clientVersion, manufacturer, model
+    }
+}
+
 /// A download's parent row plus its per-file breakdown, ordered by `trackIndex` — the shape
 /// `LibraryCacheStore.download(connectionID:itemID:episodeID:)` returns. Not itself a DB record
 /// (no table of its own); a plain composed value for callers that need both halves together.

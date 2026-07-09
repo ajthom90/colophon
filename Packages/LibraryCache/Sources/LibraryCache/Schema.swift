@@ -183,6 +183,41 @@ enum Schema {
                 t.primaryKey(["connectionID", "itemID", "episodeID", "trackIndex"])
             }
         }
+        // v5 (M2a Task 6): persisted offline local playback sessions. A NEW migration rather than an
+        // amendment of v4's body — even though v4 is branch-only/unreleased, the schema discipline
+        // is APPEND-ONLY (never edit a registered migration's body): a fresh `registerMigration`
+        // always runs forward for any dev DB already on v4, so the new table appears WITHOUT relying
+        // on the DEBUG `eraseDatabaseOnSchemaChange` flag to repair an already-branch-migrated cache,
+        // and it gives a clean, sabotage-provable v4→v5 migration-preserves-rows test.
+        //
+        // One brand-new table (additive, no existing data to preserve). `cachedLocalSession` is keyed
+        // by a CLIENT-GENERATED session UUID (`id` PK), NOT the 3-part progress convention: one row
+        // per offline PLAYBACK SESSION, so a fresh offline play of the same item is a distinct row
+        // that reconciles independently (the server dedupes by this UUID). `timeListening` is the
+        // ACCUMULATED offline listen total for the session (the app sums per-tick deltas onto it —
+        // never overwrites, never double-adds — so the offline→online seam never double-counts). The
+        // `deviceId`/`clientName`/… columns carry the `DeviceInfo` needed to rebuild the server
+        // `LocalPlaybackSession` payload at reconnect with no live device lookup.
+        migrator.registerMigration("v5") { db in
+            try db.create(table: "cachedLocalSession") { t in
+                t.primaryKey("id", .text)                       // client-generated session UUID
+                t.column("connectionID", .text).notNull().indexed()
+                t.column("itemID", .text).notNull()
+                t.column("episodeID", .text).notNull().defaults(to: "")   // "" = book/no episode
+                t.column("mediaType", .text).notNull()          // "book"/"podcast"
+                t.column("currentTime", .double).notNull()
+                t.column("timeListening", .double).notNull().defaults(to: 0)   // ACCUMULATED offline listen total
+                t.column("duration", .double).notNull().defaults(to: 0)
+                t.column("startedAt", .integer).notNull()
+                t.column("updatedAt", .integer).notNull()
+                // DeviceInfo bits (to rebuild the LocalPlaybackSession payload offline).
+                t.column("deviceId", .text).notNull()
+                t.column("clientName", .text).notNull()
+                t.column("clientVersion", .text).notNull()
+                t.column("manufacturer", .text).notNull()
+                t.column("model", .text).notNull()
+            }
+        }
         return migrator
     }
 }
