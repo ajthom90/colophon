@@ -17,8 +17,15 @@ struct HomeView: View {
 
     @State private var libraries: [CachedLibrary] = []
     @State private var shelves: [Shelf] = []
-    /// Live `CachedProgress` keyed by `itemID` (book rows preferred over episode rows on collision).
+    /// Live `CachedProgress` keyed by `itemID` (book rows preferred over episode rows on collision) —
+    /// feeds book/podcast `CoverCard` pills.
     @State private var progressByItem: [String: CachedProgress] = [:]
+    /// Live `CachedProgress` keyed by the FULL `itemID + "/" + episodeID` (M1c-c Task 7) — feeds
+    /// `EpisodeCard` pills. Unlike `progressByItem` (which collapses every row sharing an `itemID`
+    /// down to one "best" row — wrong for a podcast, whose episodes all share the PODCAST's `itemID`),
+    /// this keeps every episode's row distinct so an episode card resolves ITS OWN progress, never a
+    /// sibling episode's.
+    @State private var progressByItemEpisode: [String: CachedProgress] = [:]
     @State private var state: LoadState = .idle
 
     private enum LoadState: Equatable { case idle, loading, loaded, failed(String) }
@@ -33,6 +40,15 @@ struct HomeView: View {
             // NavigationStack (PhoneShell's Home tab, SplitShell's `.home` detail) — a stable
             // self-registration point, unlike the browse views reached through a mode switch.
             .itemDetailDestination()
+            // M1c-c Task 7: a podcast library's Home shows `.book`-shaped "recently-added" cards
+            // (routed to `PodcastDetailRoute`, see `ShelfRow`) and `.episode`-shaped cards (routed to
+            // `EpisodeDetailRoute`, see `EpisodeCard`) — both destinations MUST be registered here,
+            // on this SAME stable root, alongside `.itemDetailDestination()` above, or a card tapped
+            // from Home dead-ends on Mac ("There is no next column after the detail column"). This
+            // was the deferred Task-4 Home→podcast gap: the Library stacks already registered both
+            // (Tasks 4/6), but Home never did until now.
+            .podcastDetailDestination()
+            .episodeDetailDestination()
             .task(id: app.activeConnectionID) { await observeLibraries() }
             .task(id: app.activeConnectionID) { await observeProgress() }
             // Reload shelves whenever the active library appears/changes.
@@ -70,7 +86,12 @@ struct HomeView: View {
         ScrollView {
             LazyVStack(alignment: .leading, spacing: 28) {
                 ForEach(shelves) { shelf in
-                    ShelfRow(shelf: shelf) { itemID in progressByItem[itemID] }
+                    ShelfRow(
+                        shelf: shelf,
+                        progressFor: { itemID in progressByItem[itemID] },
+                        episodeProgressFor: { itemID, episodeID in
+                            progressByItemEpisode[itemID + "/" + episodeID]
+                        })
                 }
             }
             .padding(.vertical)
@@ -98,15 +119,23 @@ struct HomeView: View {
         }
     }
 
-    /// Observes ALL of the connection's `CachedProgress` and indexes it by `itemID` so book cards'
-    /// progress pills update live as socket events land. On an `itemID` collision (a podcast with
-    /// several episodes), the book row (`episodeID == ""`) wins, else the newest `lastUpdate`.
+    /// Observes ALL of the connection's `CachedProgress` and indexes it TWO ways so both book/podcast
+    /// AND episode shelf cards get live-updating pills as socket events land:
+    /// - `progressByItem` (`indexedByItem()`) — keyed by `itemID` alone, collapsing every row sharing
+    ///   an item down to one "best" row (book row wins, else newest `lastUpdate`). Right for a
+    ///   `CoverCard` (one pill per book/podcast item).
+    /// - `progressByItemEpisode` (`indexedByItemAndEpisode()`) — keyed by the FULL `itemID + "/" +
+    ///   episodeID`, so a podcast's several episodes (which all share the PODCAST's `itemID` in the
+    ///   3-part `cachedProgress` PK) each resolve THEIR OWN row via `EpisodeCard`, never a sibling
+    ///   episode's or the item-collapsed "best" row.
     private func observeProgress() async {
         progressByItem = [:]
+        progressByItemEpisode = [:]
         guard let connectionID = app.activeConnectionID else { return }
         do {
             for try await rows in app.cache.observeProgress(connectionID: connectionID) {
                 progressByItem = rows.indexedByItem()
+                progressByItemEpisode = rows.indexedByItemAndEpisode()
             }
         } catch {
             // Best-effort live updates; pills still paint from whatever the join already wrote.

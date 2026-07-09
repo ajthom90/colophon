@@ -3,9 +3,9 @@ import ABSKit
 import LibraryCache
 
 /// One title row in the blended search results — the merge unit of the local FTS5 tier and the
-/// server `book` bucket. `id` is the `libraryItem.id`, the dedup key: a server row REPLACES the
-/// FTS placeholder with the same id (richer), while an FTS-only row the server didn't return stays
-/// (offline), flagged `isServerEnriched == false`.
+/// server `book`/`podcast` buckets. `id` is the `libraryItem.id`, the dedup key: a server row
+/// REPLACES the FTS placeholder with the same id (richer), while an FTS-only row the server didn't
+/// return stays (offline), flagged `isServerEnriched == false`.
 struct ItemRow: Identifiable, Equatable, Sendable {
     let id: String
     var title: String
@@ -16,10 +16,18 @@ struct ItemRow: Identifiable, Equatable, Sendable {
     /// search endpoint's item shape — the merge carries the FTS value over onto the server row.
     var updatedAt: Int?
     /// `false` for an FTS-only (offline) placeholder the server hasn't enriched; `true` once a
-    /// server `book`-bucket hit has replaced it.
+    /// server `book`/`podcast`-bucket hit has replaced it.
     var isServerEnriched: Bool
+    /// `true` when this row is a PODCAST library item — routes to `PodcastDetailRoute`
+    /// (`SearchTitleRow`), not `ItemDetailRoute` (Task 8, fixing the deferred M1c-a Task 4 gap).
+    /// For an FTS/local row this is derived from the owning library's `mediaType` (a `SearchModel`
+    /// is always scoped to one library, and a library's mediaType is uniform across its items — see
+    /// `SearchModel.init(app:connectionID:libraryID:libraryMediaType:)`); for a server row it's set
+    /// by which bucket produced it — `results.podcast` (true) vs `results.book` (false) — in
+    /// `mergeServer`.
+    var isPodcast: Bool
 
-    init(cachedItem item: CachedItem) {
+    init(cachedItem item: CachedItem, isPodcast: Bool = false) {
         id = item.id
         title = item.title
         author = item.authorName
@@ -27,25 +35,62 @@ struct ItemRow: Identifiable, Equatable, Sendable {
         duration = item.duration
         updatedAt = item.updatedAt
         isServerEnriched = false
+        self.isPodcast = isPodcast
     }
 
-    init(hit: SearchBookHit) {
+    init(hit: SearchBookHit, isPodcast: Bool = false) {
         let li = hit.libraryItem
         id = li.id
         title = li.media.metadata.title ?? "Untitled"
-        author = li.media.metadata.authorName
+        // A podcast's shelf-entity metadata reports its author as `author` (singular), not
+        // `authorName` (the book field) — same fallback `ShelfRow` uses for shelf entities.
+        author = li.media.metadata.authorName ?? li.media.metadata.author
         subtitle = li.media.metadata.subtitle
         duration = li.media.duration
         updatedAt = nil
         isServerEnriched = true
+        self.isPodcast = isPodcast
     }
 }
 
-/// The result sections, in the canonical display order: Titles → Series → Authors → Narrators →
-/// Genres → Tags. `SearchModel.populatedSections` yields exactly the non-empty ones in this order,
+/// One episode row in the blended search results — server-only (the `episodes` bucket has no local
+/// FTS equivalent). Built from a `SearchEpisodeHit`, whose `libraryItem` is the matched episode's
+/// PODCAST with the matched episode riding in `recentEpisode` (verified live, `podcast-search.json`).
+/// Fails (returns `nil`) when `recentEpisode`/its `id` is missing — an episode hit with no episode
+/// is not renderable, so `mergeServer` drops it via `compactMap` rather than showing a broken row.
+struct EpisodeSearchRow: Identifiable, Equatable, Sendable {
+    let id: String
+    /// The episode id — `/play/:episodeId` and the `cachedProgress` PK; also `EpisodeDetailRoute.episodeID`.
+    let episodeID: String
+    /// The owning podcast's library-item id — `EpisodeDetailRoute.podcastItemID`.
+    let podcastItemID: String
+    let episodeTitle: String
+    let podcastTitle: String
+    let duration: Double?
+    /// Always `nil` — the search endpoint's episode bucket carries no cache cache-buster (this
+    /// bucket is server-only, never merged with a local/FTS row), matching `ItemRow(hit:)`'s server
+    /// rows before an FTS carry-over.
+    let updatedAt: Int?
+
+    init?(hit: SearchEpisodeHit) {
+        let li = hit.libraryItem
+        guard let episode = li.recentEpisode, let episodeID = episode.id else { return nil }
+        id = episodeID
+        self.episodeID = episodeID
+        podcastItemID = li.id
+        episodeTitle = episode.title ?? "Untitled Episode"
+        podcastTitle = li.media.metadata.title ?? "Untitled"
+        duration = episode.effectiveDuration
+        updatedAt = nil
+    }
+}
+
+/// The result sections, in the canonical display order: Titles → Episodes → Series → Authors →
+/// Narrators → Genres → Tags (à la Apple Podcasts' "Shows then Episodes" — Episodes sits right
+/// after Titles). `SearchModel.populatedSections` yields exactly the non-empty ones in this order,
 /// so both `SearchView` and the ordering test read the order from one source.
 enum SearchSection: String, CaseIterable, Hashable, Sendable {
-    case titles, series, authors, narrators, genres, tags
+    case titles, episodes, series, authors, narrators, genres, tags
 }
 
 /// The blended local-FTS5 ⨯ server search core. `@Observable` + `@MainActor`, driven by
@@ -60,14 +105,16 @@ enum SearchSection: String, CaseIterable, Hashable, Sendable {
 ///    at least `minimumServerQueryLength` (2) characters, calls the server fn. The server 400s on
 ///    an empty/1-char `q` (verified), so that request is NEVER made. A newer query cancels the
 ///    in-flight task; a superseded server result is discarded (`Task.isCancelled`).
-///  - **Merge:** server `book`-bucket rows replace/enrich the matching FTS placeholder BY id
-///    (one row per id, server wins); FTS-only rows stay. Entity buckets (Series/Authors/Narrators/
-///    Genres/Tags) are SERVER-ONLY — cleared on every query change, repopulated only by a response.
+///  - **Merge:** server `book`/`podcast`-bucket rows replace/enrich the matching FTS placeholder BY
+///    id (one row per id, server wins, `podcast` rows marked `isPodcast`); FTS-only rows stay. The
+///    `episodes` bucket (Task 8) has no local counterpart — it's SERVER-ONLY, like the entity
+///    buckets (Series/Authors/Narrators/Genres/Tags) — cleared on every query change, repopulated
+///    only by a response.
 ///
 /// **Per-library scope (deviation note):** the server tier is inherently per-library (the endpoint
-/// requires a `libraryID`); the production `init(app:connectionID:libraryID:)` scopes the FTS tier
-/// to the same library too, so both tiers agree. If a connection has multiple libraries, `SearchView`
-/// searches the active/first one (documented there).
+/// requires a `libraryID`); the production `init(app:connectionID:libraryID:libraryMediaType:)`
+/// scopes the FTS tier to the same library too, so both tiers agree. If a connection has multiple
+/// libraries, `SearchView` searches the active/first one (documented there).
 @Observable
 @MainActor
 final class SearchModel {
@@ -81,8 +128,12 @@ final class SearchModel {
 
     // MARK: Published result state (read by SearchView)
 
-    /// The blended title rows (FTS placeholders enriched in place by the server `book` bucket).
+    /// The blended title rows (FTS placeholders enriched in place by the server `book`/`podcast`
+    /// buckets — a podcast library item lands here too, marked `isPodcast`, not in a separate list).
     private(set) var titles: [ItemRow] = []
+    /// The server-only `episodes` bucket (Task 8) — always empty until a response lands, cleared on
+    /// query change exactly like the entity buckets below (no local FTS equivalent exists for it).
+    private(set) var episodes: [EpisodeSearchRow] = []
     /// Server-only entity buckets — always empty until a response lands, cleared on query change.
     private(set) var series: [SeriesSummary] = []
     private(set) var authors: [AuthorSummary] = []
@@ -115,15 +166,21 @@ final class SearchModel {
 
     /// Production wiring: FTS tier backed by `LibraryCacheStore.searchItems` (scoped to `libraryID`),
     /// server tier by `ABSClient.searchLibrary`. `app` is read live inside the closures so a
-    /// reconnect (fresh `client`) is picked up without rebuilding the model.
-    convenience init(app: AppState, connectionID: String, libraryID: String,
+    /// reconnect (fresh `client`) is picked up without rebuilding the model. `libraryMediaType`
+    /// (`"book"`/`"podcast"`) marks every local/FTS row's `isPodcast` up front — a library's
+    /// mediaType is uniform across its items (the same signal `CoverCard`'s library-grid caller
+    /// already uses), so this is correct even before/without a server merge (the offline case a
+    /// server-only `isPodcast` would get wrong).
+    convenience init(app: AppState, connectionID: String, libraryID: String, libraryMediaType: String,
                      debounce: Duration = .milliseconds(275)) {
+        let isPodcastLibrary = libraryMediaType == "podcast"
         self.init(
             localSearch: { query in
                 let rows = (try? app.cache.searchItems(connectionID: connectionID, query: query)) ?? []
                 // FTS is connection-scoped; keep only the active library's rows so the local tier
                 // matches the server tier's per-library scope.
-                return rows.filter { $0.libraryID == libraryID }.map(ItemRow.init(cachedItem:))
+                return rows.filter { $0.libraryID == libraryID }
+                    .map { ItemRow(cachedItem: $0, isPodcast: isPodcastLibrary) }
             },
             serverSearch: { query in
                 guard let client = app.client else { throw ABSError.notAuthenticated }
@@ -137,6 +194,7 @@ final class SearchModel {
     var populatedSections: [SearchSection] {
         var result: [SearchSection] = []
         if !titles.isEmpty { result.append(.titles) }
+        if !episodes.isEmpty { result.append(.episodes) }
         if !series.isEmpty { result.append(.series) }
         if !authors.isEmpty { result.append(.authors) }
         if !narrators.isEmpty { result.append(.narrators) }
@@ -165,9 +223,10 @@ final class SearchModel {
             return
         }
 
-        // Entity buckets belong to the PREVIOUS query's response (server-only) — clear them now so
-        // a stale Authors/Series section never lingers under a new query while the server runs.
-        series = []; authors = []; narrators = []; genres = []; tags = []
+        // Episodes + entity buckets belong to the PREVIOUS query's response (server-only) — clear
+        // them now so a stale Episodes/Authors/Series section never lingers under a new query while
+        // the server runs.
+        episodes = []; series = []; authors = []; narrators = []; genres = []; tags = []
 
         let debounce = debounceInterval
         searchTask = Task { [weak self] in
@@ -200,12 +259,18 @@ final class SearchModel {
     // MARK: - Merge
 
     /// Merges a server response into the local titles by `libraryItem.id` (server row wins,
-    /// enriched; new ids appended after the FTS rows) and replaces the server-only entity buckets.
+    /// enriched; new ids appended after the FTS rows), populates the server-only `episodes` bucket,
+    /// and replaces the server-only entity buckets.
+    ///
+    /// **Podcast bucket (Task 8, fixing the deferred M1c-a Task 10 gap):** `results.podcast` merges
+    /// into `titles` via the SAME by-id merge as `results.book` — a podcast library's items would
+    /// otherwise show ZERO title rows (M1c-a note) — but each merged row is marked `isPodcast: true`
+    /// so `SearchTitleRow` routes it to `PodcastDetailRoute`, not `ItemDetailRoute`.
     private func mergeServer(_ results: SearchResults) {
         var order = titles.map(\.id)
         var byID = Dictionary(titles.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        for hit in results.book ?? [] {
-            var row = ItemRow(hit: hit)
+        func mergeHit(_ hit: SearchBookHit, isPodcast: Bool) {
+            var row = ItemRow(hit: hit, isPodcast: isPodcast)
             if let existing = byID[row.id] {
                 // Carry the FTS row's cover cache-buster onto the (ts-less) server row.
                 if row.updatedAt == nil { row.updatedAt = existing.updatedAt }
@@ -214,7 +279,11 @@ final class SearchModel {
             }
             byID[row.id] = row
         }
+        for hit in results.book ?? [] { mergeHit(hit, isPodcast: false) }
+        for hit in results.podcast ?? [] { mergeHit(hit, isPodcast: true) }
         titles = order.compactMap { byID[$0] }
+
+        episodes = (results.episodes ?? []).compactMap(EpisodeSearchRow.init(hit:))
 
         series = (results.series ?? []).map(\.series)
         authors = results.authors ?? []
@@ -224,7 +293,7 @@ final class SearchModel {
     }
 
     private func clearResults() {
-        titles = []; series = []; authors = []; narrators = []; genres = []; tags = []
+        titles = []; episodes = []; series = []; authors = []; narrators = []; genres = []; tags = []
         isSearching = false
     }
 }

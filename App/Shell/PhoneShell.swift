@@ -132,6 +132,12 @@ private struct LibraryTabContent: View {
         // series' book grid all resolve `ItemDetailRoute` (they're reached through the mode switch,
         // so they must not self-register).
         .itemDetailDestination()
+        // A podcast library's Grid pushes `PodcastDetailRoute` → `PodcastDetailView`; registered on
+        // the same stable root as the book route above.
+        .podcastDetailDestination()
+        // An episode row (inside `PodcastDetailView`, reached through the destination above) pushes
+        // `EpisodeDetailRoute`; registered on the same stable root, inside the stack.
+        .episodeDetailDestination()
         .task(id: app.activeConnectionID) {
             let connectionID = app.activeConnectionID
             // Only reset the browse state for a GENUINELY new connection — not on every
@@ -160,16 +166,24 @@ private struct LibraryTabContent: View {
 
     @ViewBuilder
     private func content(for library: CachedLibrary) -> some View {
-        switch browseMode {
-        case .grid:
+        if library.mediaType == "podcast" {
+            // Podcasts have no Series/Authors (book concepts) — only the podcast grid, and NO
+            // "Browse by" menu (nothing to switch to). The grid keeps its own library picker.
+            // Guarding here (not just on the mode switch) means a stale `browseMode` carried from a
+            // book library can never render Series/Authors for a podcast library.
             LibraryGridView(library: library, siblings: libraries, onSelectLibrary: { selectedLibraryID = $0.id })
-                .toolbar { browseByMenu }
-        case .series:
-            SeriesListView(library: library)
-                .toolbar { browseByMenu }
-        case .authors:
-            AuthorsListView(library: library)
-                .toolbar { browseByMenu }
+        } else {
+            switch browseMode {
+            case .grid:
+                LibraryGridView(library: library, siblings: libraries, onSelectLibrary: { selectedLibraryID = $0.id })
+                    .toolbar { browseByMenu }
+            case .series:
+                SeriesListView(library: library)
+                    .toolbar { browseByMenu }
+            case .authors:
+                AuthorsListView(library: library)
+                    .toolbar { browseByMenu }
+            }
         }
     }
 

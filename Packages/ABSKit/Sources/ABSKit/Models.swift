@@ -213,6 +213,15 @@ public enum ShelfEntity: Decodable, Sendable {
 public struct ShelfBookEntity: Decodable, Sendable, Identifiable {
     public let id: String
     public let media: ShelfEntityMedia
+    /// The entity's OWN media type (`"book"` / `"podcast"`) — LIVE-CAPTURED (M1c-c Task 7,
+    /// `podcast-personalized.json` and `personalized.json`): EVERY `recently-added`/
+    /// `continue-listening` shelf entity carries this top-level field (a podcast library's is
+    /// `"podcast"`, a book library's is `"book"`). Optional/tolerant because an older/variant server
+    /// or a shelf projection that ever omits it must still decode — and because it lets the
+    /// podcast-vs-book routing (`ShelfCardRouting`) prefer this precise per-entity signal when present,
+    /// falling back to the enclosing `Shelf.type` only when it's absent. (The M1c-c Task 7 v1 claim
+    /// that shelf entities carry "no mediaType of their own" was WRONG — corrected here in fix round 2.)
+    public let mediaType: String?
 }
 
 /// Shared media projection for shelf book entities AND search's `book` bucket (verified live:
@@ -229,6 +238,13 @@ public struct ShelfEntityMetadata: Decodable, Sendable {
     public let authorName: String?
     public let narratorName: String?
     public let seriesName: String?
+    /// A PODCAST's shelf-entity metadata reports its author as `author` (singular) — NOT `authorName`
+    /// (the book field) — LIVE-VERIFIED (M1c-c Task 7, `podcast-personalized.json`'s `recently-added`
+    /// entity: `media.metadata.author == "Colophon Dev"`, `authorName` absent/nil). A caller resolving
+    /// a display author for a `.book`-shaped shelf entity that might actually be a podcast (see
+    /// `Shelf.type == "podcast"`) must fall back to this field when `authorName` is nil, or a
+    /// podcast's recently-added card silently shows no author.
+    public let author: String?
 }
 
 public struct ShelfAuthorEntity: Decodable, Sendable, Identifiable {
@@ -239,22 +255,57 @@ public struct ShelfAuthorEntity: Decodable, Sendable, Identifiable {
 }
 
 /// Podcast episode shelf entities (`continue-listening`/`newest-episodes`/`listen-again` on a
-/// podcast library — shelf `type` `"episode"`) are source-verified against ABS 2.35.1
-/// (`libraryFilters.js` attaches a `recentEpisode` object onto the podcast's `LibraryItem`
-/// before it's pushed onto the shelf) but NOT live-captured: this dev stack seeds a book library
-/// only. Every field is optional; M1c-c should tighten this against a real podcast fixture.
+/// podcast library — shelf `type` `"episode"`) — LIVE-CAPTURED (M1c-c Task 1,
+/// `podcast-personalized.json`). ABS's `libraryFilters.js` attaches a `recentEpisode` object onto
+/// the podcast's `LibraryItem` before it's pushed onto the shelf, so the entity itself is the
+/// PODCAST library item (`id` = podcast item id, `media` = podcast media) with the shelf's episode
+/// riding in `recentEpisode`.
+///
+/// Live corrections over the M1c-a source-only guess: `id` is always present (it's the podcast
+/// library-item id, NOT the episode id — the episode id lives at `recentEpisode.id`), so it's
+/// non-optional to match `ShelfBookEntity`/`ShelfAuthorEntity`. `RecentEpisodeRef` gained the
+/// fields the live projection actually carries — `libraryItemId` (the podcast id, for the 3-part
+/// `cachedProgress` PK join), `episodeType`, `index`, `pubDate`, `guid`, `description`, `duration`.
+/// `season`/`episode` are STRINGS (verified: `"1"`, not `1`); `index` and `duration` come back
+/// `null` in this shelf projection (present on the full item), so both stay optional.
 public struct ShelfEpisodeEntity: Decodable, Sendable {
-    public let id: String?
+    /// The PODCAST library-item id (the shelf entity is the podcast, not the episode).
+    public let id: String
     public let media: ShelfEntityMedia?
     public let recentEpisode: RecentEpisodeRef?
 
     public struct RecentEpisodeRef: Decodable, Sendable {
+        /// The episode id (the id used for `/play/:episodeId` and the `cachedProgress` PK).
         public let id: String?
-        public let title: String?
-        public let subtitle: String?
+        /// The owning podcast's library-item id (the `itemID` of the 3-part `cachedProgress` PK).
+        public let libraryItemId: String?
+        public let index: Int?
         public let season: String?
         public let episode: String?
+        public let episodeType: String?
+        public let title: String?
+        public let subtitle: String?
+        public let description: String?
+        public let pubDate: String?
         public let publishedAt: Int?
+        public let guid: String?
+        public let duration: Double?
+        /// The nested `audioFile.duration` — RE-VERIFIED LIVE (M1c-c Task 7, against the running dev
+        /// server, not just the captured fixture): the top-level `duration` above is reliably `null`
+        /// in this shelf projection, but `audioFile.duration` IS populated (`465.397551` for the
+        /// seeded Episode One) — ABS just nests the real number one level deeper here than the full
+        /// `?expanded=1` item response does. `effectiveDuration` below is the fallback a progress-pill
+        /// caller should use.
+        public let audioFile: AudioFileDuration?
+
+        public struct AudioFileDuration: Decodable, Sendable {
+            public let duration: Double?
+        }
+
+        /// The best duration available for this shelf projection: the top-level field when present,
+        /// else the nested `audioFile.duration` (LIVE-VERIFIED to carry the real value when the
+        /// top-level one is `null`) — never a bogus guess.
+        public var effectiveDuration: Double? { duration ?? audioFile?.duration }
     }
 }
 
@@ -357,8 +408,11 @@ public struct SearchResults: Decodable, Sendable {
     public let genres: [SearchNamedCount]?
     public let series: [SearchSeriesHit]?
     public let authors: [AuthorSummary]?
-    /// Podcast-library-only buckets (source-verified via `libraryItemsPodcastFilters.search`,
-    /// not live-captured — this dev stack seeds a book library only; M1c-c should tighten this).
+    /// Podcast-library-only buckets — LIVE-CAPTURED (M1c-c Task 1, `podcast-search.json`,
+    /// `q=on` matching both). The `podcast` bucket is verified to reuse the SAME `{libraryItem}`
+    /// wrapper as the `book` bucket (so `[SearchBookHit]` is correct); the `episodes` bucket wraps
+    /// the matched episode's PODCAST, with the matched episode in `libraryItem.recentEpisode` (see
+    /// `SearchEpisodeHit`). Book libraries omit both buckets entirely (they decode as nil).
     public let podcast: [SearchBookHit]?
     public let episodes: [SearchEpisodeHit]?
 }
@@ -396,12 +450,29 @@ public struct SearchSeriesHit: Decodable, Sendable {
     public let books: [LibraryItemSummary]?
 }
 
-/// Podcast episode search hits (source-verified only, not live-captured this milestone — see
-/// `ShelfEpisodeEntity`).
-public struct SearchEpisodeHit: Decodable, Sendable {
-    public let id: String?
-    public let libraryItemId: String?
-    public let title: String?
+/// A `episodes` search-bucket hit — LIVE-CAPTURED (M1c-c Task 1, `podcast-search.json`).
+///
+/// Live correction over the M1c-a source-only guess (`{id, libraryItemId, title}`): the real hit
+/// wraps a `libraryItem` (the matched episode's PODCAST — `mediaType: "podcast"`), and the matched
+/// episode rides in `libraryItem.recentEpisode` — `media.episodes` is EMPTY in this search
+/// projection, exactly like a personalized episode shelf entity. So the hit mirrors `SearchBookHit`
+/// (a `{libraryItem}` wrapper), not a flat episode object; read the episode from `recentEpisode`.
+public struct SearchEpisodeHit: Decodable, Sendable, Identifiable {
+    public let libraryItem: SearchEpisodeLibraryItem
+    /// The matched episode's id (falls back to the podcast id) — stable for SwiftUI `ForEach`.
+    public var id: String { libraryItem.recentEpisode?.id ?? libraryItem.id }
+}
+
+/// The `libraryItem` wrapper inside an `episodes` search hit: the matched episode's PODCAST
+/// (`id`/`media` for the podcast title + cover) plus the matched episode in `recentEpisode`
+/// (reusing `ShelfEpisodeEntity.RecentEpisodeRef`, the identical shape verified live). Lean
+/// projection — the search response's other item fields (path/ino/libraryFiles/…) are dropped by
+/// tolerant decoding.
+public struct SearchEpisodeLibraryItem: Decodable, Sendable, Identifiable {
+    /// The podcast library-item id.
+    public let id: String
+    public let media: ShelfEntityMedia
+    public let recentEpisode: ShelfEpisodeEntity.RecentEpisodeRef?
 }
 
 /// `GET /api/me` — this milestone only needs `mediaProgress` (the progress-join source for
@@ -453,6 +524,85 @@ public struct Bookmark: Codable, Sendable, Hashable, Identifiable {
         self.title = title
         self.createdAt = createdAt
     }
+}
+
+// MARK: - Podcast item detail (M1c-c Task 2)
+
+/// Full podcast-item detail from the SAME endpoint as `item(id:)` (`GET /api/items/:id?expanded=1`)
+/// — decoded into a SEPARATE type rather than folded into `LibraryItemDetail` because a podcast's
+/// `media.metadata` is a completely different shape from a book's `ExpandedItemMetadata` (podcast:
+/// `title`/`author`/`description`/`feedUrl`/`imageUrl`/…; book: `authorName`/`narratorName`/
+/// `series`/…) and only a podcast's `media` carries `episodes[]`. `ABSClient.podcastItem(id:)`
+/// hits the identical request as `item(id:)` (same URL-building helper — no duplicated fetch),
+/// just decoded against this podcast-shaped DTO. Grounded in the M1c-c Task 1 live capture
+/// (`podcast-item.json`).
+public struct PodcastDetail: Decodable, Sendable, Identifiable {
+    public let id: String
+    /// The item's owning library — optional for the same tolerant-decode reason as
+    /// `LibraryItemDetail.libraryId`.
+    public let libraryId: String?
+    public let updatedAt: Int?
+    public let media: PodcastMedia
+}
+
+public struct PodcastMedia: Decodable, Sendable {
+    public let metadata: PodcastMetadata
+    public let coverPath: String?
+    public let episodes: [PodcastEpisode]
+}
+
+/// A podcast's metadata (`media.metadata` on a podcast item) — live-verified shape, distinct from
+/// a book's `ExpandedItemMetadata`. `description` is HTML (render via `HTMLText`, not raw `Text`).
+public struct PodcastMetadata: Decodable, Sendable {
+    public let title: String?
+    public let author: String?
+    public let description: String?
+    public let releaseDate: String?
+    public let genres: [String]?
+    public let feedUrl: String?
+    public let imageUrl: String?
+    public let explicit: Bool?
+    public let language: String?
+    public let type: String?
+}
+
+/// One podcast episode from `media.episodes[]` — live-verified against `podcast-item.json`
+/// (M1c-c Task 1). `season`/`episode` are STRINGS (`"1"`, not `1` — a live correction over the
+/// M1c-a source-only guess, matching `ShelfEpisodeEntity.RecentEpisodeRef` and the `cachedEpisode`
+/// table's `season`/`episode` columns). `enclosure.length` is likewise a STRING (`"3723859"`).
+/// `audioFile`/`audioTrack` (the server's internal per-file scan metadata) are intentionally NOT
+/// modeled here — playback goes through `ABSClient.playEpisode`'s own session envelope
+/// (`audioTracks`), not the RSS enclosure or file-scan metadata; tolerant decoding drops them.
+public struct PodcastEpisode: Decodable, Sendable, Identifiable {
+    public let id: String
+    /// The owning podcast's library-item id (the `itemID` half of the 3-part `cachedProgress` PK).
+    public let libraryItemId: String?
+    public let podcastId: String?
+    /// Track index within the season/feed; `null` in the live capture (kept optional).
+    public let index: Int?
+    public let season: String?
+    public let episode: String?
+    public let episodeType: String?
+    public let title: String?
+    public let subtitle: String?
+    /// HTML — render via `HTMLText`, not raw `Text`.
+    public let description: String?
+    public let enclosure: PodcastEpisodeEnclosure?
+    public let guid: String?
+    public let pubDate: String?
+    public let publishedAt: Int?
+    /// Per-episode chapter marks, same shape as a book's global chapters; empty for this seed.
+    public let chapters: [Chapter]?
+    public let size: Int?
+    public let duration: Double?
+}
+
+/// The episode's RSS enclosure (`{url,type,length}`). `length` is a STRING in the live payload
+/// (`"3723859"`), not a JSON number — verified against `podcast-item.json`.
+public struct PodcastEpisodeEnclosure: Decodable, Sendable, Hashable {
+    public let url: String?
+    public let type: String?
+    public let length: String?
 }
 
 public struct DeviceInfo: Encodable, Sendable {

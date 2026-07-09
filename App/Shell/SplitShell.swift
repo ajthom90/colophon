@@ -52,14 +52,19 @@ struct SplitShell: View {
                 // their own `.tag`.
                 Section("Libraries") {
                     ForEach(libraries) { library in
-                        DisclosureGroup(isExpanded: expansionBinding(for: library)) {
-                            Label("Series", systemImage: "square.stack").tag(SidebarItem.series(library))
-                            Label("Authors", systemImage: "person.2").tag(SidebarItem.authors(library))
-                        } label: {
-                            Label(library.name,
-                                  systemImage: library.mediaType == "podcast"
-                                    ? "antenna.radiowaves.left.and.right" : "books.vertical")
+                        if library.mediaType == "podcast" {
+                            // Podcasts have no Series/Authors (book concepts) — a plain row that
+                            // browses the podcast grid, no disclosure children.
+                            Label(library.name, systemImage: "antenna.radiowaves.left.and.right")
                                 .tag(SidebarItem.library(library))
+                        } else {
+                            DisclosureGroup(isExpanded: expansionBinding(for: library)) {
+                                Label("Series", systemImage: "square.stack").tag(SidebarItem.series(library))
+                                Label("Authors", systemImage: "person.2").tag(SidebarItem.authors(library))
+                            } label: {
+                                Label(library.name, systemImage: "books.vertical")
+                                    .tag(SidebarItem.library(library))
+                            }
                         }
                     }
                 }
@@ -140,6 +145,14 @@ struct SplitShell: View {
             NavigationStack {
                 LibraryGridView(library: library)
                     .itemDetailDestination()
+                    // A podcast library's grid pushes `PodcastDetailRoute`; register it here on the
+                    // stack's ROOT CONTENT (inside the stack, same rule as `.itemDetailDestination()`)
+                    // so a podcast card resolves to `PodcastDetailView` within the detail column.
+                    .podcastDetailDestination()
+                    // An episode row (inside `PodcastDetailView`, reached through the destination
+                    // above) pushes `EpisodeDetailRoute`; registered on this SAME root content, inside
+                    // the stack, so it resolves within the detail column rather than dead-ending.
+                    .episodeDetailDestination()
             }
         case .series(let library):
             NavigationStack {

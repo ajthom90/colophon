@@ -2,11 +2,14 @@ import SwiftUI
 import ABSKit
 import LibraryCache
 
-/// The blended local-FTS5 ⨯ server search surface (Task 10). `.searchable` is the native search
-/// affordance; results are a grouped `List` of `Section`s (Apple Music search idiom): a Titles
-/// section (instant FTS, enriched in place by the server `book` bucket), then the SERVER-ONLY
-/// entity sections Series → Authors → Narrators → Genres → Tags. Tapping a title plays it; a series
-/// or author pushes its detail. Empty states are native (`ContentUnavailableView`).
+/// The blended local-FTS5 ⨯ server search surface (Task 10; podcast/episode buckets added Task 8).
+/// `.searchable` is the native search affordance; results are a grouped `List` of `Section`s (Apple
+/// Music/Podcasts search idiom): a Titles section (instant FTS, enriched in place by the server
+/// `book`/`podcast` buckets — a podcast library item lands here too, marked `isPodcast`), then the
+/// SERVER-ONLY sections Episodes → Series → Authors → Narrators → Genres → Tags (Episodes sits
+/// right after Titles, à la Apple Podcasts "Shows then Episodes"). Tapping a title pushes its detail
+/// (book or podcast, by kind); an episode row pushes `EpisodeDetailView`; a series or author pushes
+/// its detail. Empty states are native (`ContentUnavailableView`).
 ///
 /// Liquid Glass discipline (a review criterion): the ONLY glass is the system search bar / nav
 /// chrome the shell and `.searchable` provide — every list row, cover, and label is OPAQUE content.
@@ -33,6 +36,9 @@ struct SearchView: View {
             .task(id: app.activeConnectionID) { await syncLibraries() }
             // Registered at this stack's stable root — SearchView is the unconditional root of the
             // shell's Search `NavigationStack`, so (unlike the browse views) it may self-register.
+            // `.podcastDetailDestination()`/`.episodeDetailDestination()` join `.itemDetailDestination()`
+            // here (Task 8) so a podcast/episode title row resolves instead of dead-ending — the same
+            // macOS "register INSIDE the stack, on its root content" rule `SplitShell` documents.
             .navigationDestination(for: SeriesSummary.self) { series in
                 if let library = activeLibrary { SeriesDetailView(library: library, series: series) }
             }
@@ -40,6 +46,8 @@ struct SearchView: View {
                 if let library = activeLibrary { AuthorDetailView(library: library, author: author) }
             }
             .itemDetailDestination()
+            .podcastDetailDestination()
+            .episodeDetailDestination()
     }
 
     @ViewBuilder
@@ -68,7 +76,8 @@ struct SearchView: View {
                 libraries = libs
                 if let library = libs.first {
                     if modeledLibraryID != library.id {
-                        let fresh = SearchModel(app: app, connectionID: connectionID, libraryID: library.id)
+                        let fresh = SearchModel(app: app, connectionID: connectionID, libraryID: library.id,
+                                                 libraryMediaType: library.mediaType)
                         model = fresh
                         modeledLibraryID = library.id
                         if !query.isEmpty { fresh.updateQuery(query) }
@@ -137,6 +146,12 @@ private struct SearchResultsView: View {
                 }
             }
 
+            if !model.episodes.isEmpty {
+                Section("Episodes") {
+                    ForEach(model.episodes) { row in SearchEpisodeResultRow(row: row) }
+                }
+            }
+
             if !model.series.isEmpty {
                 Section("Series") {
                     ForEach(model.series) { series in
@@ -179,28 +194,85 @@ private struct SearchResultsView: View {
 }
 
 /// A compact title result row: small cover, title, author (or subtitle) — tapping pushes
-/// `ItemDetailView` (the Play/Resume action lives there), consistent with `CoverCard` everywhere
-/// else. The stack's `.itemDetailDestination()` (registered on `SearchView`) resolves the push.
+/// `ItemDetailView` for a book row or `PodcastDetailView` for a podcast row (`row.isPodcast`,
+/// Task 8: the deferred M1c-a Task 4 routing gap — a podcast title landed in `titles` via the
+/// server `podcast` bucket must open the episode list, not dead-end into the book detail), matching
+/// `CoverCard`'s same book-vs-podcast branch. The stack's `.itemDetailDestination()` /
+/// `.podcastDetailDestination()` (both registered on `SearchView`) resolve the push.
 private struct SearchTitleRow: View {
     let row: ItemRow
 
     var body: some View {
-        NavigationLink(value: ItemDetailRoute(
-            itemID: row.id, title: row.title, author: row.author ?? row.subtitle,
-            updatedAt: row.updatedAt, duration: row.duration)
+        Group {
+            if row.isPodcast {
+                NavigationLink(value: PodcastDetailRoute(
+                    itemID: row.id, title: row.title, author: row.author ?? row.subtitle,
+                    updatedAt: row.updatedAt)
+                ) { rowLabel }
+            } else {
+                NavigationLink(value: ItemDetailRoute(
+                    itemID: row.id, title: row.title, author: row.author ?? row.subtitle,
+                    updatedAt: row.updatedAt, duration: row.duration)
+                ) { rowLabel }
+            }
+        }
+    }
+
+    private var rowLabel: some View {
+        HStack(spacing: 12) {
+            CachedCoverView(itemID: row.id, updatedAt: row.updatedAt)
+                .frame(width: 44, height: 44)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(row.title)
+                    .font(.body)
+                    .foregroundStyle(.primary)
+                    .lineLimit(1)
+                if let secondary = row.author ?? row.subtitle, !secondary.isEmpty {
+                    Text(secondary)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.vertical, 2)
+    }
+}
+
+/// An episode result row: small (podcast) cover, episode title, podcast title + duration — tapping
+/// pushes `EpisodeDetailView` via `EpisodeDetailRoute` (Task 8), consistent with `SearchTitleRow`
+/// and `EpisodeRow` (the podcast-detail episode list). The stack's `.episodeDetailDestination()`
+/// (registered on `SearchView`) resolves the push.
+private struct SearchEpisodeResultRow: View {
+    let row: EpisodeSearchRow
+
+    private var metaText: String? {
+        guard let duration = row.duration, let text = ItemDetailView.compactDuration(duration) else {
+            return row.podcastTitle
+        }
+        return "\(row.podcastTitle) · \(text)"
+    }
+
+    var body: some View {
+        NavigationLink(value: EpisodeDetailRoute(
+            podcastItemID: row.podcastItemID, episodeID: row.episodeID,
+            podcastTitle: row.podcastTitle, updatedAt: row.updatedAt)
         ) {
             HStack(spacing: 12) {
-                CachedCoverView(itemID: row.id, updatedAt: row.updatedAt)
+                CachedCoverView(itemID: row.podcastItemID, updatedAt: row.updatedAt)
                     .frame(width: 44, height: 44)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(row.title)
+                    Text(row.episodeTitle)
                         .font(.body)
                         .foregroundStyle(.primary)
                         .lineLimit(1)
-                    if let secondary = row.author ?? row.subtitle, !secondary.isEmpty {
-                        Text(secondary)
+                    if let metaText {
+                        Text(metaText)
                             .font(.caption)
+                            .monospacedDigit()
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }

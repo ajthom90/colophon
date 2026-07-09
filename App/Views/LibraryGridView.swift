@@ -86,7 +86,8 @@ struct LibraryGridView: View {
                             title: item.title,
                             author: item.authorName,
                             duration: item.duration,
-                            progress: progressByItem[item.id])
+                            progress: progressByItem[item.id],
+                            isPodcast: library.mediaType == "podcast")
                     }
                 }
                 .padding()

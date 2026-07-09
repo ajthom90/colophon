@@ -3,10 +3,16 @@ services:
     image: ghcr.io/advplyr/audiobookshelf:2.35.1
     restart: unless-stopped
     container_name: colophon-abs
+    # Dev-only: allow ABS to fetch the podcast RSS fixture served from the host
+    # (host.docker.internal is a private IP, otherwise blocked by ABS's SSRF filter).
+    # seed.sh serves devserver/data/podcasts_feedsrc over HTTP during podcast ingest.
+    environment:
+      SSRF_REQUEST_FILTER_WHITELIST: "host.docker.internal"
     ports:
       - "13378:80"
     volumes:
       - ./data/audiobooks:/audiobooks
+      - ./data/podcasts:/podcasts
       - ./data/config:/config
       - ./data/metadata:/metadata
 

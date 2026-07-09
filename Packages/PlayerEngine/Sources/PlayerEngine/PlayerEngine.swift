@@ -96,12 +96,18 @@ public final class PlaybackController {
         }
     }
 
-    public func load(session: PlaybackSession, trackURLs: [URL]) {
+    /// - Parameter authorOverride: when non-nil, replaces `session.displayAuthor` as the now-playing
+    ///   author/secondary line. Books pass `nil` (the session's own `displayAuthor`, i.e. the book's
+    ///   author). Podcast episodes pass the PODCAST TITLE — the server's episode `displayAuthor` is
+    ///   the podcast's *author* field, but the native (Apple Podcasts) now-playing convention shows
+    ///   the *show name* as the secondary line. Only the display string differs; the session /
+    ///   sync / lifecycle wiring is byte-identical to the book path.
+    public func load(session: PlaybackSession, trackURLs: [URL], authorOverride: String? = nil) {
         timeline = BookTimeline(tracks: session.audioTracks)
         totalDuration = timeline.totalDuration
         didFireBookFinished = false   // fresh session → re-arm the one-shot book-finished latch
         title = session.displayTitle ?? "Untitled"
-        author = session.displayAuthor ?? ""
+        author = authorOverride ?? session.displayAuthor ?? ""
         chapters = session.chapters          // now-playing chapter number/title source (Task 9)
         artworkData = nil                    // fresh book → drop the previous cover until AppState resupplies
         sync = SessionSyncController()

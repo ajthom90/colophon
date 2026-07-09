@@ -159,4 +159,62 @@ struct ContractTests {
         let meAfterDelete = try await client.me()
         #expect(meAfterDelete.bookmarks?.contains { $0.libraryItemId == itemID && $0.time == 55.7 } != true)
     }
+
+    // MARK: - M1c-c Task 1: seeded podcast library
+
+    /// Live-verifies the seeded "Colophon Test Podcast": the podcast library exposes an
+    /// episode-typed personalized shelf (`newest-episodes`, present without progress), and search
+    /// populates BOTH podcast-only buckets (`q=on` matches the podcast title and an episode title).
+    /// Read-only — creates no transient state, so the seed stays clean.
+    @Test func podcastLibraryExposesEpisodeShelvesAndSearchBuckets() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let podcastLib = try #require(libs.first { $0.mediaType == "podcast" },
+                                      "seed must create a podcast library — run make seed")
+
+        let shelves = try await client.personalizedShelves(libraryID: podcastLib.id, limit: 10)
+        #expect(shelves.contains { $0.type == "episode" }, "podcast library must expose episode-typed shelves")
+        let newest = try #require(shelves.first { $0.id == "newest-episodes" })
+        guard case .episode = newest.entities.first else {
+            Issue.record("newest-episodes must contain episode shelf entities")
+            return
+        }
+
+        let results = try await client.searchLibrary(libraryID: podcastLib.id, query: "on", limit: 10)
+        #expect(results.podcast?.isEmpty == false, "q=on must match the podcast title")
+        #expect(results.episodes?.isEmpty == false, "q=on must match an episode title")
+        #expect(results.episodes?.first?.libraryItem.recentEpisode?.title != nil,
+                "episode hit must carry the matched episode in libraryItem.recentEpisode")
+    }
+
+    // MARK: - M1c-c Task 2: podcast item + episode playback
+
+    /// Live-verifies `podcastItem(id:)` against the seeded "Colophon Test Podcast" (podcast
+    /// metadata + both episodes), then plays an episode via `playEpisode` and immediately CLOSES
+    /// the session so the dev seed is left exactly as it found it (no lingering session/progress).
+    @Test func podcastItemAndEpisodePlaybackRoundTripLive() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let podcastLib = try #require(libs.first { $0.mediaType == "podcast" },
+                                      "seed must create a podcast library — run make seed")
+        let podcastPage = try await client.items(libraryID: podcastLib.id, limit: 10, page: 0)
+        let podcastItemID = try #require(podcastPage.results.first?.id)
+
+        let detail = try await client.podcastItem(id: podcastItemID)
+        #expect(detail.id == podcastItemID)
+        #expect(detail.media.metadata.title == "Colophon Test Podcast")
+        #expect(detail.media.episodes.count == 2)
+        let episode = try #require(detail.media.episodes.first)
+
+        let device = DeviceInfo(deviceId: "contract-test", clientVersion: "0.1.0", model: "test")
+        let envelope = try await client.playEpisode(itemID: podcastItemID, episodeId: episode.id, deviceInfo: device)
+        let session = envelope.session
+        #expect(session.episodeId == episode.id)
+        #expect(session.libraryItemId == podcastItemID)
+        #expect(!session.audioTracks.isEmpty)
+
+        // Leave the seed clean: close the session immediately (no sync — avoid leaving progress).
+        try await client.closeSession(id: session.id, currentTime: session.startTime,
+                                      timeListened: 0, duration: session.duration)
+    }
 }

@@ -171,6 +171,14 @@ final class AppState {
     /// `playingConnectionID` when `startPlayback` succeeds and cleared when the session is retired.
     /// Read-only to the UI (private setter).
     private(set) var nowPlayingItemID: String?
+    /// The episode ID of the currently-playing session when it's a PODCAST EPISODE, `nil` for a book.
+    /// Set alongside `nowPlayingItemID` when `startPlayback` opens an episode session (via
+    /// `client.playEpisode`) and cleared when the session is retired. Distinguishes an episode session
+    /// from a book one so per-episode progress (the 3-part `cachedProgress` PK: `connectionID/itemID/
+    /// episodeID`) and now-playing UI (e.g. the currently-playing-episode indicator) can key on it.
+    /// The session opened with this `episodeId` also syncs per-episode progress server-side (the
+    /// session id carries it). Read-only to the UI.
+    private(set) var nowPlayingEpisodeID: String?
     /// The currently-playing book's chapters (GLOBAL book seconds, `{id,start,end,title}`), taken
     /// straight from the /play envelope's `session.chapters`. This is the ONLY surface the full
     /// player (`PlayerModel`/`FullPlayerView`/`ChapterListView`) reads chapters from — the mini-bar
@@ -967,6 +975,48 @@ final class AppState {
         Task { try? await refreshItems(libraryID: libraryID) }
     }
 
+    /// Fetches a podcast item's full detail (`GET /api/items/:id?expanded=1` via `podcastItem(id:)`
+    /// — the podcast-shaped sibling of `patchItem`'s `item(id:)`, same request-building) and
+    /// reconciles its `media.episodes[]` into the v2 `cachedEpisode` table (`upsertEpisodes`,
+    /// replace-scoped-to-item: episodes the feed no longer reports for this item are dropped, the
+    /// same reconcile semantics `replaceItems` uses for the browse grid). `season`/`episode` are
+    /// carried through as the STRINGS the server sends (`"1"`, not `1`) — no numeric coercion.
+    ///
+    /// This wires the fetch → cache path (M1c-c Task 3); the podcast-detail view (Task 4) calls it on
+    /// appear and reads episodes back via `episodes`/`observeEpisodes` for instant paint. Returns the
+    /// fetched `PodcastDetail` (`@discardableResult` so the Task-3 test's bare call still compiles) so
+    /// the same single round trip also feeds the detail view's header (title/author/HTML description),
+    /// with no redundant second `podcastItem` fetch. Per-episode progress rides the SAME
+    /// `cachedProgress` join `refreshProgress()` already performs (`episodeId` populated per `me()`
+    /// entry) — no separate progress fetch is needed here.
+    @discardableResult
+    func refreshPodcastEpisodes(itemID: String) async throws -> PodcastDetail {
+        guard let client, let connectionID = activeConnectionID else {
+            throw ABSError.notAuthenticated
+        }
+        let detail = try await client.podcastItem(id: itemID)
+        let episodes = detail.media.episodes.map { episode in
+            CachedEpisode(
+                connectionID: connectionID,
+                itemID: itemID,
+                episodeID: episode.id,
+                idx: episode.index,
+                season: episode.season,
+                episode: episode.episode,
+                episodeType: episode.episodeType,
+                title: episode.title,
+                subtitle: episode.subtitle,
+                episodeDescription: episode.description,
+                pubDate: episode.pubDate,
+                publishedAt: episode.publishedAt,
+                durationSeconds: episode.duration,
+                sizeBytes: episode.size,
+                guid: episode.guid)
+        }
+        try cache.upsertEpisodes(episodes, connectionID: connectionID, itemID: itemID)
+        return detail
+    }
+
     /// Joins `GET /api/me`'s `mediaProgress[]` into the cache's `CachedProgress` — THE source of
     /// the home shelves' progress pills, since personalized-shelf entities carry NO progress field
     /// (verified live). `HomeView` calls this on appear and on pull-to-refresh; from the connected
@@ -1039,6 +1089,7 @@ final class AppState {
         sessionHandle = nil
         playingConnectionID = nil
         nowPlayingItemID = nil
+        nowPlayingEpisodeID = nil
         nowPlayingChapters = []
         // Retiring the book cancels any armed sleep timer (it was scoped to that book).
         sleepTimer.turnOff()
@@ -1047,22 +1098,47 @@ final class AppState {
         bookmarks.clear()
     }
 
-    func startPlayback(itemID: String) async {
+    /// Open a playback session and hand it to the shared player.
+    ///
+    /// ONE method serves both books and podcast episodes — there is deliberately NO forked episode
+    /// path, so the first-tap-wins reentrancy guard (`isStartingPlayback`), the connection-epoch
+    /// owner capture, `retireCurrentSession`, and the envelope→`PlaybackSessionHandle`→`onSyncDue`→
+    /// `load`/`play` wiring are byte-identical for both. The ONLY differences an episode introduces:
+    /// (1) it POSTs to `client.playEpisode(itemID:episodeId:)` (`/api/items/:id/play/:episodeId`)
+    /// instead of the book `client.startPlayback` (`/api/items/:id/play`) — the returned envelope has
+    /// the same shape (Task 2 confirmed); (2) `nowPlayingEpisodeID` is set so per-episode progress /
+    /// now-playing UI can key on it; (3) `podcastTitle`, when supplied, becomes the now-playing author
+    /// (the native show-name-as-secondary convention — see `PlaybackController.load`'s `authorOverride`).
+    ///
+    /// - Parameters:
+    ///   - episodeId: the podcast episode to play, or `nil` for a book (the default — existing book
+    ///     call sites are unchanged).
+    ///   - podcastTitle: the podcast's title, used as the now-playing author for an episode. Ignored
+    ///     for a book (which uses the session's own `displayAuthor`).
+    func startPlayback(itemID: String, episodeId: String? = nil, podcastTitle: String? = nil) async {
         // First-tap-wins reentrancy guard: without it, two rapid taps both pass
-        // `retireCurrentSession` (handle nil) and both await `client.startPlayback`; if response
+        // `retireCurrentSession` (handle nil) and both await the /play request; if response
         // A lands after B, the user hears the wrong item and B's server session leaks open.
         guard !isStartingPlayback else { return }
         isStartingPlayback = true
         defer { isStartingPlayback = false }
         guard let client else { return }
         // Captured NOW, before any await below — a connection switch racing the awaits (e.g.
-        // during `retireCurrentSession`'s flush/close or `client.startPlayback`'s round trip)
-        // must not be misattributed as this session's owner.
+        // during `retireCurrentSession`'s flush/close or the /play round trip) must not be
+        // misattributed as this session's owner.
         let owner = activeConnectionID
         // Retire the old session completely before touching the new one.
         await retireCurrentSession()
         do {
-            let envelope = try await client.startPlayback(itemID: itemID, deviceInfo: deviceInfo)
+            // The SOLE book-vs-episode branch: episode → `/play/:episodeId` (playEpisode), book →
+            // `/play` (startPlayback). Both return the identical `PlaybackSessionEnvelope`, so every
+            // line below is shared.
+            let envelope: PlaybackSessionEnvelope
+            if let episodeId {
+                envelope = try await client.playEpisode(itemID: itemID, episodeId: episodeId, deviceInfo: deviceInfo)
+            } else {
+                envelope = try await client.startPlayback(itemID: itemID, deviceInfo: deviceInfo)
+            }
             let handle = PlaybackSessionHandle(client: client, envelope: envelope)
             sessionHandle = handle
             // Record which connection owns this session so signOut/remove of that connection
@@ -1070,6 +1146,10 @@ final class AppState {
             // holds its own client, captured above — independent of `self.client`).
             playingConnectionID = owner
             nowPlayingItemID = itemID
+            // Non-nil ONLY for an episode session — the session opened above with `episodeId` syncs
+            // per-episode progress server-side, and this local pointer keys the episode's progress /
+            // now-playing UI. A book leaves it `nil`.
+            nowPlayingEpisodeID = episodeId
             // Surface this book's chapters (global seconds) to the full player. Cleared in
             // `retireCurrentSession`; the mini-bar/transport don't consume these.
             nowPlayingChapters = envelope.session.chapters
@@ -1095,12 +1175,21 @@ final class AppState {
             // `playback.skipInterval` to advertise the lock-screen/remote-command skip intervals
             // — it must already hold this playback's value when that happens.
             playback.skipInterval = Self.storedSkipInterval()
-            playback.load(session: envelope.session, trackURLs: urls)
+            // For an episode, show the PODCAST TITLE as the now-playing author (the show-name-as-
+            // secondary convention); a book (or an episode with no title supplied) uses the session's
+            // own `displayAuthor`. Empty → nil so `load` falls back to the session value.
+            let authorOverride = (episodeId != nil && !(podcastTitle ?? "").isEmpty) ? podcastTitle : nil
+            playback.load(session: envelope.session, trackURLs: urls, authorOverride: authorOverride)
             // Set AFTER `load()` (which resets the controller's session state) and BEFORE
             // `play()`: a freshly opened book resumes at ITS stored per-book rate (Task 7's `v3`
             // `cachedItemPref` table), falling back to the user's global default rate when this
             // book has none stored yet. `owner` (captured before the awaits above) is the
             // connection this session belongs to — the same id `setPlaybackRate` persists under.
+            // Episode-granularity decision (M1c-c Task 5): speed is keyed by (connection, itemID),
+            // and every episode of a podcast shares the podcast's itemID — so playback speed is
+            // persisted PER-PODCAST (all episodes of one show share a rate), not per-episode. This
+            // falls straight out of reusing the book path and matches how a listener thinks about a
+            // show's pace; per-episode speed would need the 3-part episode key and is out of scope.
             let storedRate = owner.flatMap { try? cache.playbackRate(connectionID: $0, itemID: itemID) }
             playback.rate = Float(storedRate ?? Self.storedDefaultRate())
             playback.play()
@@ -1144,16 +1233,19 @@ final class AppState {
     /// Enqueue a browse item at the FRONT of the up-next queue ("Play Next"). Scoped to the active
     /// connection (the surface the user is browsing owns the item); a no-op with no active
     /// connection. The minimal display payload rides along so `QueueView` paints without a fetch.
-    func playNext(itemID: String, title: String, author: String?) {
+    func playNext(itemID: String, title: String, author: String?, episodeId: String? = nil) {
         guard let connectionID = activeConnectionID else { return }
-        queue.playNext(QueueEntry(itemID: itemID, connectionID: connectionID, title: title, author: author))
+        queue.playNext(QueueEntry(itemID: itemID, connectionID: connectionID, title: title,
+                                  author: author, episodeId: episodeId))
     }
 
     /// Enqueue a browse item at the END of the up-next queue ("Add to Queue"). Same scoping as
-    /// `playNext`.
-    func addToQueue(itemID: String, title: String, author: String?) {
+    /// `playNext`. `episodeId` (non-nil) makes it an EPISODE entry — `title` should be the episode
+    /// title and `author` the podcast title, so `advanceToNext` plays it via the episode path.
+    func addToQueue(itemID: String, title: String, author: String?, episodeId: String? = nil) {
         guard let connectionID = activeConnectionID else { return }
-        queue.addToQueue(QueueEntry(itemID: itemID, connectionID: connectionID, title: title, author: author))
+        queue.addToQueue(QueueEntry(itemID: itemID, connectionID: connectionID, title: title,
+                                    author: author, episodeId: episodeId))
     }
 
     /// Advance past the current book — driven by the book-finished signal (`playback.onBookFinished`,
@@ -1192,8 +1284,12 @@ final class AppState {
         if next.connectionID != activeConnectionID {
             await activateConnection(next.connectionID)
         }
-        await startPlayback(itemID: next.itemID)
-        if nowPlayingItemID == next.itemID {
+        // A queued EPISODE (episodeId set) opens via the episode path — same shared `startPlayback`,
+        // just routed to `client.playEpisode`; its `author` is the podcast title, passed through as
+        // the now-playing author. A book entry (episodeId nil) takes the book path unchanged.
+        await startPlayback(itemID: next.itemID, episodeId: next.episodeId,
+                            podcastTitle: next.episodeId != nil ? next.author : nil)
+        if nowPlayingItemID == next.itemID && nowPlayingEpisodeID == next.episodeId {
             queue.remove(next)            // COMMIT: it actually started → drop it from the queue
         } else {
             // `startPlayback` bailed (e.g. the connection can't authenticate): the entry is LEFT

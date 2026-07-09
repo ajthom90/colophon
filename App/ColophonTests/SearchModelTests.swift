@@ -183,14 +183,17 @@ struct SearchModelTests {
         #expect(log.serverQueries == ["ar"])       // 2 chars: server fires, once
     }
 
-    /// Entity buckets (Series/Authors/Narrators/Genres/Tags) appear ONLY after the server response,
-    /// in the canonical section order Titles → Series → Authors → Narrators → Genres → Tags.
+    /// Entity buckets (Episodes/Series/Authors/Narrators/Genres/Tags) appear ONLY after the server
+    /// response, in the canonical section order Titles → Episodes → Series → Authors → Narrators →
+    /// Genres → Tags (Task 8 extends this with the `episodes` bucket, right after Titles).
     @Test func entityBucketsAreServerOnlyAndOrdered() async {
         let gate = Gate()
         let row = localRow(id: "i1", title: "The Art of War")
         let fullJSON = #"""
         {
           "book":[{"libraryItem":{"id":"i1","media":{"metadata":{"title":"The Art of War"}}}}],
+          "episodes":[{"libraryItem":{"id":"p1","media":{"metadata":{"title":"A Podcast"}},
+            "recentEpisode":{"id":"e1","title":"Episode One"}}}],
           "series":[{"series":{"id":"s1","name":"Warfare"}}],
           "authors":[{"id":"a1","name":"Sun Tzu","numBooks":1}],
           "narrators":[{"name":"A Narrator","numBooks":2}],
@@ -210,9 +213,87 @@ struct SearchModelTests {
         await gate.release()
         await model.pendingSearch?.value
 
-        #expect(model.populatedSections == [.titles, .series, .authors, .narrators, .genres, .tags])
+        #expect(model.populatedSections ==
+                [.titles, .episodes, .series, .authors, .narrators, .genres, .tags])
+        #expect(model.episodes.map(\.episodeTitle) == ["Episode One"])
         #expect(model.series.map(\.name) == ["Warfare"])
         #expect(model.authors.map(\.name) == ["Sun Tzu"])
         #expect(model.narrators.map(\.name) == ["A Narrator"])
+    }
+
+    // MARK: - Task 8: podcast + episode search buckets
+
+    /// `results.podcast` (a podcast library's `[SearchBookHit]` bucket — the SAME `{libraryItem}`
+    /// wrapper as `book`) merges into `titles` exactly like `book` does, but every merged row is
+    /// marked `isPodcast` — the deferred M1c-a Task 10 fix: podcast libraries previously showed
+    /// ZERO title rows because only `results.book` was merged.
+    @Test func podcastBucketMergesIntoTitlesMarkedAsPodcast() async {
+        let model = SearchModel(
+            localSearch: { _ in [] },
+            serverSearch: { _ in try self.makeResults(#"""
+                {"podcast":[{"libraryItem":{"id":"p1","media":{"duration":1800,
+                "metadata":{"title":"Colophon Test Podcast","author":"Colophon Dev"}}}}]}
+                """#) },
+            debounce: .zero)
+
+        model.updateQuery("colophon")
+        await model.pendingSearch?.value
+
+        #expect(model.titles.count == 1)
+        let row = model.titles[0]
+        #expect(row.id == "p1")
+        #expect(row.isPodcast == true)
+        #expect(row.title == "Colophon Test Podcast")
+        // Podcast shelf-entity metadata reports `author` (singular), not `authorName` — the fallback
+        // must resolve it so the row's subtitle line isn't blank.
+        #expect(row.author == "Colophon Dev")
+        #expect(model.populatedSections == [.titles])   // no episodes bucket in this response
+    }
+
+    /// `results.episodes` populates the `episodes` list — `SearchEpisodeHit.libraryItem` is the
+    /// matched episode's PODCAST, with the matched episode riding in `recentEpisode` (live-verified
+    /// shape, `podcast-search.json`). The row must read podcast id/title from the wrapper and
+    /// episode id/title/duration from `recentEpisode`, NOT the other way around.
+    @Test func episodesBucketPopulatesEpisodesSection() async {
+        let model = SearchModel(
+            localSearch: { _ in [] },
+            serverSearch: { _ in try self.makeResults(#"""
+                {"episodes":[{"libraryItem":{"id":"p1","media":{"metadata":{"title":"Colophon Test Podcast"}},
+                "recentEpisode":{"id":"e1","title":"Episode One: Laying Plans",
+                "audioFile":{"duration":465.397551}}}}]}
+                """#) },
+            debounce: .zero)
+
+        model.updateQuery("laying")
+        await model.pendingSearch?.value
+
+        #expect(model.episodes.count == 1)
+        let row = model.episodes[0]
+        #expect(row.id == "e1")
+        #expect(row.episodeID == "e1")
+        #expect(row.podcastItemID == "p1")
+        #expect(row.episodeTitle == "Episode One: Laying Plans")
+        #expect(row.podcastTitle == "Colophon Test Podcast")
+        #expect(row.duration == 465.397551)   // falls back to the nested `audioFile.duration`
+        #expect(model.populatedSections == [.episodes])   // no titles in this response
+    }
+
+    /// Regression: a book-library response (only the `book` bucket, no `podcast`/`episodes`) is
+    /// unchanged by Task 8 — titles are NOT marked podcast and no Episodes section appears.
+    @Test func bookOnlySearchLeavesTitlesNotPodcastAndNoEpisodesSection() async {
+        let model = SearchModel(
+            localSearch: { _ in [] },
+            serverSearch: { _ in try self.makeResults(#"""
+                {"book":[{"libraryItem":{"id":"i1","media":{"metadata":{"title":"The Art of War"}}}}]}
+                """#) },
+            debounce: .zero)
+
+        model.updateQuery("art")
+        await model.pendingSearch?.value
+
+        #expect(model.titles.count == 1)
+        #expect(model.titles[0].isPodcast == false)
+        #expect(model.episodes.isEmpty)
+        #expect(model.populatedSections == [.titles])
     }
 }
