@@ -962,6 +962,15 @@ final class AppState {
         var lastTotal = 0
         var completed = false
         do {
+            // Fast-path (M2a Task 7, offline-aware browse): the raw network link is down — a real
+            // request below would only fail after the OS's own multi-second connect timeout, which
+            // reads as a hung spinner to the user. Skip straight into the SAME graceful-degradation
+            // catch branch below (a cached library → `refreshBanner`, not a throw; a not-yet-cached
+            // library → the existing `ContentUnavailableView`/retry path) rather than waiting out a
+            // doomed request. `isNetworkAvailable` defaults `true` and is changed only by the
+            // reachability monitor (or its `handleNetworkPathUpdate` test seam), so this is a no-op
+            // for every existing online test/path.
+            guard isNetworkAvailable else { throw ABSError.offline }
             for page in 0..<Self.refreshPageSafetyBound {
                 let result = try await client.items(
                     libraryID: libraryID, limit: limit, page: page,

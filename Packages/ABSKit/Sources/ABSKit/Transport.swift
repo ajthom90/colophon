@@ -64,6 +64,11 @@ public enum ABSError: Error, Equatable {
     case reauthRequired
     case invalidResponse
     case serverTooOld(found: String)
+    /// The raw network link is down (M2a Task 7's `AppState.isNetworkAvailable` fast-path) — a
+    /// distinct case from `notAuthenticated`/`http` so offline-aware browse can show a friendly,
+    /// accurate message instead of "not signed in" or a bogus HTTP status for a request that was
+    /// never actually sent.
+    case offline
 }
 
 extension ABSError: LocalizedError {
@@ -75,6 +80,7 @@ extension ABSError: LocalizedError {
         case .invalidResponse: "The server sent an unexpected response."
         case .serverTooOld(let found):
             "This server runs Audiobookshelf \(found). Colophon requires 2.26.0 or newer."
+        case .offline: "You're offline."
         }
     }
 }

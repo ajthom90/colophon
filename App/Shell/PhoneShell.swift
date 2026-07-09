@@ -37,6 +37,7 @@ struct PhoneShell: View {
             Tab("Home", systemImage: "house") {
                 NavigationStack {
                     HomeView()
+                        .offlineIndicator()
                         .accountMenu()
                 }
             }
@@ -47,14 +48,22 @@ struct PhoneShell: View {
                         selectedLibraryID: $selectedLibraryID,
                         browseMode: $browseMode,
                         initializedConnectionID: $initializedConnectionID)
+                        .offlineIndicator()
                         .accountMenu()
                 }
             }
+            // Downloads (Task 7): a 4th tab per spec §7 — downloaded books/episodes, state, storage,
+            // delete/manage. No offline indicator here: this surface IS the offline-first one (fully
+            // local, nothing here depends on the network), so the banner would be redundant noise.
             Tab("Downloads", systemImage: "arrow.down.circle") {
-                NavigationStack { DownloadsPlaceholder().accountMenu() }
+                NavigationStack { DownloadsView().accountMenu() }
             }
             Tab("Search", systemImage: "magnifyingglass", role: .search) {
-                NavigationStack { SearchView().accountMenu() }
+                NavigationStack {
+                    SearchView()
+                        .offlineIndicator()
+                        .accountMenu()
+                }
             }
         }
         .phoneTabChrome { MiniPlayerBar { showingFullPlayer = true } }

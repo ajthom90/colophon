@@ -147,7 +147,11 @@ struct HomeView: View {
     /// (only surfaces the error state when there's nothing to show).
     private func loadShelves() async {
         guard let library = activeLibrary else { return }
-        guard let client = app.client else {
+        // `app.isNetworkAvailable` (M2a Task 7): with no client this was already offline; with a
+        // client but no network link, a live `personalizedShelves` call would otherwise hang until
+        // the OS's own connect timeout before failing — skip it and degrade immediately instead, so
+        // Home never shows a spinner that outlives the user's patience.
+        guard let client = app.client, app.isNetworkAvailable else {
             if shelves.isEmpty {
                 state = .failed("You're offline — Home shelves need a live connection.")
             }
