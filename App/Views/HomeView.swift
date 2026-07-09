@@ -26,6 +26,14 @@ struct HomeView: View {
     /// this keeps every episode's row distinct so an episode card resolves ITS OWN progress, never a
     /// sibling episode's.
     @State private var progressByItemEpisode: [String: CachedProgress] = [:]
+    /// Book-level download state (M2a Task 8), keyed by `itemID` — feeds `CoverCard`'s badge on a
+    /// book/podcast-item shelf card. Only a book-shaped `CachedDownload` row (`episodeID` empty)
+    /// keys onto an item this way; episode rows feed `downloadStateByItemEpisode` instead.
+    @State private var downloadStateByItem: [String: String] = [:]
+    /// Episode-level download state, keyed by `itemID + "/" + episodeID` (mirrors
+    /// `progressByItemEpisode`) — feeds `EpisodeCard`'s badge with THIS episode's own state, never a
+    /// sibling's.
+    @State private var downloadStateByItemEpisode: [String: String] = [:]
     @State private var state: LoadState = .idle
 
     private enum LoadState: Equatable { case idle, loading, loaded, failed(String) }
@@ -51,6 +59,7 @@ struct HomeView: View {
             .episodeDetailDestination()
             .task(id: app.activeConnectionID) { await observeLibraries() }
             .task(id: app.activeConnectionID) { await observeProgress() }
+            .task(id: app.activeConnectionID) { await observeDownloads() }
             // Reload shelves whenever the active library appears/changes.
             .task(id: activeLibrary?.id) { await loadShelves() }
     }
@@ -91,6 +100,10 @@ struct HomeView: View {
                         progressFor: { itemID in progressByItem[itemID] },
                         episodeProgressFor: { itemID, episodeID in
                             progressByItemEpisode[itemID + "/" + episodeID]
+                        },
+                        downloadStateFor: { itemID in downloadStateByItem[itemID] },
+                        episodeDownloadStateFor: { itemID, episodeID in
+                            downloadStateByItemEpisode[itemID + "/" + episodeID]
                         })
                 }
             }
@@ -142,12 +155,40 @@ struct HomeView: View {
         }
     }
 
+    /// Indexes the connection's downloads TWO ways for the shelf badges (M2a Task 8), mirroring
+    /// `observeProgress`'s split: a book-shaped row (`episodeID` empty) keys `downloadStateByItem`
+    /// directly by `itemID`; an episode-shaped row keys `downloadStateByItemEpisode` by the FULL
+    /// `itemID + "/" + episodeID` so a podcast's several episodes each resolve THEIR OWN state.
+    private func observeDownloads() async {
+        downloadStateByItem = [:]
+        downloadStateByItemEpisode = [:]
+        guard let connectionID = app.activeConnectionID else { return }
+        do {
+            for try await rows in app.cache.observeDownloads(connectionID: connectionID) {
+                downloadStateByItem = Dictionary(
+                    rows.filter { $0.episodeID.isEmpty }.map { ($0.itemID, $0.state) },
+                    uniquingKeysWith: { _, latest in latest })
+                downloadStateByItemEpisode = Dictionary(
+                    rows.filter { !$0.episodeID.isEmpty }
+                        .map { ($0.itemID + "/" + $0.episodeID, $0.state) },
+                    uniquingKeysWith: { _, latest in latest })
+            }
+        } catch {
+            // Best-effort live badges; shelves still paint without them.
+        }
+    }
+
     /// Fetches the active library's personalized shelves and joins `me()` progress so the pills
     /// have data as soon as the shelves paint. Keeps the last-good shelves on a transient failure
     /// (only surfaces the error state when there's nothing to show).
     private func loadShelves() async {
         guard let library = activeLibrary else { return }
-        guard let client = app.client else {
+        // `app.isOffline` (M2a Task 7): the server is KNOWN-unreachable (probe failed — the common
+        // self-hosted "server stopped, device online" case the raw link state can't see). A live
+        // `personalizedShelves` call would only fail after the transport timeout, reading as a hung
+        // spinner — degrade immediately instead. Keyed on `isOffline` (not the raw link, not bare
+        // `!isOnline`), so a healthy launch and the initial in-flight probe both proceed normally.
+        guard let client = app.client, !app.isOffline else {
             if shelves.isEmpty {
                 state = .failed("You're offline — Home shelves need a live connection.")
             }

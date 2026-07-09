@@ -35,15 +35,21 @@ public struct LibraryCacheStore: Sendable {
 
     /// Removes a connection and every row scoped to it — the `cachedConnection` row plus its
     /// `cachedLibrary`, `cachedItem` (and, via the FTS5 `synchronize` trigger, its search-index
-    /// rows), `cachedItemDetail`, `cachedEpisode`, and `cachedProgress` rows — in ONE
-    /// transaction. Used by `AppState.removeConnection` so a "forget this server" leaves no
-    /// orphaned cache behind. Other connections are untouched.
+    /// rows), `cachedItemDetail`, `cachedEpisode`, `cachedProgress`, `cachedDownload`,
+    /// `cachedDownloadFile`, and `cachedLocalSession` rows — in ONE transaction. Used by
+    /// `AppState.removeConnection` so a "forget this server" leaves no orphaned cache (including no
+    /// orphaned downloaded files' bookkeeping and no orphaned pending offline sessions) behind — the
+    /// only place a pending offline session is dropped, a deliberate user-driven purge, not a silent
+    /// loss. Other connections are untouched.
     public func deleteConnection(connectionID: String) throws {
         try pool.write { db in
             _ = try CachedItem.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedItemDetail.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedEpisode.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedProgress.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedDownload.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedDownloadFile.filter(Column("connectionID") == connectionID).deleteAll(db)
+            _ = try CachedLocalSession.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedLibrary.filter(Column("connectionID") == connectionID).deleteAll(db)
             _ = try CachedConnection.filter(Column("id") == connectionID).deleteAll(db)
         }
@@ -93,8 +99,9 @@ public struct LibraryCacheStore: Sendable {
     }
 
     /// Removes a single item (and, via the FTS5 `synchronize` trigger, its search index row),
-    /// plus its `cachedItemDetail` and `cachedEpisode` rows — all in ONE transaction so no
-    /// orphaned detail/episode cache survives the item.
+    /// plus its `cachedItemDetail`, `cachedEpisode`, `cachedDownload`, and `cachedDownloadFile`
+    /// rows — all in ONE transaction so no orphaned detail/episode/download cache survives the
+    /// item.
     public func deleteItem(connectionID: String, itemID: String) throws {
         try pool.write { db in
             _ = try CachedItem.filter(Column("connectionID") == connectionID
@@ -103,6 +110,10 @@ public struct LibraryCacheStore: Sendable {
                                              && Column("itemID") == itemID).deleteAll(db)
             _ = try CachedEpisode.filter(Column("connectionID") == connectionID
                                           && Column("itemID") == itemID).deleteAll(db)
+            _ = try CachedDownload.filter(Column("connectionID") == connectionID
+                                           && Column("itemID") == itemID).deleteAll(db)
+            _ = try CachedDownloadFile.filter(Column("connectionID") == connectionID
+                                               && Column("itemID") == itemID).deleteAll(db)
         }
     }
 
@@ -128,6 +139,16 @@ public struct LibraryCacheStore: Sendable {
         try pool.read {
             try CachedItem.filter(Column("connectionID") == connectionID && Column("libraryID") == libraryID)
                 .order(Column("title").collating(.localizedCaseInsensitiveCompare)).fetchAll($0)
+        }
+    }
+
+    /// One browse-row item by its `(connectionID, id)` primary key, or nil if the item was never
+    /// cached. Offline playback (M2a Task 5) reads it for the now-playing title/author of a
+    /// downloaded book (the pinned `CachedItemDetail` carries chapters/description but not the
+    /// title/author, which live on this row).
+    public func item(connectionID: String, itemID: String) throws -> CachedItem? {
+        try pool.read {
+            try CachedItem.fetchOne($0, key: ["connectionID": connectionID, "id": itemID])
         }
     }
 
@@ -250,5 +271,127 @@ public struct LibraryCacheStore: Sendable {
         try pool.read { db in
             try CachedItemPref.fetchOne(db, key: ["connectionID": connectionID, "itemID": itemID])?.playbackRate
         }
+    }
+
+    // MARK: - v4: download records
+
+    /// Upserts a download's AGGREGATE (parent) row — e.g. a state transition (`queued` →
+    /// `downloading` → `downloaded`/`failed`) or an aggregate byte-count tick. Does not touch
+    /// this download's per-file rows; see `upsertDownloadFile` for those.
+    public func upsertDownload(_ download: CachedDownload) throws {
+        try pool.write { try download.upsert($0) }
+    }
+
+    /// Upserts one file's row within a download's per-file breakdown — e.g. a single file's
+    /// progress tick or terminal state. Does not touch the parent `cachedDownload` row or any
+    /// sibling file; the caller (`DownloadCoordinator`, Task 4) keeps the parent's aggregate
+    /// state/bytes in sync separately via `upsertDownload`.
+    public func upsertDownloadFile(_ file: CachedDownloadFile) throws {
+        try pool.write { try file.upsert($0) }
+    }
+
+    /// One download's parent row plus its full per-file breakdown (ordered by `trackIndex`), or
+    /// nil if no download exists at this key.
+    public func download(
+        connectionID: String, itemID: String, episodeID: String? = nil
+    ) throws -> CachedDownloadWithFiles? {
+        try pool.read { db in
+            let episodeID = episodeID ?? ""
+            guard let parent = try CachedDownload.fetchOne(db, key: [
+                "connectionID": connectionID, "itemID": itemID, "episodeID": episodeID,
+            ]) else { return nil }
+            let files = try CachedDownloadFile
+                .filter(Column("connectionID") == connectionID
+                        && Column("itemID") == itemID
+                        && Column("episodeID") == episodeID)
+                .order(Column("trackIndex"))
+                .fetchAll(db)
+            return CachedDownloadWithFiles(download: parent, files: files)
+        }
+    }
+
+    /// Every download's parent row for a connection (books + podcast episodes), newest-updated
+    /// first — the Downloads tab's listing. Parent rows only; call
+    /// `download(connectionID:itemID:episodeID:)` for one download's file breakdown.
+    public func downloads(connectionID: String) throws -> [CachedDownload] {
+        try pool.read {
+            try CachedDownload.filter(Column("connectionID") == connectionID)
+                .order(Column("updatedAt").desc)
+                .fetchAll($0)
+        }
+    }
+
+    /// Live stream of a connection's downloads — mirrors `observeItems`'/`observeEpisodes`'s role
+    /// for the Downloads tab: an `upsertDownload` (a progress tick or state transition) repaints
+    /// instantly with no refetch needed by the observer.
+    public func observeDownloads(connectionID: String) -> AsyncValueObservation<[CachedDownload]> {
+        ValueObservation.tracking { db in
+            try CachedDownload.filter(Column("connectionID") == connectionID)
+                .order(Column("updatedAt").desc)
+                .fetchAll(db)
+        }.values(in: pool)
+    }
+
+    /// Removes a download's parent row plus its full per-file breakdown in ONE transaction — no
+    /// orphaned `cachedDownloadFile` rows survive a delete.
+    public func deleteDownload(connectionID: String, itemID: String, episodeID: String? = nil) throws {
+        try pool.write { db in
+            let episodeID = episodeID ?? ""
+            _ = try CachedDownload.filter(Column("connectionID") == connectionID
+                                           && Column("itemID") == itemID
+                                           && Column("episodeID") == episodeID).deleteAll(db)
+            _ = try CachedDownloadFile.filter(Column("connectionID") == connectionID
+                                               && Column("itemID") == itemID
+                                               && Column("episodeID") == episodeID).deleteAll(db)
+        }
+    }
+
+    /// Sum of `receivedBytes` across every FILE row (`cachedDownloadFile`) for a connection — the
+    /// Downloads tab's total-storage figure. Sums the file rows (the actual on-disk bytes)
+    /// rather than the parent `cachedDownload` rows' aggregate counters, so storage is accurate
+    /// even if a caller's aggregate bookkeeping ever lags.
+    public func totalDownloadedBytes(connectionID: String) throws -> Int {
+        try pool.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COALESCE(SUM(receivedBytes), 0) FROM cachedDownloadFile WHERE connectionID = ?",
+                arguments: [connectionID]
+            ) ?? 0
+        }
+    }
+
+    // MARK: - v5: persisted offline local sessions (Task 6)
+
+    /// Upserts one offline `cachedLocalSession` row by its client-generated UUID (`id`). Used both
+    /// to INSERT a fresh session (first accrual tick of a new offline playback) and to UPDATE the
+    /// current session (subsequent ticks bump `currentTime`/`timeListening`/`updatedAt`). The caller
+    /// owns the ACCUMULATION of `timeListening` (read-modify-write of the row's running total) — this
+    /// is a plain full-row upsert, so a caller MUST pass the already-accumulated total, not a delta.
+    public func upsertLocalSession(_ session: CachedLocalSession) throws {
+        try pool.write { try session.upsert($0) }
+    }
+
+    /// One offline session by its UUID, or nil — the read half of the accrual read-modify-write, and
+    /// the reconcile's re-read to detect a tick that landed mid-reconcile (an advanced `updatedAt`).
+    public func localSession(id: String) throws -> CachedLocalSession? {
+        try pool.read { try CachedLocalSession.fetchOne($0, key: id) }
+    }
+
+    /// Every pending offline session for a connection, oldest-started first — the reconcile's input
+    /// set (each becomes a `LocalPlaybackSession` posted to `POST /api/session/local-all`). Ordered
+    /// by `startedAt` so a stable, chronological batch is posted.
+    public func localSessions(connectionID: String) throws -> [CachedLocalSession] {
+        try pool.read {
+            try CachedLocalSession.filter(Column("connectionID") == connectionID)
+                .order(Column("startedAt"))
+                .fetchAll($0)
+        }
+    }
+
+    /// Prunes ONE offline session by its UUID — called after the server accepts it
+    /// (`LocalSessionSyncResult.success == true`). A rejected/failed session is deliberately NOT
+    /// pruned (its offline listen time is never silently dropped — Task 3/6 contract).
+    public func deleteLocalSession(id: String) throws {
+        try pool.write { _ = try CachedLocalSession.filter(key: id).deleteAll($0) }
     }
 }

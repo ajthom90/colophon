@@ -28,6 +28,11 @@ struct CoverCard: View {
     /// "podcast"`). A podcast card pushes `PodcastDetailRoute` → `PodcastDetailView` (the episode
     /// list), NOT the book `ItemDetailView`, and drops the book-only queue context menu.
     var isPodcast: Bool = false
+    /// This item's own `CachedDownload.state` (M2a Task 8), or `nil` — feeds the compact, opaque
+    /// `DownloadStateBadge` overlay so a user browsing sees what's offline-available at a glance
+    /// (only a book has a whole-item download; a podcast's episodes download individually, so a
+    /// podcast card's caller has nothing meaningful to pass and the badge never shows for one).
+    var downloadState: String? = nil
 
     static let width: CGFloat = 150
 
@@ -83,6 +88,9 @@ struct CoverCard: View {
             CachedCoverView(itemID: itemID, updatedAt: updatedAt)
                 .frame(width: Self.width, height: Self.width)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(alignment: .topTrailing) {
+                    DownloadStateBadge(state: downloadState).padding(6)
+                }
                 .overlay(alignment: .bottom) {
                     if let fraction {
                         ProgressView(value: fraction)
@@ -197,6 +205,10 @@ struct EpisodeCard: View {
     /// 3-part `(itemID, episodeID)` key — NOT `CoverCard`'s item-collapsed lookup, which would return
     /// the wrong row for a podcast item that has several episodes sharing one `itemID`.
     let progress: CachedProgress?
+    /// This EPISODE's own `CachedDownload.state` (M2a Task 8), or `nil` — resolved by the caller via
+    /// the same `(itemID, episodeID)` key as `progress` (a podcast's episodes download individually,
+    /// so this must never collapse to the item-level lookup `CoverCard` uses for a book).
+    var downloadState: String? = nil
 
     static let width: CGFloat = CoverCard.width
 
@@ -225,6 +237,9 @@ struct EpisodeCard: View {
             CachedCoverView(itemID: podcastItemID, updatedAt: updatedAt)
                 .frame(width: Self.width, height: Self.width)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
+                .overlay(alignment: .topTrailing) {
+                    DownloadStateBadge(state: downloadState).padding(6)
+                }
                 .overlay(alignment: .bottom) {
                     if let fraction {
                         ProgressView(value: fraction)

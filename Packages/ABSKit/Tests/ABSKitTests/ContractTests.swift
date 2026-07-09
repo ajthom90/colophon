@@ -16,6 +16,27 @@ struct ContractTests {
         return ABSClient(baseURL: base, transport: transport, auth: auth)
     }
 
+    /// Raw `/api/me` progress lookup keyed by `(libraryItemId, episodeId)`, surfacing the
+    /// mediaProgress record's own server-assigned `id` — needed for `DELETE /api/me/progress/:id`
+    /// reset cleanup, but not otherwise modeled on the public `MediaProgressEntry` (Task 3 scope
+    /// is `fileDownloadURL`/`syncLocalSessions`/`progressReconcileView`, not a progress-deletion
+    /// API), so this reaches into `ABSClient`'s internal `get`/`authorizedData` via `@testable`.
+    private func rawMediaProgress(_ client: ABSClient, libraryItemId: String, episodeId: String?) async throws -> (id: String, currentTime: Double?)? {
+        let data = try await client.authorizedData(client.get("api/me"))
+        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let progress = object["mediaProgress"] as? [[String: Any]] else { return nil }
+        guard let match = progress.first(where: {
+            ($0["libraryItemId"] as? String) == libraryItemId && ($0["episodeId"] as? String) == episodeId
+        }), let id = match["id"] as? String else { return nil }
+        return (id: id, currentTime: match["currentTime"] as? Double)
+    }
+
+    private func deleteMediaProgress(_ client: ABSClient, id: String) async throws {
+        var req = URLRequest(url: client.baseURL.appending(path: "api/me/progress/\(id)"))
+        req.httpMethod = "DELETE"
+        _ = try await client.authorizedData(req)
+    }
+
     @Test func statusReportsSupportedVersion() async throws {
         let status = try await ABSClient.status(baseURL: base, transport: transport)
         #expect(status.isInit == true)
@@ -216,5 +237,86 @@ struct ContractTests {
         // Leave the seed clean: close the session immediately (no sync — avoid leaving progress).
         try await client.closeSession(id: session.id, currentTime: session.startTime,
                                       timeListened: 0, duration: session.duration)
+    }
+
+    // MARK: - M2a Task 3: file-download URL + local-session batch reconcile
+
+    /// Live-verifies `fileDownloadURL`: gets a real track's `ino` from a `/play` session's
+    /// `audioTracks[].contentUrl` (`/api/items/:id/file/:ino` — the SAME `:ino` value the
+    /// download route keys on, just without the `/download` suffix), builds the download URL,
+    /// and confirms it serves real audio bytes over a request that carries NO Authorization
+    /// header at all — proving the query `token` alone is what authorizes it (this is exactly
+    /// how Task 4's background `URLSession` will call it: no shared session, no Bearer header).
+    /// Closes the session immediately after (no sync) so the dev seed is left exactly as found.
+    @Test func fileDownloadURLServesAudioBytesLive() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let bookLib = try #require(libs.first { $0.mediaType == "book" })
+        let page = try await client.items(libraryID: bookLib.id, limit: 1, page: 0)
+        let itemID = try #require(page.results.first?.id)
+
+        // A DISTINCT deviceId from `fullPlaybackLifecycle`'s "contract-test": Swift Testing runs
+        // suite tests concurrently, and ABS evicts/closes a device's prior open session when the
+        // SAME deviceId starts a new one — reusing that id here intermittently 404'd the other
+        // test's later sync/close calls (observed live this task).
+        let device = DeviceInfo(deviceId: "contract-test-file-download", clientVersion: "0.1.0", model: "test")
+        let envelope = try await client.startPlayback(itemID: itemID, deviceInfo: device)
+        let track = try #require(envelope.session.audioTracks.first)
+        let ino = try #require(track.contentUrl?.split(separator: "/").last).description
+
+        let url = try await client.fileDownloadURL(itemID: itemID, ino: ino)
+        #expect(url.path == "/api/items/\(itemID)/file/\(ino)/download")
+        #expect(url.query?.hasPrefix("token=") == true)
+
+        let response = try await transport.send(URLRequest(url: url))   // no Authorization header
+        #expect(response.statusCode == 200, "expected the query token alone to authorize the download")
+        #expect(response.data.count > 1_000, "expected real audio bytes, not an error body")
+        let contentType = response.headers.first { $0.key.lowercased() == "content-type" }?.value
+        #expect(contentType?.hasPrefix("audio/") == true, "expected an audio content-type, got \(contentType ?? "nil")")
+
+        try await client.closeSession(id: envelope.session.id, currentTime: envelope.session.startTime,
+                                      timeListened: 0, duration: envelope.session.duration)
+    }
+
+    /// Live-verifies `syncLocalSessions`: POSTs a `local-all` batch for a throwaway offline
+    /// session against a real seeded book, confirms `/api/me` reflects the synced `currentTime`,
+    /// then RESETS by deleting that mediaProgress record (`DELETE /api/me/progress/:id`) so the
+    /// seed ends up clean — no lingering test-authored progress. `updatedAt` is real wall-clock
+    /// "now" (not a fixed past value) because the server's reconcile is itself last-write-wins
+    /// (`PlaybackSessionManager.syncLocalSession`: it SKIPS the progress update if the existing
+    /// record's `updatedAt` is already newer) — this book already carries progress from earlier
+    /// contract runs, so only a genuinely newer timestamp is guaranteed to win and apply.
+    @Test func syncLocalSessionsBatchReconcilesLiveThenResets() async throws {
+        let client = try await loggedInClient()
+        let libs = try await client.libraries()
+        let bookLib = try #require(libs.first { $0.mediaType == "book" })
+        let page = try await client.items(libraryID: bookLib.id, limit: 1, page: 0)
+        let itemID = try #require(page.results.first?.id)
+        let detail = try await client.item(id: itemID)
+        let duration = try #require(detail.media.duration)
+        let currentTime = min(500, duration / 2)
+
+        let nowMillis = Int(Date().timeIntervalSince1970 * 1000)
+        let session = LocalPlaybackSession(
+            libraryItemId: itemID, mediaType: "book",
+            currentTime: currentTime, timeListened: 60, duration: duration,
+            deviceInfo: DeviceInfo(deviceId: "contract-test-local-all", clientVersion: "0.1.0", model: "test"),
+            startedAt: nowMillis - 60_000, updatedAt: nowMillis)
+
+        let results = try await client.syncLocalSessions([session])
+        #expect(results.count == 1, "server must return one result per posted session")
+        let result = try #require(results.first)
+        #expect(result.id == session.id, "the server echoes back the posted session id")
+        #expect(result.success == true, "a valid seeded item must sync successfully")
+        #expect(result.error == nil)
+
+        let synced = try #require(await rawMediaProgress(client, libraryItemId: itemID, episodeId: nil),
+                                  "expected /api/me to carry progress for this item after the batch sync")
+        #expect(synced.currentTime == currentTime)
+
+        // Reset: delete the progress record entirely so the seed is left clean.
+        try await deleteMediaProgress(client, id: synced.id)
+        let cleaned = try await rawMediaProgress(client, libraryItemId: itemID, episodeId: nil)
+        #expect(cleaned == nil, "progress must be gone after reset")
     }
 }

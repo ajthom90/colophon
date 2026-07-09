@@ -89,6 +89,42 @@ public struct ExpandedItemMedia: Decodable, Sendable {
     public let metadata: ExpandedItemMetadata
     /// Chapter marks in GLOBAL book seconds (`{id,start,end,title}`), for the chapters preview.
     public let chapters: [Chapter]?
+    /// The item's on-disk audio files (`media.audioFiles[]` from `?expanded=1`) — each carries the
+    /// `ino` the per-file download route (`/api/items/:id/file/:ino/download`) keys on, plus its
+    /// `index` (1-based track order) and `metadata.ext`. Optional/tolerant: a lean projection that
+    /// omits it (search/shelf entities) still decodes; only the offline-download orchestrator
+    /// (`DownloadCoordinator`) reads it.
+    public let audioFiles: [AudioFileInfo]?
+}
+
+/// One entry of an item's `media.audioFiles[]` (a book) or an episode's `audioFile` (a podcast) —
+/// the minimum the offline-download orchestrator needs to enumerate and fetch a file: its `ino`
+/// (the per-file download route's key), its `index` (track order), the `metadata.ext`/`size`, and
+/// the `mimeType`. Everything else the server sends (scan tags, birthtimes, embedded cover art) is
+/// dropped by tolerant decoding.
+public struct AudioFileInfo: Decodable, Sendable {
+    /// 1-based track order within the item's file list (`1` for the first file in the live shape).
+    public let index: Int?
+    /// The file's inode string — the key the download route uses (`/file/:ino/download`).
+    public let ino: String
+    public let metadata: AudioFileMetadata?
+    public let mimeType: String?
+    public let duration: Double?
+
+    /// The file extension WITHOUT a leading dot (`"mp3"` from a `metadata.ext` of `".mp3"`), or
+    /// `nil` when the server omits it. Callers building a local filename append `.<fileExtension>`.
+    public var fileExtension: String? {
+        guard let ext = metadata?.ext, !ext.isEmpty else { return nil }
+        return ext.hasPrefix(".") ? String(ext.dropFirst()) : ext
+    }
+}
+
+/// The nested `metadata` block of an `AudioFileInfo` — only `ext`/`filename`/`size` matter to the
+/// downloader; the rest of the server's file-scan metadata is dropped by tolerant decoding.
+public struct AudioFileMetadata: Decodable, Sendable {
+    public let ext: String?
+    public let filename: String?
+    public let size: Int?
 }
 
 /// Expanded book metadata. `authorName`/`narratorName`/`seriesName` are server-computed
@@ -147,6 +183,39 @@ public struct PlaybackSession: Decodable, Sendable {
     public let playMethod: Int
     public let audioTracks: [AudioTrack]
     public let chapters: [Chapter]
+
+    /// LOCAL constructor (M2a Task 5): builds a `PlaybackSession` for OFFLINE playback of a
+    /// fully-downloaded item — one that never had a server `/play` round trip. The app assembles it
+    /// from cached pieces (local `file://` tracks, the pinned detail's chapters, `cachedProgress`'s
+    /// resume `startTime`) and hands it to `PlayerEngine.load(session:trackURLs:)` unchanged, with
+    /// `playMethod` = `LocalPlaybackSession.playMethodLocal` (ABS `PlayMethod.LOCAL`, `3`). This is
+    /// additive: the decoder's synthesized `init(from:)` is untouched (the streaming path still
+    /// decodes the server envelope).
+    public init(
+        id: String,
+        libraryItemId: String,
+        episodeId: String? = nil,
+        displayTitle: String?,
+        displayAuthor: String?,
+        duration: Double,
+        startTime: Double,
+        currentTime: Double? = nil,
+        playMethod: Int,
+        audioTracks: [AudioTrack],
+        chapters: [Chapter]
+    ) {
+        self.id = id
+        self.libraryItemId = libraryItemId
+        self.episodeId = episodeId
+        self.displayTitle = displayTitle
+        self.displayAuthor = displayAuthor
+        self.duration = duration
+        self.startTime = startTime
+        self.currentTime = currentTime
+        self.playMethod = playMethod
+        self.audioTracks = audioTracks
+        self.chapters = chapters
+    }
 }
 
 public struct AudioTrack: Decodable, Sendable {
@@ -156,6 +225,25 @@ public struct AudioTrack: Decodable, Sendable {
     public let title: String?
     public let contentUrl: String?
     public let mimeType: String?
+
+    /// Memberwise constructor for a LOCALLY-built track (M2a Task 5) — the offline path synthesizes
+    /// tracks from cached per-file durations (`contentUrl` is nil: local playback feeds `file://`
+    /// URLs directly to the player, never resolving a server content path).
+    public init(
+        index: Int,
+        startOffset: Double,
+        duration: Double,
+        title: String? = nil,
+        contentUrl: String? = nil,
+        mimeType: String? = nil
+    ) {
+        self.index = index
+        self.startOffset = startOffset
+        self.duration = duration
+        self.title = title
+        self.contentUrl = contentUrl
+        self.mimeType = mimeType
+    }
 }
 
 public struct Chapter: Decodable, Sendable, Identifiable {
@@ -163,6 +251,15 @@ public struct Chapter: Decodable, Sendable, Identifiable {
     public let start: Double
     public let end: Double
     public let title: String?
+
+    /// Memberwise constructor (M2a Task 5) — lets the offline path rebuild chapters from the pinned
+    /// `CachedItemDetail`'s cached `{id,start,end,title}` marks. Additive; the decoder is untouched.
+    public init(id: Int, start: Double, end: Double, title: String? = nil) {
+        self.id = id
+        self.start = start
+        self.end = end
+        self.title = title
+    }
 }
 
 // MARK: - Browse, search, and me (Task 5)
@@ -570,14 +667,18 @@ public struct PodcastMetadata: Decodable, Sendable {
 /// (M1c-c Task 1). `season`/`episode` are STRINGS (`"1"`, not `1` — a live correction over the
 /// M1c-a source-only guess, matching `ShelfEpisodeEntity.RecentEpisodeRef` and the `cachedEpisode`
 /// table's `season`/`episode` columns). `enclosure.length` is likewise a STRING (`"3723859"`).
-/// `audioFile`/`audioTrack` (the server's internal per-file scan metadata) are intentionally NOT
-/// modeled here — playback goes through `ABSClient.playEpisode`'s own session envelope
-/// (`audioTracks`), not the RSS enclosure or file-scan metadata; tolerant decoding drops them.
+/// `audioTrack` (the server's internal per-track scan metadata) is intentionally NOT modeled here —
+/// PLAYBACK goes through `ABSClient.playEpisode`'s own session envelope (`audioTracks`). The single
+/// `audioFile`, however, IS modeled (M2a): its `ino` is what the per-file download route keys on, so
+/// the offline downloader reads `episode.audioFile.ino` to enqueue a podcast episode's one file.
 public struct PodcastEpisode: Decodable, Sendable, Identifiable {
     public let id: String
     /// The owning podcast's library-item id (the `itemID` half of the 3-part `cachedProgress` PK).
     public let libraryItemId: String?
     public let podcastId: String?
+    /// The episode's single downloadable audio file (`ino`/`ext`/`size`), for offline download —
+    /// distinct from the streaming `audioTrack`. Optional/tolerant: absent in search/shelf projections.
+    public let audioFile: AudioFileInfo?
     /// Track index within the season/feed; `null` in the live capture (kept optional).
     public let index: Int?
     public let season: String?
@@ -616,4 +717,99 @@ public struct DeviceInfo: Encodable, Sendable {
         self.deviceId = deviceId; self.clientName = clientName
         self.clientVersion = clientVersion; self.manufacturer = manufacturer; self.model = model
     }
+}
+
+// MARK: - Local-session batch reconcile (M2a Task 3)
+
+/// The client-synthesized local-session payload for OFFLINE playback of downloaded audio —
+/// distinct from `PlaybackSessionEnvelope.rawData` (the SERVER's own `/play` response, replayed
+/// back through `ABSClient.postLocalSession`'s upsert): a session that started fully offline
+/// never had a server `/play` call to capture, so this models the full shape the server's
+/// `PlaybackSession` constructor consumes for BOTH `POST /api/session/local` (a lone instance)
+/// and `POST /api/session/local-all` (the array in `{sessions, deviceInfo}`) — verified against
+/// ABS `PlaybackSessionManager.syncLocalSession`'s `construct(session)`, which reads exactly
+/// `id`/`libraryItemId`/`episodeId`/`mediaType`/`duration`/`playMethod`/`deviceInfo`/
+/// `timeListening`/`startTime`/`currentTime`/`startedAt`/`updatedAt` off the incoming object
+/// (NOT `audioTracks` — a local session never streamed, so there is nothing to enumerate).
+///
+/// - `id` is a CLIENT-GENERATED UUID (spec §3's "client-generated UUID id") — the server has
+///   never seen this session, so there is no server id to reuse.
+/// - `playMethod` defaults to `playMethodLocal` (`3`, ABS's `PlayMethod.LOCAL` — confirmed
+///   against the live dev server's source, `server/utils/constants.js`; `0`/`1`/`2` are
+///   direct-play/direct-stream/transcode, all meaningless for audio that was never streamed
+///   from the server).
+/// - `timeListened` encodes as `timeListening` (the server's field name here — matches
+///   `postLocalSession`'s `object["timeListening"]`), NOT `timeListened` — that key name is only
+///   for the UNRELATED `/session/:id/sync`+`/close` delta-payload shape
+///   (`ABSClient.postSessionPayload`), a different endpoint family with a different body shape.
+public struct LocalPlaybackSession: Encodable, Sendable {
+    /// ABS's `PlayMethod.LOCAL` (server `server/utils/constants.js`), confirmed live this task.
+    public static let playMethodLocal = 3
+
+    public let id: String
+    public let libraryItemId: String
+    public let episodeId: String?
+    public let mediaType: String
+    public let currentTime: Double
+    public let timeListened: Double
+    public let duration: Double
+    public let playMethod: Int
+    public let deviceInfo: DeviceInfo
+    public let startedAt: Int
+    public let updatedAt: Int
+
+    enum CodingKeys: String, CodingKey {
+        case id, libraryItemId, episodeId, mediaType, currentTime
+        case timeListened = "timeListening"
+        case duration, playMethod, deviceInfo, startedAt, updatedAt
+    }
+
+    public init(
+        id: String = UUID().uuidString,
+        libraryItemId: String,
+        episodeId: String? = nil,
+        mediaType: String,
+        currentTime: Double,
+        timeListened: Double,
+        duration: Double,
+        deviceInfo: DeviceInfo,
+        startedAt: Int,
+        updatedAt: Int,
+        playMethod: Int = LocalPlaybackSession.playMethodLocal
+    ) {
+        self.id = id
+        self.libraryItemId = libraryItemId
+        self.episodeId = episodeId
+        self.mediaType = mediaType
+        self.currentTime = currentTime
+        self.timeListened = timeListened
+        self.duration = duration
+        self.playMethod = playMethod
+        self.deviceInfo = deviceInfo
+        self.startedAt = startedAt
+        self.updatedAt = updatedAt
+    }
+}
+
+/// One entry of `POST /api/session/local-all`'s `{results: […]}` response — the server's verdict
+/// on a SINGLE session in the batch. `POST /api/session/local-all` always answers HTTP 200 even
+/// when individual sessions fail (verified against ABS
+/// `PlaybackSessionManager.syncLocalSessionsRequest`, which pushes one of these per input session
+/// into a `syncResults` array: `{id, success, progressSynced}` on success, `{id, success:false,
+/// error}` on failure — e.g. `"Media item not found"` when the offline source item was deleted or
+/// moved server-side). Task 6's reconcile prunes a local session from its queue ONLY when the
+/// matching result's `success` is `true`, so a rejected session's offline listen time is
+/// re-queued/surfaced rather than silently dropped. Tolerant decode: `error` (and any unmodeled
+/// server field like `progressSynced`) is optional/ignored.
+public struct LocalSessionSyncResult: Decodable, Sendable, Identifiable {
+    /// The session id the server echoes back — matches the `LocalPlaybackSession.id` that was
+    /// posted, so Task 6 can map a result to the exact queued session to prune.
+    public let id: String
+    public let success: Bool
+    public let error: String?
+}
+
+/// The `{results: […]}` envelope `POST /api/session/local-all` wraps its per-session verdicts in.
+struct LocalSessionSyncResponse: Decodable, Sendable {
+    let results: [LocalSessionSyncResult]
 }

@@ -144,6 +144,17 @@ public final class ABSClient: Sendable {
         try await authorizedSend(get("api/me"), as: MeUser.self)
     }
 
+    /// A typed, keyed view over `me()`'s `mediaProgress[]` for last-write-wins reconcile
+    /// (Task 6): callers look up a pending local session's server-side counterpart by
+    /// `(libraryItemId, episodeId)` and compare `MediaProgressEntry.lastUpdate` against the local
+    /// session's `updatedAt` — newer SERVER progress wins locally (spec §3); otherwise the local
+    /// session is what still needs pushing via `syncLocalSessions`. Built from a SINGLE `me()`
+    /// call — `me()` already exists and already carries everything needed, so this never
+    /// refetches redundantly.
+    public func progressReconcileView() async throws -> ProgressReconcileView {
+        ProgressReconcileView(entries: try await me().mediaProgress ?? [])
+    }
+
     public func coverURL(itemID: String, width: Int, updatedAt: Int?) -> URL {
         var comps = URLComponents(url: baseURL.appending(path: "api/items/\(itemID)/cover"),
                                   resolvingAgainstBaseURL: false)!
@@ -166,6 +177,33 @@ public final class ABSClient: Sendable {
         var comps = URLComponents(url: baseURL.appending(path: "api/authors/\(authorID)/image"),
                                   resolvingAgainstBaseURL: false)!
         comps.queryItems = [.init(name: "width", value: String(width))]
+        return comps.url!
+    }
+
+    /// `GET /api/items/:id/file/:ino/download?token=<accessToken>` — the per-file download route
+    /// (NEVER the zip endpoint; range/resume is server-supported via Express `sendFile`).
+    /// Downloads run in a background `URLSession` OUTSIDE this client's authorized-request
+    /// machinery (Task 4's `DownloadCoordinator`/`DownloadManager` — no shared session, no
+    /// Bearer-header 401-refresh loop reachable from a background delegate callback), so the
+    /// token travels as a plain `token` query parameter instead of an `Authorization` header —
+    /// unlike `coverURL`/`authorImageURL` (genuinely unauthenticated), this endpoint IS gated, so
+    /// the token is required. `async throws` (not a plain URL builder) because it needs a live
+    /// access token (`auth.currentAccessToken()`) — the SAME auth source every other
+    /// authenticated call uses, just carried differently for this one background-session caller.
+    /// `URLComponents.queryItems` percent-encodes the token correctly (it may contain JWT
+    /// characters like `.`/`-`/`_`); `URL.appending(path:)` does the same for `itemID`/`ino`.
+    ///
+    /// **Credential handling (Task 4 MUST honor):** the embedded `token` is the live access token
+    /// — a Bearer-EQUIVALENT credential that grants full API access, and one that EXPIRES (~1h
+    /// server-side). So a returned URL is short-lived and secret: Task 4 must re-derive it (call
+    /// this again) immediately before each (re)transfer or resume — a URL captured earlier can
+    /// carry a stale/expired token and 401 — and must NEVER log, persist, or surface the full URL
+    /// (it embeds the credential in the query string). Log the item/ino, not the URL.
+    public func fileDownloadURL(itemID: String, ino: String) async throws -> URL {
+        let token = try await auth.currentAccessToken()
+        var comps = URLComponents(url: baseURL.appending(path: "api/items/\(itemID)/file/\(ino)/download"),
+                                  resolvingAgainstBaseURL: false)!
+        comps.queryItems = [.init(name: "token", value: token)]
         return comps.url!
     }
 
@@ -203,6 +241,51 @@ public struct PlaybackSessionEnvelope: Sendable {
     public let session: PlaybackSession
     public let rawData: Data
     public init(session: PlaybackSession, rawData: Data) { self.session = session; self.rawData = rawData }
+}
+
+/// A keyed view over `MeUser.mediaProgress[]`, built by `ABSClient.progressReconcileView()`, so
+/// the offline reconcile (Task 6) can look up a pending local session's server-side counterpart in
+/// O(1) and compare `MediaProgressEntry.lastUpdate` against the local session's `updatedAt`.
+///
+/// **Key normalization (load-bearing):** the lookup key `episodeID` is normalized to a
+/// NON-optional `String` with `""` meaning "book / no episode" — the EXACT convention
+/// `LibraryCache.CachedProgress.episodeID` uses (which stores `episodeID ?? ""`). `me()`'s own
+/// `episodeId` is `nil` for a book, so this maps `nil → ""` on both insert and lookup; without
+/// that, a Task-6 lookup keyed by a `CachedProgress.episodeID` of `""` would never match a book's
+/// `me()` entry (`Optional("") != Optional.none`) and last-write-wins would silently never fire
+/// for ANY book. Call `progress(itemID:episodeID:)` with a `CachedProgress.episodeID` value
+/// directly — it needs no `nil`/`""` massaging at the call site.
+public struct ProgressReconcileView: Sendable {
+    struct Key: Hashable, Sendable { let libraryItemId: String; let episodeID: String }
+    private let byKey: [Key: MediaProgressEntry]
+
+    /// Normalizes an optional episode id (`me()`'s `nil`, or a `CachedProgress.episodeID` that is
+    /// already `""` for a book) to the single `""`-for-book convention both sides share.
+    private static func normalize(_ episodeID: String?) -> String {
+        (episodeID?.isEmpty ?? true) ? "" : episodeID!
+    }
+
+    init(entries: [MediaProgressEntry]) {
+        var map: [Key: MediaProgressEntry] = [:]
+        for entry in entries {
+            map[Key(libraryItemId: entry.libraryItemId, episodeID: Self.normalize(entry.episodeId))] = entry
+        }
+        byKey = map
+    }
+
+    /// The server's progress for this item/episode, if any — the accessor Task 6 calls with a
+    /// `CachedProgress.episodeID` (a non-optional `String`, `""` = book; `nil` also accepted and
+    /// treated identically). `nil` return means the server has no record — a brand-new local
+    /// session with nothing to reconcile against, always safe to push.
+    public func progress(itemID: String, episodeID: String? = nil) -> MediaProgressEntry? {
+        byKey[Key(libraryItemId: itemID, episodeID: Self.normalize(episodeID))]
+    }
+
+    /// Convenience subscript equivalent to `progress(itemID:episodeID:)` (same `""`==book==nil
+    /// normalization), kept for terse call sites and tests.
+    public subscript(itemID: String, episodeID: String? = nil) -> MediaProgressEntry? {
+        progress(itemID: itemID, episodeID: episodeID)
+    }
 }
 
 extension ABSClient {
@@ -274,6 +357,38 @@ extension ABSClient {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: object)
         _ = try await authorizedData(req)
+    }
+
+    /// `POST /api/session/local-all` `{sessions, deviceInfo}` — batch counterpart to
+    /// `postLocalSession`'s single-session upsert, for reconciling many offline-accrued local
+    /// sessions in one round trip after a reconnect (Task 6). Returns the server's PER-SESSION
+    /// results — this is load-bearing, NOT cosmetic: `POST /api/session/local-all` always answers
+    /// HTTP 200 even when INDIVIDUAL sessions are rejected (e.g. the source item was deleted or
+    /// moved on the server while the device was offline → `"Media item not found"`), so a bare
+    /// "didn't throw" would make a permanently-rejected session indistinguishable from a synced
+    /// one. Task 6 MUST prune only the sessions whose `LocalSessionSyncResult.success == true`,
+    /// re-queueing (or surfacing) the rest, so their offline listening time is never silently
+    /// lost. Verified against ABS `PlaybackSessionManager.syncLocalSessionsRequest`/
+    /// `syncLocalSession`: the server responds `{results: [{id, success, error?}, …]}`.
+    ///
+    /// Body shape: the server builds `new PlaybackSession(sessionJson)` per array element and, on
+    /// FIRST INSERT of a session id ONLY, sets `session.deviceInfo = deviceInfo` from the
+    /// TOP-LEVEL batch `deviceInfo` (a sibling of `sessions`, not each session's own nested
+    /// field); a resync of an already-persisted id updates only `currentTime`/`timeListening`/
+    /// `updatedAt` and leaves the stored `deviceInfo` untouched. Every session queued by this app
+    /// instance shares one device, so this derives that top-level `deviceInfo` from the batch's
+    /// first session rather than taking a redundant separate parameter. An empty `sessions` array
+    /// is a no-op returning `[]` — nothing to reconcile, and no `deviceInfo` to report.
+    @discardableResult
+    public func syncLocalSessions(_ sessions: [LocalPlaybackSession]) async throws -> [LocalSessionSyncResult] {
+        guard let deviceInfo = sessions.first?.deviceInfo else { return [] }
+        struct Body: Encodable { let sessions: [LocalPlaybackSession]; let deviceInfo: DeviceInfo }
+        var req = URLRequest(url: baseURL.appending(path: "api/session/local-all"))
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try ABSAPI.encoder.encode(Body(sessions: sessions, deviceInfo: deviceInfo))
+        let data = try await authorizedData(req)
+        return try ABSAPI.decoder.decode(LocalSessionSyncResponse.self, from: data).results
     }
 
     public func syncSession(id: String, currentTime: Double, timeListened: Double, duration: Double) async throws {

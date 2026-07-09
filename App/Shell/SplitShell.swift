@@ -31,6 +31,7 @@ struct SplitShell: View {
     enum SidebarItem: Hashable {
         case home
         case search
+        case downloads
         case library(CachedLibrary)
         case series(CachedLibrary)
         case authors(CachedLibrary)
@@ -42,6 +43,9 @@ struct SplitShell: View {
                 Section {
                     Label("Home", systemImage: "house").tag(SidebarItem.home)
                     Label("Search", systemImage: "magnifyingglass").tag(SidebarItem.search)
+                    // Downloads (Task 7): the Mac/iPad sidebar entry point — downloaded books/
+                    // episodes, state, storage, delete/manage, same `DownloadsView` the iPhone tab uses.
+                    Label("Downloads", systemImage: "arrow.down.circle").tag(SidebarItem.downloads)
                 }
                 // Series/Authors nest UNDER each library (an outline/disclosure row, à la Music's
                 // Library sidebar nesting Playlists/Artists/Albums) rather than as flat top-level
@@ -140,7 +144,13 @@ struct SplitShell: View {
         // rule the browse views' doc comments describe is honored.
         switch selection {
         case .search:
-            NavigationStack { SearchView() }
+            NavigationStack { SearchView().offlineIndicator() }
+        case .downloads:
+            // `DownloadsView` registers its OWN `.itemDetailDestination()`/`.episodeDetailDestination()`
+            // at its root content, inside this stack — the same macOS nav-gotcha rule every other
+            // case here follows. No offline indicator (see the sidebar Label's comment): Downloads
+            // is the fully-local surface, nothing here depends on the network.
+            NavigationStack { DownloadsView() }
         case .library(let library):
             NavigationStack {
                 LibraryGridView(library: library)
@@ -153,21 +163,28 @@ struct SplitShell: View {
                     // above) pushes `EpisodeDetailRoute`; registered on this SAME root content, inside
                     // the stack, so it resolves within the detail column rather than dead-ending.
                     .episodeDetailDestination()
+                    .offlineIndicator()
             }
         case .series(let library):
             NavigationStack {
                 SeriesListView(library: library)
                     .navigationDestination(for: SeriesSummary.self) { SeriesDetailView(library: library, series: $0) }
                     .itemDetailDestination()
+                    // Parity with .search/.library/.home (and the iPhone shell): the series surface
+                    // is network-backed, so it shows the offline banner when the server is unreachable.
+                    .offlineIndicator()
             }
         case .authors(let library):
             NavigationStack {
                 AuthorsListView(library: library)
                     .navigationDestination(for: AuthorSummary.self) { AuthorDetailView(library: library, author: $0) }
                     .itemDetailDestination()
+                    // Parity with .search/.library/.home (and the iPhone shell): authors are
+                    // network-backed, so surface the offline banner when the server is unreachable.
+                    .offlineIndicator()
             }
         case .home, .none:
-            NavigationStack { HomeView() }
+            NavigationStack { HomeView().offlineIndicator() }
         }
     }
 }

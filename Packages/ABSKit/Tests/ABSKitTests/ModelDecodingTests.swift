@@ -407,6 +407,53 @@ private func fixture(_ name: String) throws -> Data {
         #expect(second.episode == "2")
         #expect(second.title == "Episode Two: Attack by Stratagem")
         #expect(second.duration == 506.827755)
+
+        // M2a: the episode's single downloadable `audioFile` (its `ino` keys the /file/:ino/download
+        // route) is now modeled for the offline downloader.
+        let af = try #require(first.audioFile)
+        #expect(af.ino == "5521")
+        #expect(af.index == 1)
+        #expect(af.mimeType == "audio/mpeg")
+        #expect(af.fileExtension == "mp3")     // stripped leading dot from ".mp3"
+        #expect(af.metadata?.size == 3_724_390)
+    }
+
+    /// M2a: a book's `media.audioFiles[]` decodes into `AudioFileInfo` (the offline downloader
+    /// enumerates these to enqueue per-file transfers keyed by `ino`). `fileExtension` strips the
+    /// leading dot the server sends on `metadata.ext`.
+    @Test func decodesBookAudioFilesForDownload() throws {
+        let json = Data("""
+        {
+          "id": "book-1",
+          "libraryId": "lib-1",
+          "media": {
+            "metadata": { "title": "Two-File Book" },
+            "audioFiles": [
+              { "index": 1, "ino": "1975", "mimeType": "audio/mpeg",
+                "metadata": { "ext": ".mp3", "filename": "part1.mp3", "size": 4055167 } },
+              { "index": 2, "ino": "1976", "mimeType": "audio/mp4",
+                "metadata": { "ext": ".m4b", "filename": "part2.m4b", "size": 2048 } }
+            ]
+          }
+        }
+        """.utf8)
+        let d = try decoder.decode(LibraryItemDetail.self, from: json)
+        let files = try #require(d.media.audioFiles)
+        #expect(files.count == 2)
+        #expect(files[0].ino == "1975")
+        #expect(files[0].index == 1)
+        #expect(files[0].fileExtension == "mp3")
+        #expect(files[0].metadata?.size == 4055167)
+        #expect(files[1].ino == "1976")
+        #expect(files[1].fileExtension == "m4b")
+    }
+
+    /// An item response with NO `audioFiles` key (a lean/older shape) still decodes — `audioFiles`
+    /// is tolerant so the existing browse/detail paths are unaffected.
+    @Test func itemWithoutAudioFilesStillDecodes() throws {
+        let json = Data(#"{"id":"i","libraryId":"l","media":{"metadata":{"title":"T"}}}"#.utf8)
+        let d = try decoder.decode(LibraryItemDetail.self, from: json)
+        #expect(d.media.audioFiles == nil)
     }
 
     @Test func deviceInfoEncodesWithDefaults() throws {

@@ -33,6 +33,10 @@ struct EpisodeRow: View {
     /// `FullPlayerView`, which needs an active session. Defaults to `true` so existing callers are
     /// unaffected; the caller (`PodcastDetailView`) passes the live guard.
     var canAddToQueue: Bool = true
+    /// THIS episode's download row, resolved by the parent (`PodcastDetailView`) from ONE shared
+    /// `observeDownloads` join — passed straight into the trailing `DownloadButton` so every row
+    /// shares that single observation instead of opening its own. `nil` = not downloaded.
+    var download: CachedDownload? = nil
 
     private var isFinished: Bool { progress?.isFinished ?? false }
 
@@ -83,6 +87,16 @@ struct EpisodeRow: View {
                 }
                 .accessibilityElement(children: .combine)
                 Spacer(minLength: 8)
+
+                // Per-episode download affordance (M2a Task 8) — compact, plain, never glass. Its own
+                // glyph (down-arrow/progress-ring/checkmark/retry) already communicates this episode's
+                // offline state, so it doubles as this row's "download-state badge" — a separate
+                // decorative overlay would be redundant (`CoverCard`/`EpisodeCard`, which have no
+                // control of their own, get the passive `DownloadStateBadge` instead). Fed the
+                // parent's shared download observation (`.provided`) so an N-episode list opens ONE
+                // observation, not N.
+                DownloadButton(itemID: episode.itemID, episodeID: episode.episodeID, compact: true,
+                               source: .provided(download))
             }
             .padding(.vertical, 4)
             .contentShape(Rectangle())

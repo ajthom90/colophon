@@ -8,6 +8,8 @@ import ABSKit
 import ABSRealtime
 import PlayerEngine
 import LibraryCache
+import DownloadManager
+import Network
 
 /// The library-browse sort options surfaced in `LibraryGridView`'s toolbar, each mapped to a
 /// verified ABS `items?sort=` key (see the plan's endpoint reference). Plain `Sendable` value type
@@ -104,6 +106,10 @@ final class AppState {
     let queue = PlaybackQueue()
     let cache: LibraryCacheStore
     let coverStore: CoverStore
+    /// Offline-download orchestration (M2a Task 4): `download`/`delete`/storage over the
+    /// `DownloadManager` + LibraryCache v4 records. AppState feeds it the live active client +
+    /// connection id (below); the Downloads UI (Tasks 7-8) reads/observes the cache and calls it.
+    let downloads: DownloadCoordinator
 
     /// UserDefaults key persisting the last connection the user activated, so `ConnectionsView`
     /// can auto-resume it on the next launch — the load-bearing half of the offline first-run
@@ -116,6 +122,11 @@ final class AppState {
     /// `UserDefaults.standard` keys directly instead.
     static let defaultRateKey = "colophon.defaultRate"
     static let skipIntervalKey = "colophon.skipInterval"
+    /// M2a Task 8: the podcast "Delete downloaded episodes after finishing" toggle (default OFF).
+    /// `SettingsView` owns the `@AppStorage` Toggle; `maybeAutoDeleteFinishedEpisode` below reads
+    /// the same key directly (same unset-reads-as-off convention — `UserDefaults.bool` already
+    /// returns `false` for an absent key, matching the documented default with no extra plumbing).
+    static let deleteAfterFinishedKey = "colophon.deleteDownloadedEpisodesAfterFinishing"
 
     /// Single source of truth for the skip-interval setting (Task 4), shared by `SettingsView`'s
     /// `@AppStorage` default + Picker options, `storedSkipInterval()` below, and the live-update
@@ -148,6 +159,60 @@ final class AppState {
     /// cached-first `activateConnection` until (and unless) the background `POST /api/authorize`
     /// probe succeeds; distinguishes "browsing cached rows offline" from "connected and syncing".
     private(set) var isOnline = false
+
+    /// Whether the active connection's server probe is STILL IN FLIGHT — true from the moment a
+    /// cached-first `activateConnection` publishes `phase == .connected` (BEFORE the token-store
+    /// await, so there is no gap) until that connection's `POST /api/authorize` probe settles
+    /// (success or failure). It exists ONLY to keep `isOffline` (below) from firing a FALSE POSITIVE
+    /// during that initial window: `isOnline` is transiently `false` while the probe runs even when
+    /// the server is perfectly reachable, so `phase == .connected && !isOnline` ALONE (the condition
+    /// the review proposed) would wrongly report "offline" for the ~probe-duration of every healthy
+    /// cached-first resume — the `activateConnection` code path publishes `.connected` BEFORE the
+    /// probe, so `phase` does not disambiguate it (contrary to the review note; verified against the
+    /// activation flow). Gating additionally on `!isProbingConnection` engages the offline fallback
+    /// only once the server is KNOWN-unreachable (the probe has failed), which is the review's actual
+    /// stated intent. A fresh `connect()` login publishes `isOnline == true` before `.connected`, so
+    /// it never enters this window.
+    private var isProbingConnection = false
+
+    /// The single "browsing cached content with a KNOWN-unreachable server" signal the offline-aware
+    /// browse keys on (M2a Task 7): a connection is active (`phase == .connected`), its server probe
+    /// has settled `false` (`!isOnline && !isProbingConnection`). This is exactly the review's
+    /// `phase == .connected && !isOnline`, corrected with `!isProbingConnection` to exclude the
+    /// initial in-flight-probe false positive (see `isProbingConnection`). It covers the primary
+    /// real-world offline case — a self-hosted SERVER stopped while the DEVICE's network link is
+    /// fine (`isNetworkAvailable` stays `true`, so the raw link is the WRONG signal to gate on) —
+    /// and drives both the browse fast-paths (`refreshItems`/`HomeView`/`SearchModel`) and the
+    /// shell's `OfflineIndicator` banner, so all four agree.
+    var isOffline: Bool { phase == .connected && !isOnline && !isProbingConnection }
+
+    /// Offline-guarded browse fetch shared by the network-backed browse views (`SeriesListView`/
+    /// `AuthorsListView`/`AuthorDetailView`) — M2a final review #3. Returns the fetched value, or
+    /// `nil` WITHOUT touching the network when the server is known-unreachable (`isOffline`) or there
+    /// is no client, so an offline load degrades to its cached/offline state immediately instead of
+    /// hanging a doomed request to the transport timeout. Same inline `!isOffline` fast-path
+    /// `refreshItems`/`HomeView`/`SearchModel` use, factored out HERE so those SwiftUI views (which
+    /// can't be hosted headlessly for a unit test) route their offline decision through ONE tested,
+    /// RED-verifiable gate. A thrown error (an ONLINE fetch that failed) propagates to the caller's
+    /// own catch — only a genuine offline/no-client short-circuit returns `nil`.
+    func browseFetch<T>(_ fetch: (ABSClient) async throws -> T) async throws -> T? {
+        guard let client, !isOffline else { return nil }
+        return try await fetch(client)
+    }
+
+    /// Raw OS network-path availability (`NWPathMonitor`) — the LINK state (Wi-Fi/cellular up),
+    /// which knows NOTHING about the active server or auth. Deliberately SEPARATE from `isOnline`,
+    /// and the two relate cleanly rather than duplicate:
+    ///   • `isOnline` is SERVER+AUTH reachability — set true only after a successful `/authorize`
+    ///     probe or login, cleared on host-down / sign-out. It's what browse/offline UI keys on.
+    ///   • `isNetworkAvailable` is the raw LINK edge the probe-driven `isOnline` cannot see on its
+    ///     own: when the link returns (airplane mode off, Wi-Fi reassociates), the app must NOTICE
+    ///     and re-reconcile — but the server behind this connection may still be down.
+    /// So the monitor's job is narrow: detect the OFFLINE→ONLINE link edge and TRIGGER the reconnect
+    /// reconcile (`reconcileOnReconnect`). The reconcile itself is the authority on `isOnline` — it
+    /// sets `isOnline = true` only once `GET /api/me` actually answers (server reachable+authed),
+    /// so a satisfied link with a still-dead server keeps everything pending and offline.
+    private(set) var isNetworkAvailable = true
     /// Connection IDs whose stored tokens are missing or rejected (a failed probe / signed-out
     /// row). Surfaced as a badge in `ConnectionsView`; tapping such a row routes to re-auth.
     /// Cleared the moment a (re)connect or a successful probe proves the credentials good.
@@ -260,6 +325,33 @@ final class AppState {
     /// `signOut`/`removeConnection` tail from stomping a newer activation started during its awaits.
     private var connectionEpoch = 0
 
+    /// The continuous `NWPathMonitor` backing `isNetworkAvailable`. Built here but NOT started in
+    /// `init` (a unit-test `AppState` must not stand up a live OS monitor); `startReachabilityMonitoring()`
+    /// starts it once, from the app's launch `.task`. Its updates hop onto the MainActor via
+    /// `handleNetworkPathUpdate(isSatisfied:)`, which is also the deterministic test seam.
+    private let pathMonitor = NWPathMonitor()
+    private let pathMonitorQueue = DispatchQueue(label: "com.andrewthom.colophon.reachability")
+    private var pathMonitorStarted = false
+
+    /// In-progress guard for `reconcileOnReconnect` (Task 6) — the same first-wins discipline as
+    /// `isStartingPlayback`/`isAdvancing`. Two rapid OFFLINE→ONLINE transitions must not run two
+    /// overlapping reconciles racing on the same pending `cachedLocalSession` rows (a double POST /
+    /// double prune). The first transition's reconcile holds this; a second is dropped — the first
+    /// already drains every pending row, and anything that accrues after its snapshot stays pending
+    /// (see the prune guard) for the next reconnect.
+    private var isReconciling = false
+
+    /// The client-generated UUID of the CURRENTLY-PLAYING offline session's `cachedLocalSession`
+    /// row (Task 6). A new offline playback (`loadOfflineSession`) mints a fresh UUID → a NEW row;
+    /// each due tick UPDATEs that row, ACCUMULATING `timeListening`. Cleared by `retireCurrentSession`
+    /// so a later offline playback of the SAME item starts a distinct row. The reconcile NEVER prunes
+    /// this id: a live session is still accruing, so pruning it mid-play would let a subsequent tick
+    /// resurrect the pruned UUID with only a partial total (a lost-listen-time bug) — it's pruned only
+    /// once sealed (playback retired), on a later reconcile.
+    private var currentOfflineSessionID: String?
+    /// The wall-clock (ms) the current offline session started — its fixed `startedAt`.
+    private var currentOfflineSessionStartedAt = 0
+
     /// Opens a new connection epoch and returns it — the single entry point every connection-mutating
     /// flow calls exactly once, at the moment it commits to running (for `connect`/`connectWithOIDC`
     /// that is AFTER URL validation, so an invalid URL that returns early never stales a healthy
@@ -278,7 +370,12 @@ final class AppState {
         cacheDirectory: URL? = nil,
         socketFactory: ((URL, @escaping @Sendable () async -> String?) -> any RealtimeSocketProtocol)? = nil,
         tokenStore: (any TokenStore)? = nil,
-        oidcTransportProvider: (@Sendable () -> Transport)? = nil
+        oidcTransportProvider: (@Sendable () -> Transport)? = nil,
+        // The download manager is built LAZILY on first download use — constructing a real
+        // `DownloadManager` stands up a background `URLSession`, which must not happen merely by
+        // constructing `AppState` in a unit test that never downloads. Tests inject a fake.
+        downloadManagerProvider: (@MainActor () -> any DownloadManaging)? = nil,
+        downloadsRoot: URL? = nil
     ) {
         self.transport = transportProvider()
         self.oidcTransport = oidcTransportProvider?()
@@ -299,6 +396,14 @@ final class AppState {
         let coversDir = cacheDirectory?.appending(path: "covers")
             ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appending(path: "covers")
         coverStore = CoverStore(directory: coversDir)
+        // Downloads live UNDER the (persistent) support dir — never Caches, which the OS may purge.
+        let resolvedDownloadsRoot = downloadsRoot ?? supportDir.appending(path: "Downloads")
+        let resolvedManagerProvider: @MainActor () -> any DownloadManaging = downloadManagerProvider ?? {
+            DownloadManager(session: URLSessionDownloadSession(
+                identifier: "com.andrewthom.colophon.downloads"))
+        }
+        downloads = DownloadCoordinator(cache: cache, downloadsRoot: resolvedDownloadsRoot,
+                                        managerProvider: resolvedManagerProvider)
         // Seed the observed connections array now, not just on the first `.task` after launch —
         // otherwise `ColophonApp`'s `app.connections.isEmpty` check on first render sees an empty
         // array and flashes `ConnectView` for one frame before `.task` runs `loadConnections()`,
@@ -310,8 +415,32 @@ final class AppState {
         // because the callback fires synchronously from the (MainActor) controller and the advance
         // is async; `[weak self]` avoids a retain cycle (AppState owns `playback`).
         playback.onBookFinished = { [weak self] in
-            Task { await self?.advanceToNext() }
+            guard let self else { return }
+            // M2a Task 8: podcast auto-delete-after-finished, the OFFLINE half. `cachedProgress`'s
+            // `isFinished` is server-authoritative (see `maybeAutoDeleteFinishedEpisode`'s doc) and
+            // never set locally, so a purely offline listen-to-completion (no reconnect yet) would
+            // otherwise wait on a future `me()`/socket round trip to learn it just finished. This
+            // fires the SAME check immediately from the "playback truly reached the end" signal —
+            // captured NOW (before `advanceToNext`, scheduled below, can retire/replace the session)
+            // so it names the JUST-finished item, not whatever plays next. `nowPlayingEpisodeID` nil
+            // (a book) short-circuits before any lookup — a book is never touched.
+            if let connectionID = self.playingConnectionID, let episodeID = self.nowPlayingEpisodeID,
+               let itemID = self.nowPlayingItemID {
+                // A genuine playing→finished transition (the episode was NOT finished a moment ago),
+                // so `wasFinished: false`; `isLocalFinish: true` exempts it from the currently-playing
+                // guard (it IS still now-playing at this instant, but "finished" here means it reached
+                // its end — the intended deletion moment, not a mid-stream cross-device push).
+                Task { await self.maybeAutoDeleteFinishedEpisode(
+                    connectionID: connectionID, itemID: itemID, episodeID: episodeID,
+                    wasFinished: false, isFinished: true, isLocalFinish: true) }
+            }
+            Task { await self.advanceToNext() }
         }
+        // Feed the download coordinator the LIVE active client + connection id (both change on a
+        // connection switch / sign-out), so `download` re-derives URLs against the current client
+        // and every download is scoped to the active connection.
+        downloads.clientProvider = { [weak self] in self?.client }
+        downloads.connectionIDProvider = { [weak self] in self?.activeConnectionID }
     }
 
     var deviceInfo: DeviceInfo {
@@ -513,9 +642,19 @@ final class AppState {
         // needs sign-in, and it's live.
         needsSignIn.remove(connection.id)
         isOnline = true
+        // A fresh login never entered the cached-first probe window; clear the flag defensively so a
+        // prior activation's stale in-flight mark can't leave `isOffline` mis-reading this live one.
+        isProbingConnection = false
         persistLastActive(connection.id)
         loadConnections()
         phase = .connected
+        // Same download reconcile as `activateConnection`'s cached-first path — the fresh sign-in is
+        // also a launch/activation moment where the background session's state must meet the cache.
+        Task { await downloads.reattachOnLaunch() }
+        // Server reachability is live (isOnline true above): sync any pending offline sessions back
+        // (M2a final review #2). No-op unless there are pending sessions, so a normal fresh login
+        // with nothing to sync never fires a stray reconcile.
+        reconcileAfterServerRecovery(connectionID: connection.id)
     }
 
     /// Cleanup for a superseded (stale-epoch) connect flow's bail paths. `completeConnection`
@@ -622,11 +761,21 @@ final class AppState {
         errorMessage = nil
         refreshBanner = nil
         isOnline = false
+        // Mark the probe in-flight NOW — synchronously, at the same point `phase` becomes `.connected`
+        // and BEFORE the token-store await below — so `isOffline` is never transiently true in the
+        // gap between publishing `.connected` and the probe actually starting (that gap is a real
+        // suspension point a view's `.task` can run inside). Cleared on every settled outcome:
+        // the no-tokens branch, and all three probe exit paths.
+        isProbingConnection = true
         activeLibraryID = nil
         activeConnectionID = id
         persistLastActive(id)
         loadConnections()
         phase = .connected   // cached browsing is live from here — server up or not.
+        // Reconcile in-progress downloads against the background session for the now-active
+        // connection (an in-flight transfer resumes; one finished while dead is marked downloaded).
+        // Detached + best-effort; safe to run offline (it only needs the connection id + cache).
+        Task { await downloads.reattachOnLaunch() }
 
         // No stored credentials: surface re-auth, don't probe (nothing to probe with).
         guard await tokenStore.tokens(for: id) != nil else {
@@ -636,6 +785,9 @@ final class AppState {
             client = nil
             auth = nil
             needsSignIn.insert(id)
+            // No probe will run — this connection is settled OFFLINE (needs sign-in), so `isOffline`
+            // may now report true.
+            isProbingConnection = false
             return
         }
         guard connectionEpoch == myEpoch else { return }
@@ -658,6 +810,7 @@ final class AppState {
                 guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.needsSignIn.remove(id)
                 self.isOnline = true
+                self.isProbingConnection = false   // probe settled ONLINE
                 self.startSocket(url: url, auth: auth)
                 if let libs = try? await client.libraries() {
                     guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
@@ -666,9 +819,15 @@ final class AppState {
                                       mediaType: lib.mediaType, displayOrder: lib.displayOrder ?? index)
                     }, connectionID: id)
                 }
+                // Server reachability just recovered (isOnline false→true above): sync any pending
+                // offline sessions back (M2a final review #2). Fired here, AFTER the probe's own
+                // `libraries()` completes, so the reconcile's `me()`/`local-all` never race that
+                // fetch for the FIFO. No-op unless there are pending sessions.
+                self.reconcileAfterServerRecovery(connectionID: id)
             } catch ABSError.reauthRequired, ABSError.notAuthenticated {
                 guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
+                self.isProbingConnection = false   // probe settled (needs sign-in) → offline
                 self.needsSignIn.insert(id)
             } catch {
                 // Host down / transport error: stay in cached-only offline mode. `isOnline ==
@@ -676,6 +835,7 @@ final class AppState {
                 // offline case.
                 guard self.connectionEpoch == myEpoch, self.activeConnectionID == id else { return }
                 self.isOnline = false
+                self.isProbingConnection = false   // probe settled OFFLINE (server unreachable)
             }
         }
     }
@@ -758,6 +918,10 @@ final class AppState {
         needsSignIn.remove(id)
         try? cache.deleteConnection(connectionID: id)
         await coverStore.deleteConnection(connectionID: id)
+        // Reclaim the connection's on-disk download files too (M2a final review #6): deleting the
+        // cache rows above leaves the audio behind otherwise — a forgotten connection must leave
+        // nothing on disk.
+        downloads.deleteAllFiles(connectionID: id)
         loadConnections()
     }
 
@@ -791,16 +955,39 @@ final class AppState {
         guard let connectionID = activeConnectionID else { return }
         switch event {
         case .progressUpdated(let update):
+            let episode = update.episodeID ?? ""
+            // M2a Task 8 (transition gate): capture the PRIOR cached `isFinished` BEFORE the upsert
+            // overwrites it — auto-delete fires ONLY on a witnessed false→true finish, never on a
+            // reprocess of an already-finished row (see `maybeAutoDeleteFinishedEpisode`).
+            let wasFinished = priorFinished(connectionID: connectionID, itemID: update.itemID, episodeID: episode)
             try? cache.upsertProgress(CachedProgress(
                 connectionID: connectionID, itemID: update.itemID, episodeID: update.episodeID,
                 currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate))
+            await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: update.itemID,
+                episodeID: episode, wasFinished: wasFinished, isFinished: update.isFinished)
         case .progressBatch(let updates):
             let batch = updates.map { update in
                 CachedProgress(
                     connectionID: connectionID, itemID: update.itemID, episodeID: update.episodeID,
                     currentTime: update.currentTime, isFinished: update.isFinished, lastUpdate: update.lastUpdate)
             }
+            // A `user_updated` push carries the WHOLE user object — the ENTIRE mediaProgress history,
+            // not just what changed. Capture each row's PRIOR finished-state BEFORE the batch upsert
+            // so the transition gate below fires only on genuine false→true finishes and never
+            // mass-deletes the accumulated already-finished downloads (the CRITICAL data-loss bug).
+            let priorByKey = Dictionary(updates.compactMap { update -> (String, Bool)? in
+                let episode = update.episodeID ?? ""
+                guard let was = priorFinished(connectionID: connectionID, itemID: update.itemID, episodeID: episode)
+                else { return nil }
+                return (update.itemID + "/" + episode, was)
+            }, uniquingKeysWith: { first, _ in first })
             try? cache.upsertProgressBatch(batch)
+            for update in updates {
+                let episode = update.episodeID ?? ""
+                await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: update.itemID,
+                    episodeID: episode, wasFinished: priorByKey[update.itemID + "/" + episode],
+                    isFinished: update.isFinished)
+            }
         case .itemChanged(let id):
             try? await patchItem(id: id, connectionID: connectionID)
         case .itemsChanged(let ids):
@@ -815,6 +1002,9 @@ final class AppState {
             // Precise deletion first (instant, no round trip) — the coarse re-page below is a
             // safety net for anything else the same event batch implies, not the primary path.
             try? cache.deleteItem(connectionID: connectionID, itemID: id)
+            // `deleteItem` cascades away the download ROWS but not the on-disk track files (M2a final
+            // review #7) — remove them too so a server-side deletion doesn't leak the item's audio.
+            downloads.deleteItemFiles(connectionID: connectionID, itemID: id)
             if let libraryID = activeLibraryID { try? await refreshItems(libraryID: libraryID) }
         }
     }
@@ -890,6 +1080,15 @@ final class AppState {
         var lastTotal = 0
         var completed = false
         do {
+            // Fast-path (M2a Task 7, offline-aware browse): the server is KNOWN-unreachable (a
+            // cached-first activation whose probe failed — the common self-hosted "server stopped,
+            // device online" case, which the raw link state `isNetworkAvailable` can't see). A real
+            // request would only fail after the transport's timeout, reading as a hung spinner; skip
+            // straight into the SAME graceful-degradation catch below (cached library → `refreshBanner`,
+            // not a throw; not-yet-cached → the existing `ContentUnavailableView`/retry path). Keyed on
+            // `isOffline` (NOT the raw link, NOT bare `!isOnline`) so it's a genuine no-op online AND
+            // during the initial in-flight probe (see `isOffline`/`isProbingConnection`).
+            if isOffline { throw ABSError.offline }
             for page in 0..<Self.refreshPageSafetyBound {
                 let result = try await client.items(
                     libraryID: libraryID, limit: limit, page: page,
@@ -1050,7 +1249,24 @@ final class AppState {
                 isFinished: entry.isFinished ?? false,
                 lastUpdate: entry.lastUpdate ?? now)
         }
+        // `GET /api/me` returns the user's FULL mediaProgress history — every already-finished
+        // episode, every time. Capture each row's PRIOR finished-state BEFORE the upsert so the
+        // auto-delete transition gate (M2a Task 8) fires only on a genuine false→true finish learned
+        // here (a relaunch/refresh where the server knows something the local cache didn't yet), and
+        // NEVER walks the whole history mass-deleting already-finished downloads (the CRITICAL bug:
+        // a user who kept downloads with the toggle OFF, then flips it ON, must not lose them on the
+        // next Home appear).
+        let priorByKey = Dictionary(batch.compactMap { cp -> (String, Bool)? in
+            guard let was = priorFinished(connectionID: connectionID, itemID: cp.itemID, episodeID: cp.episodeID)
+            else { return nil }
+            return (cp.itemID + "/" + cp.episodeID, was)
+        }, uniquingKeysWith: { first, _ in first })
         try? cache.upsertProgressBatch(batch)
+        for cp in batch {
+            await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: cp.itemID,
+                episodeID: cp.episodeID, wasFinished: priorByKey[cp.itemID + "/" + cp.episodeID],
+                isFinished: cp.isFinished)
+        }
         // Reuse the same `me()` payload to keep the now-playing book's bookmarks fresh (Task 6):
         // `me().bookmarks[]` is the source of truth, filtered to the playing item. Cheap, and
         // ignored by the store when no book is playing (`nowPlayingItemID` nil) or the item differs.
@@ -1080,17 +1296,30 @@ final class AppState {
     /// deterministically before severing onSyncDue (idempotent: a harmless no-op if pause()'s
     /// internal flush already landed).
     private func retireCurrentSession() async {
-        guard let handle = sessionHandle else { return }
+        // Retire EITHER a streaming session (`sessionHandle` present) OR an OFFLINE one (M2a Task 5:
+        // no server handle, but a loaded local session — flagged by `nowPlayingItemID`). Nothing
+        // loaded → nothing to retire. The flush-then-detach ordering is shared by both: for a
+        // streaming session `flushOnly` drives `onSyncDue`→`handle.sync`; for an offline one it drives
+        // `onSyncDue`→the LOCAL `cachedProgress` write — the sole divergence is the sync SINK, not the
+        // teardown sequence.
+        guard sessionHandle != nil || nowPlayingItemID != nil else { return }
         playback.pause()
         await playback.flushOnly()
         playback.onSyncDue = nil
-        await handle.close(currentTime: playback.globalTime, timeListened: 0)
+        // Only a streaming session has a server session to close; an offline one never opened one.
+        if let handle = sessionHandle {
+            await handle.close(currentTime: playback.globalTime, timeListened: 0)
+        }
         playback.unload()
         sessionHandle = nil
         playingConnectionID = nil
         nowPlayingItemID = nil
         nowPlayingEpisodeID = nil
         nowPlayingChapters = []
+        // Seal the offline session (Task 6): the final `flushOnly()` above already accrued its last
+        // listened delta onto the row while this id was still current, so clearing it now only makes
+        // the row eligible for pruning on a later reconcile — never before its tail is recorded.
+        currentOfflineSessionID = nil
         // Retiring the book cancels any armed sleep timer (it was scoped to that book).
         sleepTimer.turnOff()
         sleepTimer.chapters = []
@@ -1122,11 +1351,40 @@ final class AppState {
         guard !isStartingPlayback else { return }
         isStartingPlayback = true
         defer { isStartingPlayback = false }
-        guard let client else { return }
         // Captured NOW, before any await below — a connection switch racing the awaits (e.g.
         // during `retireCurrentSession`'s flush/close or the /play round trip) must not be
-        // misattributed as this session's owner.
+        // misattributed as this session's owner. Shared by BOTH the offline and streaming branches.
         let owner = activeConnectionID
+        let episode = episodeId ?? ""
+
+        // OFFLINE-SOURCE branch (M2a Task 5): SELECTION RULE — prefer LOCAL files ONLY when this
+        // (item, episode) is FULLY `.downloaded`; a partial/absent download falls through to the
+        // streaming path below. Checked BEFORE requiring a live `client`/network, so a downloaded
+        // item plays with the server unreachable — and, even when online, a downloaded item STILL
+        // plays from local (downloads-first; a user-facing "prefer downloads" toggle is post-v1).
+        // The ONLY divergence from streaming is the SOURCE (local files + a locally-built session vs.
+        // a `/play` envelope): the reentrancy guard, epoch owner capture, and `retireCurrentSession`
+        // are the SAME — no forked guard logic.
+        if let owner, let source = localPlaybackSource(connectionID: owner, itemID: itemID, episodeID: episode) {
+            await retireCurrentSession()
+            loadOfflineSession(owner: owner, itemID: itemID, episodeId: episodeId,
+                               podcastTitle: podcastTitle, source: source)
+            return
+        }
+
+        // OFFLINE tap on a NON-downloaded item → a CLEAN NO-OP (M2a final review #1). `client` is
+        // NON-nil offline (valid tokens, server DOWN, device link UP), so the client-nil guard below
+        // is the WRONG signal here: falling through would `retireCurrentSession()` (STOPPING the
+        // current offline playback) and then hit the dead server's `/play`, hanging to the transport
+        // timeout. Gate on the REAL offline signal (`isOffline`) instead, and return WITHOUT retiring
+        // current playback or touching the network. No `errorMessage` is set: it drives the BLOCKING
+        // "Something went wrong" alert (see `ColophonApp`), which would disturb the ongoing listen —
+        // a silent no-op is the least-surprising behavior for a tap on an unavailable item.
+        if isOffline { return }
+
+        // STREAMING branch: requires a live client. Guarded HERE (not before the offline check) so an
+        // ONLINE tap on a NON-downloaded item with no client is still a clean no-op.
+        guard let client else { return }
         // Retire the old session completely before touching the new one.
         await retireCurrentSession()
         do {
@@ -1196,6 +1454,439 @@ final class AppState {
         } catch {
             errorMessage = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
         }
+    }
+
+    // MARK: - Offline playback (M2a Task 5)
+
+    /// TASK 6 SEAM (offline sync-back): fired on every OFFLINE sync tick / flush with the same
+    /// `(itemID, episodeID, payload)` written to `cachedProgress`. Task 5 accrues progress LOCALLY
+    /// only; Task 6 fills this hook to ALSO record a local `PlaybackSession` row (client UUID,
+    /// `playMethod: local`, accruing `timeListened`) and, with an `NWPathMonitor` reachability
+    /// signal, reconcile it to the server on reconnect via `POST /api/session/local-all`. `nil` (a
+    /// no-op) this milestone — additive, so wiring it needs no change to the offline player path.
+    var onOfflineProgressAccrued: ((_ itemID: String, _ episodeID: String, _ payload: SyncPayload) -> Void)?
+
+    /// Resolve the LOCAL playback source for a FULLY-downloaded `(item, episode)`, or `nil` to fall
+    /// through to streaming. "Fully downloaded" = a `cachedDownload` in state `.downloaded` whose
+    /// every file row is `.downloaded` AND present on disk (a missing file → `nil`, so a half-evicted
+    /// download streams rather than handing AVFoundation a dangling `file://` URL). Builds ordered
+    /// `file://` track URLs (by `trackIndex`); the timeline (each track's `startOffset` = the running
+    /// sum of the preceding cached per-file durations); chapters from the pinned `CachedItemDetail`;
+    /// and the resume `startTime` from `cachedProgress` (clamped to the total). Pure cache/disk reads
+    /// — NO network. Returns `nil` (→ stream) when a per-file duration is missing AND the server is
+    /// reachable (`!isOffline`), so a broken local timeline never wins over streaming's correct one
+    /// (offline, it plays degraded best-effort instead — see the loop).
+    private func localPlaybackSource(connectionID: String, itemID: String, episodeID: String) -> LocalPlaybackSource? {
+        guard let wf = (try? cache.download(connectionID: connectionID, itemID: itemID,
+                                            episodeID: episodeID)) ?? nil,
+              wf.download.state == DownloadCoordinator.State.downloaded,
+              !wf.files.isEmpty,
+              wf.files.allSatisfy({ $0.state == DownloadCoordinator.State.downloaded })
+        else { return nil }
+
+        var trackURLs: [URL] = []
+        var audioTracks: [AudioTrack] = []
+        var runningOffset = 0.0
+        var anyDurationMissing = false
+        for file in wf.files.sorted(by: { $0.trackIndex < $1.trackIndex }) {
+            let url = downloads.localURL(for: file)
+            guard FileManager.default.fileExists(atPath: url.path) else { return nil }
+            // A nil per-file duration (the server omitted `audioFile.duration`) would make a
+            // ZERO-LENGTH track — resume lost for a single-file book, and misaligned/skipped audio
+            // for a multi-file one. When ONLINE (a live client can open a `/play` session with the
+            // server-computed track offsets), fall back to streaming rather than build a broken
+            // timeline; when OFFLINE, play best-effort degraded (see the guard below).
+            if file.durationSeconds == nil { anyDurationMissing = true }
+            let duration = file.durationSeconds ?? 0
+            trackURLs.append(url)
+            audioTracks.append(AudioTrack(index: file.trackIndex, startOffset: runningOffset,
+                                          duration: duration, mimeType: file.mimeType))
+            runningOffset += duration
+        }
+        // If any track's duration is missing AND we could stream instead (ONLINE), prefer streaming's
+        // correct timeline over this broken-local one. OFFLINE, proceed best-effort — degraded
+        // playback beats no playback — accepting a possibly-wrong resume/track alignment. Keyed on
+        // `isOffline`, NOT `client != nil` (M2a final review #4): `client` is NON-nil offline
+        // (server down, link up), so the client-nil test would wrongly kill the degraded offline
+        // path — leaving a downloaded item UNPLAYABLE offline. `isOffline` is the correct signal.
+        if anyDurationMissing, !isOffline { return nil }
+        let total = runningOffset
+
+        let chapters = ((try? cache.itemDetail(connectionID: connectionID, itemID: itemID)) ?? nil)?
+            .chapters.map { Chapter(id: $0.id, start: $0.start, end: $0.end, title: $0.title) } ?? []
+
+        let progress = (try? cache.progress(connectionID: connectionID, itemID: itemID,
+                                            episodeID: episodeID.isEmpty ? nil : episodeID)) ?? nil
+        let startTime = min(max(progress?.currentTime ?? 0, 0), total)
+
+        let title: String?
+        let author: String?
+        if episodeID.isEmpty {
+            let item = (try? cache.item(connectionID: connectionID, itemID: itemID)) ?? nil
+            title = item?.title
+            author = item?.authorName
+        } else {
+            let episode = ((try? cache.episodes(connectionID: connectionID, itemID: itemID)) ?? [])
+                .first { $0.episodeID == episodeID }
+            title = episode?.title
+            author = nil   // the podcast title arrives via `podcastTitle` → `authorOverride` in load()
+        }
+        return LocalPlaybackSource(trackURLs: trackURLs, audioTracks: audioTracks, chapters: chapters,
+                                   startTime: startTime, duration: total, title: title, author: author)
+    }
+
+    /// Load a LOCAL session into the SHARED player (M2a Task 5) — the offline twin of the streaming
+    /// branch's envelope wiring, reusing `PlayerEngine.load`/`play` and the SAME now-playing state
+    /// (`nowPlayingItemID`/`nowPlayingEpisodeID`/`nowPlayingChapters`, sleep-timer chapters, per-book
+    /// rate). No `/play` call and no `PlaybackSessionHandle`: `onSyncDue` writes `cachedProgress`
+    /// LOCALLY instead of syncing to a server. Called only from `startPlayback`, already inside the
+    /// shared reentrancy guard and after `retireCurrentSession`.
+    private func loadOfflineSession(owner: String, itemID: String, episodeId: String?,
+                                    podcastTitle: String?, source: LocalPlaybackSource) {
+        let episode = episodeId ?? ""
+        let session = PlaybackSession(
+            id: "local-\(owner)-\(itemID)-\(episode)",
+            libraryItemId: itemID,
+            episodeId: episodeId,
+            displayTitle: source.title,
+            displayAuthor: source.author,
+            duration: source.duration,
+            startTime: source.startTime,
+            currentTime: source.startTime,
+            playMethod: LocalPlaybackSession.playMethodLocal,   // 3 = ABS PlayMethod.LOCAL
+            audioTracks: source.audioTracks,
+            chapters: source.chapters)
+
+        // No server session/handle — offline playback never opened `/play`.
+        sessionHandle = nil
+        playingConnectionID = owner
+        nowPlayingItemID = itemID
+        nowPlayingEpisodeID = episodeId
+        nowPlayingChapters = source.chapters
+        sleepTimer.chapters = source.chapters
+        sleepTimer.turnOff()
+
+        // Mint a fresh persisted-session identity for THIS offline playback (Task 6): a new UUID →
+        // a new `cachedLocalSession` row, so replaying the same item later is a distinct, independently
+        // reconciled session. Captured as constants in the sync closure below, so each `loadOfflineSession`
+        // accrues onto its OWN row.
+        let sessionID = UUID().uuidString
+        let startedAt = Int(Date().timeIntervalSince1970 * 1000)
+        let sessionDuration = source.duration
+        currentOfflineSessionID = sessionID
+        currentOfflineSessionStartedAt = startedAt
+
+        // Offline sync SINK: on each due tick / flush, (1) write `cachedProgress` LOCALLY (NO
+        // network — last-write-wins by wall-clock) so the resume/UI reflect the listen, and (2)
+        // ACCRUE the listened delta onto this offline session's PERSISTED `cachedLocalSession` row
+        // (Task 6) so it survives an app kill and reconciles to the server on reconnect. Returning
+        // true marks the delta consumed; the public `onOfflineProgressAccrued` hook stays a pure
+        // observation seam (tests/extensions), NOT the accrual path.
+        playback.onSyncDue = { [weak self] payload in
+            guard let self else { return true }
+            self.writeLocalProgress(connectionID: owner, itemID: itemID, episodeID: episode,
+                                    currentTime: payload.currentTime)
+            self.accrueLocalSession(sessionID: sessionID, connectionID: owner, itemID: itemID,
+                                    episodeID: episode, currentTime: payload.currentTime,
+                                    listenedDelta: payload.timeListened, duration: sessionDuration,
+                                    startedAt: startedAt)
+            self.onOfflineProgressAccrued?(itemID, episode, payload)
+            return true
+        }
+
+        // Mirror the streaming branch's pre-`load` setup: advertise the skip interval BEFORE load()
+        // (NowPlayingUpdater.configure reads it), then the podcast-title-as-author override.
+        playback.skipInterval = Self.storedSkipInterval()
+        let authorOverride = (episodeId != nil && !(podcastTitle ?? "").isEmpty) ? podcastTitle : nil
+        playback.load(session: session, trackURLs: source.trackURLs, authorOverride: authorOverride)
+        // Per-book stored rate (falls back to the global default) — same as the streaming branch.
+        let storedRate = (try? cache.playbackRate(connectionID: owner, itemID: itemID)) ?? nil
+        playback.rate = Float(storedRate ?? Self.storedDefaultRate())
+        playback.play()
+
+        // Now-playing artwork from the disk cover cache (best-effort; skipped when offline/no client).
+        Task { await loadNowPlayingArtwork(itemID: itemID, connectionID: owner) }
+    }
+
+    /// Write offline playback progress to `cachedProgress` (M2a Task 5) — the UI's progress pills and
+    /// the next resume read this, so an offline listen is reflected with no server. Last-write-wins
+    /// locally (`upsertProgress` compares `lastUpdate`; a fresh wall-clock stamp beats older server
+    /// progress). `isFinished` is preserved from any existing row (offline finished-detection +
+    /// server reconcile are Task 6). NO network.
+    private func writeLocalProgress(connectionID: String, itemID: String, episodeID: String,
+                                    currentTime: Double) {
+        let existing = (try? cache.progress(connectionID: connectionID, itemID: itemID,
+                                            episodeID: episodeID.isEmpty ? nil : episodeID)) ?? nil
+        try? cache.upsertProgress(CachedProgress(
+            connectionID: connectionID, itemID: itemID,
+            episodeID: episodeID.isEmpty ? nil : episodeID,
+            currentTime: currentTime, isFinished: existing?.isFinished ?? false,
+            lastUpdate: Int(Date().timeIntervalSince1970 * 1000)))
+    }
+
+    // MARK: - Offline local-session accrual + reconnect reconcile (M2a Task 6)
+
+    /// ACCRUE one offline sync tick onto the current session's PERSISTED `cachedLocalSession` row.
+    /// Read-modify-write keyed by the session UUID: it ADDS this tick's `listenedDelta` onto the
+    /// row's running `timeListening` total (never overwrites it, never adds it twice), so across an
+    /// entire offline listen — and across an app restart — the row holds the TOTAL offline listen
+    /// time exactly once. The `payload.timeListened` handed to the offline sync sink is the delta
+    /// SINCE THE LAST successful sync (the controller's `didSync` consumes exactly the emitted
+    /// amount when the sink returns true), so summing the deltas is the correct, non-double-counting
+    /// accumulation. `currentTime`/`updatedAt` advance each tick; `startedAt` is fixed. All the
+    /// `DeviceInfo` bits are captured so a later reconnect can rebuild the server payload with no
+    /// live device lookup. NO network.
+    private func accrueLocalSession(sessionID: String, connectionID: String, itemID: String,
+                                    episodeID: String, currentTime: Double, listenedDelta: Double,
+                                    duration: Double, startedAt: Int) {
+        let di = deviceInfo
+        let existing = (try? cache.localSession(id: sessionID)) ?? nil
+        let accumulated = (existing?.timeListening ?? 0) + max(0, listenedDelta)
+        try? cache.upsertLocalSession(CachedLocalSession(
+            id: sessionID, connectionID: connectionID, itemID: itemID,
+            episodeID: episodeID.isEmpty ? nil : episodeID,
+            mediaType: episodeID.isEmpty ? "book" : "podcast",
+            currentTime: currentTime, timeListening: accumulated, duration: duration,
+            startedAt: existing?.startedAt ?? startedAt,
+            updatedAt: Int(Date().timeIntervalSince1970 * 1000),
+            deviceId: di.deviceId, clientName: di.clientName, clientVersion: di.clientVersion,
+            manufacturer: di.manufacturer, model: di.model))
+    }
+
+    /// Start the continuous `NWPathMonitor` reachability signal — called ONCE from the app's launch
+    /// `.task` (never from `init`, so a unit-test `AppState` doesn't stand up a live OS monitor).
+    /// The monitor's callback runs on a background queue; it hops onto the MainActor via
+    /// `handleNetworkPathUpdate(isSatisfied:)`.
+    func startReachabilityMonitoring() {
+        guard !pathMonitorStarted else { return }
+        pathMonitorStarted = true
+        pathMonitor.pathUpdateHandler = { [weak self] path in
+            let satisfied = path.status == .satisfied
+            Task { @MainActor in self?.handleNetworkPathUpdate(isSatisfied: satisfied) }
+        }
+        pathMonitor.start(queue: pathMonitorQueue)
+    }
+
+    /// The path-update sink (also the deterministic test seam). Tracks the raw link state in
+    /// `isNetworkAvailable` and fires the reconnect reconcile ONLY on the OFFLINE→ONLINE edge
+    /// (`unsatisfied → satisfied`) — not on every satisfied update, and never on a satisfied→satisfied
+    /// no-op, so a steady connection never re-reconciles. The reconcile itself is guarded reentrant
+    /// (`isReconciling`) and best-effort (a satisfied link with a still-dead server keeps everything
+    /// pending). A launch that starts already-satisfied sees no edge (initial `isNetworkAvailable`
+    /// is true), so activation/connect — not this — owns the first-run reconcile.
+    func handleNetworkPathUpdate(isSatisfied: Bool) {
+        let wasAvailable = isNetworkAvailable
+        isNetworkAvailable = isSatisfied
+        guard isSatisfied, !wasAvailable else { return }   // only the offline→online link edge
+        Task { await reconcileOnReconnect() }
+    }
+
+    /// SERVER reachability just recovered (a stored-token probe or a fresh login settled ONLINE) —
+    /// sync any pending OFFLINE sessions back (M2a final review #2). The `NWPathMonitor` link edge
+    /// (`handleNetworkPathUpdate`) fires ONLY on a DEVICE-link flap, which does NOT happen in the
+    /// PRIMARY self-hosted case (the SERVER goes down/up while the device link stays up), nor on a
+    /// relaunch-while-online — so keying sync-back solely on that edge (as before) missed both. This
+    /// runs from the `activateConnection` probe's success branch (`isOnline` false→true) and from
+    /// `completeConnection` (fresh login / relaunch), covering server recovery and relaunch alike.
+    ///
+    /// Gated on there actually being pending local sessions so a normal online connect/activate with
+    /// nothing to sync stays a pure no-op (never a stray `me()` round trip that would perturb the
+    /// FIFO of other in-flight calls). Shares `reconcileOnReconnect`'s `isReconciling` reentrancy
+    /// guard, so if the link edge ALSO fires concurrently the second trigger is dropped — it never
+    /// double-runs.
+    private func reconcileAfterServerRecovery(connectionID: String) {
+        guard let pending = try? cache.localSessions(connectionID: connectionID), !pending.isEmpty else { return }
+        Task { await reconcileOnReconnect() }
+    }
+
+    /// Reconnect reconcile (Task 6) — THE offline↔online correctness surface. Idempotent and
+    /// reentrancy-safe: a reconcile already running is not double-started (first-wins, like
+    /// `isStartingPlayback`). Runs the spec's EXACT order:
+    ///   (a) `GET /api/me` → for each pending offline session's (item, episode), compare the server's
+    ///       `lastUpdate` to local `cachedProgress` via `ProgressReconcileView.progress(itemID:episodeID:)`
+    ///       — newer SERVER progress wins locally (upsert), else keep local;
+    ///   (b) build `LocalPlaybackSession` payloads from the pending `cachedLocalSession` rows and
+    ///       `POST /api/session/local-all` them;
+    ///   (c) PRUNE ONLY the rows whose `result.success == true` — a rejected/failed session STAYS
+    ///       pending (never silently dropped, per Task 3), the currently-PLAYING session is never
+    ///       pruned (still accruing), and a row whose `updatedAt` advanced during the reconcile (a
+    ///       tick landed mid-flight) is kept so its tail is never lost or double-counted.
+    /// `me()` failing (still offline) aborts before any prune, so nothing is lost. NO double-count
+    /// across the seam: accrual is client-accumulated, and the server dedupes by the session UUID
+    /// (last-write-wins on `updatedAt`), so a kept row re-synced next time overwrites, never adds.
+    func reconcileOnReconnect() async {
+        guard !isReconciling else { return }   // a reconcile already running — don't double-start
+        isReconciling = true
+        defer { isReconciling = false }
+        guard let client, let connectionID = activeConnectionID else { return }
+
+        // (a) me() → last-write-wins into cachedProgress. A failure here means the link is up but the
+        // SERVER is still unreachable/unauthed — keep everything pending and stay offline.
+        guard let view = try? await client.progressReconcileView() else { return }
+        guard connectionID == activeConnectionID else { return }   // connection switched mid-fetch
+        // me() answered → server reachable+authed; reconcile the two signals.
+        isOnline = true
+
+        let pending = (try? cache.localSessions(connectionID: connectionID)) ?? []
+        // Reconcile each pending session's (item, episode) progress: newer SERVER wins locally.
+        for key in Set(pending.map { LocalKey(itemID: $0.itemID, episodeID: $0.episodeID) }) {
+            await reconcileServerProgress(view: view, connectionID: connectionID,
+                                          itemID: key.itemID, episodeID: key.episodeID)
+        }
+        guard !pending.isEmpty else { return }
+
+        // (b) Snapshot each row's updatedAt BEFORE the POST, then push all pending sessions.
+        let snapshot = Dictionary(uniqueKeysWithValues: pending.map { ($0.id, $0.updatedAt) })
+        let payloads = pending.map(localPlaybackSession(from:))
+        guard let results = try? await client.syncLocalSessions(payloads) else { return }
+        guard connectionID == activeConnectionID else { return }
+
+        // (c) Prune ONLY successfully-synced rows that are neither the live session nor changed mid-reconcile.
+        let successIDs = Set(results.filter { $0.success }.map { $0.id })
+        for session in pending where successIDs.contains(session.id) {
+            guard session.id != currentOfflineSessionID else { continue }   // live session — still accruing
+            let current = (try? cache.localSession(id: session.id)) ?? nil
+            // A tick landed during the reconcile (updatedAt advanced, or the row was resurrected):
+            // keep it pending so its tail is re-synced next time (server dedupes by UUID) — never lost.
+            guard let current, current.updatedAt == snapshot[session.id] else { continue }
+            try? cache.deleteLocalSession(id: session.id)
+        }
+    }
+
+    /// A `(item, episode)` reconcile key — dedups the pending sessions down to the distinct progress
+    /// rows to reconcile (several sessions for one item share one progress row).
+    private struct LocalKey: Hashable { let itemID: String; let episodeID: String }
+
+    /// me() last-write-wins for ONE (item, episode): the server's `MediaProgressEntry` wins locally
+    /// only when it is strictly NEWER than the local `cachedProgress` (`lastUpdate`), else the local
+    /// (offline-accrued) value is kept. `cache.upsertProgress` is itself last-write-wins by
+    /// `lastUpdate`, so this is doubly safe; the explicit comparison keeps the intent legible and
+    /// avoids a needless write when the server has nothing newer.
+    private func reconcileServerProgress(view: ProgressReconcileView, connectionID: String,
+                                         itemID: String, episodeID: String) async {
+        guard let server = view.progress(itemID: itemID, episodeID: episodeID) else { return }
+        let local = (try? cache.progress(connectionID: connectionID, itemID: itemID,
+                                         episodeID: episodeID.isEmpty ? nil : episodeID)) ?? nil
+        let serverLastUpdate = server.lastUpdate ?? 0
+        guard serverLastUpdate > (local?.lastUpdate ?? 0) else { return }   // else keep local
+        let isFinished = server.isFinished ?? false
+        try? cache.upsertProgress(CachedProgress(
+            connectionID: connectionID, itemID: itemID,
+            episodeID: episodeID.isEmpty ? nil : episodeID,
+            currentTime: server.currentTime ?? 0, isFinished: isFinished,
+            lastUpdate: serverLastUpdate))
+        // Same auto-delete trigger (M2a Task 8) — the offline-reconnect reconcile is exactly where a
+        // downloaded episode finished OFFLINE first learns the server's `isFinished` after reconnect.
+        // `local` (read above) is the PRIOR row, so the transition gate holds here too: a server row
+        // that was ALREADY finished locally (`local?.isFinished == true`) is no transition → no delete.
+        await maybeAutoDeleteFinishedEpisode(connectionID: connectionID, itemID: itemID,
+            episodeID: episodeID, wasFinished: local?.isFinished, isFinished: isFinished)
+    }
+
+    // MARK: - Podcast auto-delete-after-finished (M2a Task 8)
+
+    /// The PRIOR cached `isFinished` for `(itemID, episodeID)`, or `nil` when no `cachedProgress` row
+    /// exists yet — the "was it finished BEFORE this update" half of the auto-delete TRANSITION gate.
+    /// A `nil` (no prior row: a fresh/rebuilt cache, or the first sync of the full history) reads as
+    /// "no witnessed transition", which is exactly what stops a whole-history reprocess from
+    /// mass-deleting every already-finished download. Read at each server-progress site BEFORE that
+    /// site's upsert overwrites the row.
+    private func priorFinished(connectionID: String, itemID: String, episodeID: String) -> Bool? {
+        ((try? cache.progress(connectionID: connectionID, itemID: itemID,
+                              episodeID: episodeID.isEmpty ? nil : episodeID)) ?? nil)?.isFinished
+    }
+
+    /// Pure eligibility decision for the "Delete downloaded episodes after finishing" preference —
+    /// no cache/`UserDefaults`/playback dependency, so it's directly unit-testable. Deletes ONLY on a
+    /// WITNESSED false→true finish: `wasFinished == false` requires a prior cached row that existed
+    /// AND was unfinished. Every other prior state is disqualifying:
+    ///  - `wasFinished == nil` (NO prior row — fresh/rebuilt cache, first full-history sync) → false,
+    ///    so a rebuilt cache or a first `me()`/`user_updated` full-list sync NEVER mass-deletes.
+    ///  - `wasFinished == true` (already finished — a reprocess of the persistent history) → false.
+    /// Plus the standing conservative guards: a BOOK (`episodeID` empty), an unfinished incoming
+    /// value, a not-downloaded episode, or the toggle OFF are each never eligible.
+    static func shouldAutoDeleteFinishedEpisode(
+        episodeID: String, wasFinished: Bool?, isFinished: Bool, isDownloaded: Bool, toggleOn: Bool
+    ) -> Bool {
+        !episodeID.isEmpty && wasFinished == false && isFinished && isDownloaded && toggleOn
+    }
+
+    /// Called from every place `cachedProgress` receives a fresh `isFinished` value for an
+    /// item/episode — the live socket `.progressUpdated`/`.progressBatch` (`apply(_:)`),
+    /// `refreshProgress`'s `me()` join, and the offline-reconnect reconcile's
+    /// `reconcileServerProgress` (Task 6) — each passing the PRIOR cached `isFinished` (`wasFinished`)
+    /// so only a genuine false→true transition ever deletes (never a full-history reprocess). The
+    /// purely-OFFLINE finish is covered by `playback.onBookFinished` in `init`, which passes
+    /// `wasFinished: false` + `isLocalFinish: true` (a real playing→finished transition the server
+    /// hasn't seen yet). Looks up the episode's CURRENT download state + the toggle, then defers to
+    /// the pure decision above. `internal` (not `private`) for direct testing, matching `apply(_:)`.
+    ///
+    /// Two safety guards live here (they need live state the pure decision can't see):
+    ///  - **Never the currently-playing episode.** A cross-device "mark finished" push for the
+    ///    episode you're ACTIVELY listening to must not yank its file mid-stream. Exempted only for
+    ///    `isLocalFinish` (the natural end-of-playback signal), where "finished" genuinely means it
+    ///    reached its end — which is exactly when deletion is wanted. A skipped push is fine: it's
+    ///    cleaned up by `onBookFinished` when playback ends, or a later finished event once playback
+    ///    moves on.
+    ///  - **Idempotent delete.** `downloads.delete` is a no-op with no matching row, so the socket
+    ///    path and `onBookFinished` both firing for one finish is harmless — no de-dup bookkeeping.
+    func maybeAutoDeleteFinishedEpisode(
+        connectionID: String, itemID: String, episodeID: String,
+        wasFinished: Bool?, isFinished: Bool, isLocalFinish: Bool = false
+    ) async {
+        if !isLocalFinish, itemID == nowPlayingItemID, episodeID == (nowPlayingEpisodeID ?? "") {
+            return
+        }
+        let isDownloaded = ((try? cache.download(
+            connectionID: connectionID, itemID: itemID, episodeID: episodeID)) ?? nil)?
+            .download.state == DownloadCoordinator.State.downloaded
+        let toggleOn = UserDefaults.standard.bool(forKey: Self.deleteAfterFinishedKey)
+        guard Self.shouldAutoDeleteFinishedEpisode(
+            episodeID: episodeID, wasFinished: wasFinished, isFinished: isFinished,
+            isDownloaded: isDownloaded, toggleOn: toggleOn
+        ) else { return }
+        await downloads.delete(itemID: itemID, episodeID: episodeID)
+    }
+
+    /// Whether the given `(itemID, episodeID)` is the item CURRENTLY PLAYING FROM LOCAL FILES — an
+    /// offline session's `AVPlayer` reads those exact `file://` URLs, so removing them out from under
+    /// it breaks playback. A STREAMING session of the same item reads the network and is unaffected
+    /// (`sessionHandle != nil` there); an offline session has no server handle (`sessionHandle == nil`
+    /// with `nowPlayingItemID` set — see `loadOfflineSession`).
+    func isPlayingFromLocalFiles(itemID: String, episodeID: String?) -> Bool {
+        nowPlayingItemID == itemID
+            && (nowPlayingEpisodeID ?? "") == (episodeID ?? "")
+            && sessionHandle == nil
+            && currentOfflineSessionID != nil
+    }
+
+    /// SAFE manual delete of a download (M2a final review #5). The auto-delete path already refuses
+    /// to pull files out from under the currently-playing episode; the manual delete affordances
+    /// (`DownloadButton`, `DownloadsView`'s swipe/context-menu) had no such guard, so deleting the
+    /// download you're listening to offline would remove files under a live `AVPlayer`. DECISION:
+    /// retire the session FIRST when this `(item, episode)` is the one playing from local files, then
+    /// delete — the user explicitly asked to remove it, and playback of just-deleted files is
+    /// impossible, so stopping is the least-surprising outcome. A streaming session of the same item
+    /// (or any other item playing) is left untouched.
+    func deleteDownload(itemID: String, episodeID: String?) async {
+        if isPlayingFromLocalFiles(itemID: itemID, episodeID: episodeID) {
+            await retireCurrentSession()
+        }
+        await downloads.delete(itemID: itemID, episodeID: episodeID)
+    }
+
+    /// Rebuild the server `LocalPlaybackSession` payload from a persisted `cachedLocalSession` row —
+    /// the client UUID is carried through so the server dedupes a resync (last-write-wins on
+    /// `updatedAt`), and the captured `DeviceInfo` bits make the payload complete with no live lookup.
+    private func localPlaybackSession(from s: CachedLocalSession) -> LocalPlaybackSession {
+        LocalPlaybackSession(
+            id: s.id, libraryItemId: s.itemID, episodeId: s.episodeID.isEmpty ? nil : s.episodeID,
+            mediaType: s.mediaType, currentTime: s.currentTime, timeListened: s.timeListening,
+            duration: s.duration,
+            deviceInfo: DeviceInfo(deviceId: s.deviceId, clientName: s.clientName,
+                                   clientVersion: s.clientVersion, manufacturer: s.manufacturer,
+                                   model: s.model),
+            startedAt: s.startedAt, updatedAt: s.updatedAt)
     }
 
     /// Loads the now-playing book's cover bytes (through the disk-backed `CoverStore`, the same
@@ -1379,4 +2070,22 @@ final class AppState {
         }
     }
     #endif
+}
+
+/// The resolved LOCAL playback source for a fully-downloaded item/episode (M2a Task 5) — the cached
+/// pieces `localPlaybackSource` gathers and `loadOfflineSession` assembles into a local
+/// `PlaybackSession`. A transient value passed between the two; never persisted.
+private struct LocalPlaybackSource {
+    /// Ordered `file://` URLs for the downloaded tracks (by `trackIndex`).
+    let trackURLs: [URL]
+    /// One `AudioTrack` per file — `startOffset` is the running sum of preceding durations, so the
+    /// shared `BookTimeline` maps global time onto the local files exactly as it does for a stream.
+    let audioTracks: [AudioTrack]
+    let chapters: [Chapter]
+    /// Resume position from `cachedProgress` (clamped to `duration`).
+    let startTime: Double
+    /// Total playback seconds (sum of per-file durations).
+    let duration: Double
+    let title: String?
+    let author: String?
 }

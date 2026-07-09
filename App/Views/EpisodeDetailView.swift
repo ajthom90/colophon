@@ -166,20 +166,26 @@ struct EpisodeDetailView: View {
 
     private func playSection(_ episode: CachedEpisode) -> some View {
         VStack(spacing: 10) {
-            Button {
-                Task {
-                    await app.startPlayback(itemID: route.podcastItemID, episodeId: route.episodeID,
-                                             podcastTitle: route.podcastTitle)
+            HStack(spacing: 12) {
+                Button {
+                    Task {
+                        await app.startPlayback(itemID: route.podcastItemID, episodeId: route.episodeID,
+                                                 podcastTitle: route.podcastTitle)
+                    }
+                } label: {
+                    Label(playLabel(episode), systemImage: "play.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 4)
                 }
-            } label: {
-                Label(playLabel(episode), systemImage: "play.fill")
-                    .font(.headline)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 4)
+                .buttonStyle(.glassProminent)
+                .controlSize(.large)
+                .fontDesign(.default)
+
+                // Download affordance (M2a Task 8) — plain, secondary, NEVER glass; same rationale
+                // as `ItemDetailView`'s book placement. Bound to THIS episode's own download state.
+                DownloadButton(itemID: route.podcastItemID, episodeID: route.episodeID)
             }
-            .buttonStyle(.glassProminent)
-            .controlSize(.large)
-            .fontDesign(.default)
 
             // Enabled only while something is playing — there's a "current" now-playing item to
             // queue after (matches ItemDetailView's book Add-to-Queue guard; the queue UI is only
