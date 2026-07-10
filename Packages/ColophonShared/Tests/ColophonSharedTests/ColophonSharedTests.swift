@@ -106,6 +106,44 @@ private func tearDown(suite: String, container: URL) {
     #expect(store.readContinueListening() == nil)
 }
 
+/// The M2b Task 5 `connectionID` (the publishing connection) round-trips through the store — the field
+/// `resume` gates on so it never starts a foreign server's item.
+@Test func continueListeningSnapshotCarriesConnectionIDThroughFile() throws {
+    let (store, suite, container) = try makeStore()
+    defer { tearDown(suite: suite, container: container) }
+
+    let snapshot = ContinueListeningSnapshot(
+        entries: [.init(itemID: "li_1", title: "Book One", author: "Author One", progress: 0.25)],
+        connectionID: "conn-1")
+    store.writeContinueListening(snapshot)
+
+    let read = try #require(store.readContinueListening())
+    #expect(read.connectionID == "conn-1")
+    #expect(read == snapshot)
+}
+
+/// A pre-Task-5 blob has no `connectionID` key — it must decode with a nil connectionID (never crash),
+/// so a legacy snapshot is simply treated as non-matching by `resume`.
+@Test func continueListeningSnapshotDecodesLegacyBlobWithoutConnectionID() throws {
+    let json = #"{"entries":[{"itemID":"li_1","title":"T","author":"A","progress":0.2}]}"#
+    let snapshot = try JSONDecoder().decode(ContinueListeningSnapshot.self, from: Data(json.utf8))
+    #expect(snapshot.connectionID == nil)
+    #expect(snapshot.entries.count == 1)
+}
+
+/// `clearContinueListening()` removes the blob (sign-out / connection removal) — `read` returns nil.
+@Test func clearContinueListeningRemovesTheBlob() throws {
+    let (store, suite, container) = try makeStore()
+    defer { tearDown(suite: suite, container: container) }
+
+    store.writeContinueListening(ContinueListeningSnapshot(
+        entries: [.init(itemID: "li_1", title: "T", author: "A", progress: 0.2)], connectionID: "conn-1"))
+    #expect(store.readContinueListening() != nil)
+
+    store.clearContinueListening()
+    #expect(store.readContinueListening() == nil)
+}
+
 // MARK: - Artwork thumbnails (container files)
 
 @Test func artworkWriteReturnsRelativePathAndReadsBack() throws {

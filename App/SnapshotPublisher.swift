@@ -34,6 +34,13 @@ struct SnapshotPublisher {
         reloadWidgets()
     }
 
+    /// Clear the continue-listening snapshot (sign-out / connection removal), then reload widget
+    /// timelines so the home widget drops the signed-out connection's shelf (M2b Task 5).
+    func clearContinueListening() {
+        store.clearContinueListening()
+        reloadWidgets()
+    }
+
     /// Persist a cover thumbnail into the container, returning its container-relative path.
     @discardableResult
     func writeArtwork(_ data: Data, forKey key: String) -> String? {

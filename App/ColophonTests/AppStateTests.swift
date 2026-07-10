@@ -456,6 +456,69 @@ struct AppStateTests {
         #expect(store.readNowPlaying() == nil)
     }
 
+    /// `resumePlayback` (colophon://resume / ResumeIntent) with a session ALREADY loaded resumes it IN
+    /// PLACE (`togglePlayPause`) — it does NOT open a new server session. RED-meaningful: a resume that
+    /// re-`startPlayback`ed would fire a SECOND `/play` and re-load the session.
+    @Test func resumePlaybackResumesLoadedSessionInPlace() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        await transport.enqueue(status: 200, json: bookPlayJSON)
+        await app.startPlayback(itemID: "book1")
+        #expect(app.playback.isPlaying == true)
+
+        app.playback.pause()
+        #expect(app.playback.isPlaying == false)
+        let playsBefore = await transport.recorded.filter { $0.url?.path.hasSuffix("/play") == true }.count
+
+        await app.resumePlayback()
+
+        let playsAfter = await transport.recorded.filter { $0.url?.path.hasSuffix("/play") == true }.count
+        #expect(app.nowPlayingItemID == "book1")   // same session, not re-opened
+        #expect(playsAfter == playsBefore)         // NO second /play — resumed in place
+        #expect(app.playback.isPlaying == true)    // toggled back to playing
+    }
+
+    /// `resumePlayback` with NOTHING loaded starts the TOP continue-listening entry — but ONLY when the
+    /// snapshot was published by the ACTIVE connection. A snapshot from a different / signed-out server
+    /// is ignored (never resumed against the active client). RED-meaningful: dropping the connectionID
+    /// gate would start `book1` from the foreign snapshot too.
+    @Test func resumePlaybackStartsTopEntryForMatchingConnectionOnly() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let container = makeTempDir()
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let store = SharedStore(suiteName: "colophon.tests.\(UUID().uuidString)", containerURL: container)
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: makeTempDir(),
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: InMemoryTokenStore(),
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() },
+            snapshotStore: store)
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let connID = try #require(app.activeConnectionID)
+        let entry = ContinueListeningSnapshot.Entry(
+            itemID: "book1", title: "A Book", author: "Auth", progress: 0.4)
+
+        // A snapshot from a DIFFERENT connection must NOT resume against the active client.
+        store.writeContinueListening(ContinueListeningSnapshot(entries: [entry], connectionID: "other-conn"))
+        await app.resumePlayback()
+        #expect(app.nowPlayingItemID == nil)   // foreign snapshot ignored — nothing started
+
+        // A snapshot from the ACTIVE connection resumes the TOP entry via startPlayback.
+        store.writeContinueListening(ContinueListeningSnapshot(entries: [entry], connectionID: connID))
+        await transport.enqueue(status: 200, json: bookPlayJSON)
+        await app.resumePlayback()
+        #expect(app.nowPlayingItemID == "book1")
+    }
+
     /// A fake `ActivityManaging` recording the Live Activity start/update/end the app drives — the
     /// seam that lets the lifecycle wiring be asserted on the simulator without a live ActivityKit
     /// host. `isActive` mirrors the real manager's contract (true after start, false after end).

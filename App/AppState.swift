@@ -942,6 +942,13 @@ final class AppState {
         // books never linger in system Spotlight. Domain-scoped, so ONLY this connection's items go —
         // `removeConnection` inherits it (its first step is this method).
         spotlight.deindex(connectionID: id)
+        // Clear the continue-listening snapshot IF it belongs to this (signed-out/removed) connection,
+        // so its books never linger for the home widget or `resume` (mirrors the Spotlight de-index +
+        // `queue.removeEntries`). Gated on the snapshot's own `connectionID` so signing out an INACTIVE
+        // connection never wipes the ACTIVE one's widget shelf (the store holds a single shared blob).
+        if snapshots.store.readContinueListening()?.connectionID == id {
+            snapshots.clearContinueListening()
+        }
         // Drop this connection's up-next entries (Task 8): a signed-out / removed connection can't
         // play, so its queued books shouldn't linger. `advanceToNext`'s valid-connection guard is
         // the defense-in-depth backstop; this keeps the visible queue honest immediately.
@@ -2076,7 +2083,10 @@ final class AppState {
                 return nil
             }
         }
-        snapshots.publishContinueListening(ContinueListeningSnapshot(entries: entries))
+        // Stamp the publishing connection onto the snapshot (M2b Task 5) so `resume` never starts a
+        // different / signed-out server's item against the active connection's client.
+        snapshots.publishContinueListening(
+            ContinueListeningSnapshot(entries: entries, connectionID: activeConnectionID))
 
         guard let client, let connectionID = activeConnectionID, !entries.isEmpty else { return }
         // Capture the shelf source's identity NOW; the guard in `loadContinueListeningArtwork`
@@ -2143,7 +2153,8 @@ final class AppState {
         // The staleness bail: the active connection/library changed while covers were fetching, so
         // this snapshot is for a superseded shelf source — drop it rather than overwrite the current.
         guard activeConnectionID == connectionID, activeLibraryID == libraryID else { return }
-        snapshots.publishContinueListening(ContinueListeningSnapshot(entries: updated))
+        snapshots.publishContinueListening(
+            ContinueListeningSnapshot(entries: updated, connectionID: connectionID))
     }
 
     /// Fractional progress (0…1) for a continue-listening entry, joined from the local `cachedProgress`
@@ -2207,7 +2218,10 @@ final class AppState {
             if !playback.isPlaying { playback.togglePlayPause() }
             return
         }
-        guard let entry = DeepLinkRouter.resumeTarget(in: snapshots.store.readContinueListening()) else { return }
+        // Gate on the snapshot's own connectionID matching the active one — never resume a different /
+        // signed-out server's item against the active connection's client.
+        guard let entry = DeepLinkRouter.resumeTarget(
+            in: snapshots.store.readContinueListening(), activeConnectionID: activeConnectionID) else { return }
         await startPlayback(itemID: entry.itemID, episodeId: entry.episodeID)
     }
 
@@ -2234,14 +2248,20 @@ final class AppState {
         guard !items.isEmpty else { return }
         let coverStore = self.coverStore
         let thumbnailIDs = Set(items.prefix(Self.spotlightThumbnailCap).map(\.id))
-        spotlight.index(items: items, connectionID: connectionID) { item in
-            guard thumbnailIDs.contains(item.id),
-                  let data = try? await coverStore.coverData(
-                    connectionID: connectionID, itemID: item.id, updatedAt: item.updatedAt,
-                    fetch: { throw CancellationError() })
-            else { return nil }
-            return ArtworkThumbnail.downscale(data, maxPixelSize: Self.spotlightThumbnailPixelSize)
-        }
+        spotlight.index(
+            items: items, connectionID: connectionID,
+            thumbnail: { item in
+                guard thumbnailIDs.contains(item.id),
+                      let data = try? await coverStore.coverData(
+                        connectionID: connectionID, itemID: item.id, updatedAt: item.updatedAt,
+                        fetch: { throw CancellationError() })
+                else { return nil }
+                return ArtworkThumbnail.downscale(data, maxPixelSize: Self.spotlightThumbnailPixelSize)
+            },
+            // TOCTOU guard: skip the (possibly-lagging) index write if this connection is no longer the
+            // active, signed-in one — a sign-out nils `client` (and a switch changes `activeConnectionID`),
+            // so a de-indexed connection's items are never resurrected by an in-flight index Task.
+            isStillActive: { [weak self] in self?.activeConnectionID == connectionID && self?.client != nil })
     }
 
     /// Cap on how many items get a Spotlight cover thumbnail per refresh (disk reads + image decodes),

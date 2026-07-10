@@ -36,7 +36,17 @@ public struct ContinueListeningSnapshot: Codable, Sendable, Equatable {
 
     public var entries: [Entry]
 
-    public init(entries: [Entry] = []) {
+    /// The connection that PUBLISHED this snapshot (M2b Task 5). `SharedStore` holds a SINGLE shared
+    /// continue-listening blob, last written by whichever connection's Home most recently published —
+    /// it carries no connection identity on its own. `colophon://resume` / `ResumeIntent` start the top
+    /// entry's `itemID` against the CURRENTLY-active connection's client, so they must gate on this
+    /// matching the active connection: an `itemID` from a DIFFERENT / signed-out server must never be
+    /// resumed. `nil` for a legacy blob written before this field existed (treated as non-matching, so a
+    /// pre-upgrade blob never cross-resumes).
+    public var connectionID: String?
+
+    public init(entries: [Entry] = [], connectionID: String? = nil) {
         self.entries = entries
+        self.connectionID = connectionID
     }
 }

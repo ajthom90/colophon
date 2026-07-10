@@ -77,6 +77,13 @@ public struct SharedStore: Sendable {
         return try? JSONDecoder().decode(ContinueListeningSnapshot.self, from: data)
     }
 
+    /// Remove the continue-listening blob entirely (M2b Task 5) — called on sign-out / connection
+    /// removal so a signed-out connection's shelf never lingers for the widget or `resume`. A missing
+    /// file is a no-op. `readContinueListening()` reads nil afterwards.
+    public func clearContinueListening() {
+        try? FileManager.default.removeItem(at: continueListeningURL)
+    }
+
     // MARK: - Artwork thumbnails (container files)
 
     private var artworkDirectoryURL: URL {

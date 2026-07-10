@@ -54,16 +54,25 @@ struct DeepLinkRoutingTests {
         #expect(dest == .resume)
     }
 
-    // MARK: - resume-target selection (pure)
+    // MARK: - resume-target selection (pure, connection-gated)
 
-    @Test func resumeTargetIsTopContinueListeningEntry() {
+    @Test func resumeTargetIsTopEntryOnlyForMatchingConnection() {
         let snapshot = ContinueListeningSnapshot(entries: [
             .init(itemID: "top", title: "Top", author: "A", progress: 0.3),
             .init(itemID: "second", episodeID: "e2", title: "Second", author: "B", progress: 0.1),
-        ])
-        #expect(DeepLinkRouter.resumeTarget(in: snapshot)?.itemID == "top")
-        #expect(DeepLinkRouter.resumeTarget(in: ContinueListeningSnapshot(entries: [])) == nil)
-        #expect(DeepLinkRouter.resumeTarget(in: nil) == nil)
+        ], connectionID: "c1")
+        // Matching connection → the top entry.
+        #expect(DeepLinkRouter.resumeTarget(in: snapshot, activeConnectionID: "c1")?.itemID == "top")
+        // A DIFFERENT / signed-out connection → nil (never resume a foreign server's item).
+        #expect(DeepLinkRouter.resumeTarget(in: snapshot, activeConnectionID: "other") == nil)
+        // A legacy blob with no connectionID → nil.
+        #expect(DeepLinkRouter.resumeTarget(
+            in: ContinueListeningSnapshot(entries: snapshot.entries), activeConnectionID: "c1") == nil)
+        // Empty shelf / no active connection / nil snapshot → nil.
+        #expect(DeepLinkRouter.resumeTarget(
+            in: ContinueListeningSnapshot(entries: [], connectionID: "c1"), activeConnectionID: "c1") == nil)
+        #expect(DeepLinkRouter.resumeTarget(in: snapshot, activeConnectionID: nil) == nil)
+        #expect(DeepLinkRouter.resumeTarget(in: nil, activeConnectionID: "c1") == nil)
     }
 
     // MARK: - AppState dispatch

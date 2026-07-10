@@ -61,9 +61,16 @@ final class SpotlightIndexer {
     /// Index (upsert) a batch of cached items for a connection, resolving each item's optional cover
     /// thumbnail through the injected async provider (disk-only in production — no network). Runs off
     /// the caller's critical path in a `Task`; best-effort.
+    ///
+    /// TOCTOU GUARD: the thumbnail reads are awaited, so a sign-out (`deindex(connectionID:)`, which is
+    /// synchronous) can complete WHILE this Task is in flight — the lagging write would otherwise
+    /// resurrect the signed-out connection's items. `isStillActive` is re-checked on the MainActor
+    /// immediately BEFORE the write; if the connection is no longer active/signed-in, the batch is
+    /// dropped.
     func index(
         items: [CachedItem], connectionID: String,
-        thumbnail: @escaping @Sendable (CachedItem) async -> Data?
+        thumbnail: @escaping @Sendable (CachedItem) async -> Data?,
+        isStillActive: @escaping @MainActor () -> Bool
     ) {
         guard !items.isEmpty else { return }
         let index = self.index
@@ -74,6 +81,7 @@ final class SpotlightIndexer {
                 searchables.append(Self.searchableItem(
                     for: item, connectionID: connectionID, thumbnailData: await thumbnail(item)))
             }
+            guard isStillActive() else { return }
             try? await index.indexSearchableItems(searchables)
         }
     }

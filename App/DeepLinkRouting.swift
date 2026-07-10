@@ -63,9 +63,16 @@ enum DeepLinkRouter {
     }
 
     /// The resume target for `colophon://resume` / `ResumeIntent` — the TOP continue-listening entry
-    /// (the app publishes the shelf most-recent-first, matching the widget's order), or nil when the
-    /// shelf is empty.
-    static func resumeTarget(in snapshot: ContinueListeningSnapshot?) -> ContinueListeningSnapshot.Entry? {
-        snapshot?.entries.first
+    /// (the app publishes the shelf most-recent-first, matching the widget's order), but ONLY when the
+    /// snapshot was published by the CURRENTLY-active connection (`snapshot.connectionID ==
+    /// activeConnectionID`). A snapshot from a different / signed-out server — or a legacy blob with no
+    /// `connectionID` — yields nil, so `resume` never starts a foreign server's item against the active
+    /// connection's client. Nil too when the shelf is empty or there's no active connection.
+    static func resumeTarget(
+        in snapshot: ContinueListeningSnapshot?, activeConnectionID: String?
+    ) -> ContinueListeningSnapshot.Entry? {
+        guard let snapshot, let activeConnectionID,
+              snapshot.connectionID == activeConnectionID else { return nil }
+        return snapshot.entries.first
     }
 }
