@@ -7,8 +7,13 @@ import SwiftUI
 /// `ColophonApp` (typeface, root `fontDesign`) and `AppState.startPlayback` (rate, skip interval,
 /// via plain `UserDefaults` reads — `AppState` isn't a `View`) also read.
 ///
-/// Presented two ways, same view both times: a macOS `Settings` scene (⌘,) in `ColophonApp`, and
-/// an iOS/iPadOS sheet from the gear button on `ConnectionsView`.
+/// Presented several ways, same view every time: a macOS `Settings` scene (⌘,) in `ColophonApp`,
+/// the account-menu sheet shared by `PhoneShell`/`SplitShell` (`RootShell.swift`), and an
+/// iOS/iPadOS sheet from the gear button on `ConnectionsView`. The two sheet call sites already
+/// wrap this view in their own `NavigationStack`; the macOS `Settings` scene did NOT, so the
+/// "Support the app" `NavigationLink` below would dead-end there (this project's Mac
+/// navigationDestination gotcha — a `NavigationLink` needs a `NavigationStack` ancestor to push
+/// into) until `ColophonApp` was updated to wrap it too.
 struct SettingsView: View {
     @AppStorage("colophon.typeface") private var typeface = "serif"
     @AppStorage("colophon.defaultRate") private var defaultRate = 1.0
@@ -45,6 +50,22 @@ struct SettingsView: View {
                 Toggle("Delete Downloaded Episodes After Finishing", isOn: $deleteEpisodesAfterFinishing)
             } footer: {
                 Text("When on, a downloaded podcast episode's files are removed automatically once you finish listening to it. Books are never deleted automatically.")
+            }
+            // M2c Task 2: an unobtrusive final section — a tip unlocks nothing (Global Constraint),
+            // so it lives below every real preference, never mixed in with them.
+            Section {
+                NavigationLink {
+                    TipJarView()
+                } label: {
+                    Label {
+                        Text("Support the app")
+                    } icon: {
+                        Image(systemName: "heart.fill")
+                            .foregroundStyle(.pink)
+                    }
+                }
+            } footer: {
+                Text("Colophon is free, with every feature included. A tip is optional, and always appreciated.")
             }
         }
         .formStyle(.grouped)
