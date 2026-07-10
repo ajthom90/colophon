@@ -3,12 +3,20 @@ import ColophonShared
 
 // The App Intents that control playback for the companion surfaces (M2b Task 3). They live in a
 // SharedIntents source folder compiled into BOTH the app target and the ColophonWidgets extension so
-// (a) the app's App Intents metadata includes them — the system routes `perform()` to the running app
-// process — and (b) the Control Center control (in the extension) can reference `SetPlaybackIntent`.
+// (a) the app's App Intents metadata includes them and (b) the Control Center control (in the
+// extension) can reference `SetPlaybackIntent`.
+//
+// GUARANTEED app-process routing: each intent conforms to `AppIntents.AudioPlaybackIntent` (a marker
+// protocol, `AudioPlaybackIntent: SystemIntent` — zero extra requirements). This is Apple's documented
+// mechanism to GUARANTEE `perform()` runs in the CONTAINING APP process (launching it if suspended),
+// not the widget extension. Without it, the OS default routes `perform()` to the extension whenever the
+// app is suspended — and a PAUSED audio app suspends within ~30s — where only `NoOpPlaybackCommanding`
+// is registered, so a Play tap would silently no-op. The conformance is exactly what makes the
+// `@Dependency` bridge below reach the LIVE player reliably.
 //
 // BRIDGE to the live player: each intent resolves `PlaybackControlProvider` via `@Dependency`. The app
 // registers a provider wrapping the LIVE `PlaybackController` at launch (`AudioPlaybackIntentBridge`),
-// so when the app is running — which a media app must be to hold audio — `perform()` reaches the real
+// and because `perform()` runs in the app process (per the conformance above), it reaches the real
 // player. This is ADDITIVE to the existing `MPRemoteCommandCenter` now-playing controls
 // (`NowPlayingUpdater`), which stay exactly as they were.
 //
@@ -20,7 +28,7 @@ import ColophonShared
 /// Sets the play/pause state — the `SetValueIntent` behind the Control Center / Lock Screen play-pause
 /// toggle (`PlayPauseControlWidget`). `value` is the DESIRED playing state the toggle requests
 /// (on = play), so the control's optimistic flip maps straight to play/pause on the live player.
-struct SetPlaybackIntent: SetValueIntent {
+struct SetPlaybackIntent: SetValueIntent, AppIntents.AudioPlaybackIntent {
     static let title: LocalizedStringResource = "Play or Pause"
     static let description = IntentDescription("Play or pause the current audiobook.")
 
@@ -34,9 +42,10 @@ struct SetPlaybackIntent: SetValueIntent {
     }
 }
 
-/// Toggles play/pause regardless of current state — for Siri/Shortcuts and the Live Activity button
-/// (Task 4). Same live-player `@Dependency` bridge as `SetPlaybackIntent`.
-struct TogglePlaybackIntent: AppIntent {
+/// Toggles play/pause regardless of current state — for the Live Activity button (Task 4) and,
+/// once an `AppShortcutsProvider` registers it in Task 5, Siri/Shortcuts. Same live-player
+/// `@Dependency` bridge as `SetPlaybackIntent`.
+struct TogglePlaybackIntent: AppIntent, AppIntents.AudioPlaybackIntent {
     static let title: LocalizedStringResource = "Toggle Play/Pause"
     static let description = IntentDescription("Toggle play or pause for the current audiobook.")
 
@@ -50,7 +59,7 @@ struct TogglePlaybackIntent: AppIntent {
 }
 
 /// Skips forward by the app's live skip interval.
-struct SkipForwardIntent: AppIntent {
+struct SkipForwardIntent: AppIntent, AppIntents.AudioPlaybackIntent {
     static let title: LocalizedStringResource = "Skip Forward"
     static let description = IntentDescription("Skip forward in the current audiobook.")
 
@@ -64,7 +73,7 @@ struct SkipForwardIntent: AppIntent {
 }
 
 /// Skips back by the app's live skip interval.
-struct SkipBackwardIntent: AppIntent {
+struct SkipBackwardIntent: AppIntent, AppIntents.AudioPlaybackIntent {
     static let title: LocalizedStringResource = "Skip Back"
     static let description = IntentDescription("Skip back in the current audiobook.")
 

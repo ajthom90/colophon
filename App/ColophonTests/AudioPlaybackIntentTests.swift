@@ -1,4 +1,5 @@
 import Testing
+import AppIntents
 import ColophonShared
 @testable import Colophon
 
@@ -62,6 +63,17 @@ struct AudioPlaybackIntentTests {
         _ = try await intent.perform()
         #expect(fake.toggleCount == 2)
         #expect(fake.isPlaying == false)
+    }
+
+    /// Regression guard for the Critical review finding: all four intents MUST conform to
+    /// `AppIntents.AudioPlaybackIntent` so the OS routes `perform()` to the app process (where the live
+    /// provider is registered) rather than the widget extension (where only the no-op is). This binds
+    /// each to `any AudioPlaybackIntent` — it fails to COMPILE if a conformance is dropped.
+    @Test func intentsConformToAudioPlaybackIntent() {
+        let intents: [any AudioPlaybackIntent] = [
+            SetPlaybackIntent(), TogglePlaybackIntent(), SkipForwardIntent(), SkipBackwardIntent(),
+        ]
+        #expect(intents.count == 4)
     }
 
     @Test func skipIntentsUseTheLiveSkipInterval() async throws {
