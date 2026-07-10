@@ -49,6 +49,10 @@ struct SnapshotPublisher {
         store.writeTypefacePreference(UserDefaults.standard.string(forKey: "colophon.typeface") ?? "serif")
         // Live Activity + Control Center are iOS-only; the home widget also lives on iOS first.
         WidgetCenter.shared.reloadAllTimelines()
+        // The Control Center / Lock Screen play-pause control (M2b Task 3) reads `isPlaying` from the
+        // now-playing snapshot via its `ControlValueProvider`; `reloadAllTimelines()` does NOT refresh
+        // controls, so nudge them too so the toggle reflects the new play/pause state promptly.
+        ControlCenter.shared.reloadAllControls()
         #endif
     }
 }

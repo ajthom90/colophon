@@ -31,6 +31,11 @@ targets:
       - path: App
         excludes:
           - ColophonTests
+      # The playback App Intents (M2b Task 3) are compiled into BOTH the app and the widget extension
+      # (see the ColophonWidgets target) so the app's App Intents metadata includes them — the system
+      # routes `perform()` to the running app process, where the live-player `@Dependency` is
+      # registered — while the Control Center control (in the extension) references the same intents.
+      - path: SharedIntents
     dependencies:
       - package: ABSKit
       - package: ABSKit
@@ -86,7 +91,11 @@ targets:
   ColophonWidgets:
     type: app-extension
     supportedDestinations: [iOS]
-    sources: [Widgets]
+    sources:
+      - Widgets
+      # The playback App Intents (M2b Task 3), shared with the app target — so the Control Center
+      # control (`PlayPauseControlWidget`, in Widgets/) can reference `SetPlaybackIntent`.
+      - SharedIntents
     dependencies:
       - package: ColophonShared
     settings:

@@ -20,7 +20,7 @@ private struct PerfSpikeAutoOpener: View {
 
 @main
 struct ColophonApp: App {
-    @State private var app = AppState()
+    @State private var app: AppState
     @Environment(\.scenePhase) private var scenePhase
     /// Single source of truth for typography (Global Constraints: `colophon.typeface`, "serif"
     /// default | "sans"). Applied outermost in the `WindowGroup` content's modifier chain, so it
@@ -38,6 +38,15 @@ struct ColophonApp: App {
     @AppStorage("colophon.skipInterval") private var skipInterval = AppState.defaultSkipInterval
 
     init() {
+        let appState = AppState()
+        _app = State(initialValue: appState)
+        // Register the App Intents dependency at app launch (M2b Task 3): the playback intents
+        // (`SetPlaybackIntent`/`TogglePlaybackIntent`/`SkipForward/BackwardIntent`) resolve this LIVE
+        // provider via `@Dependency`, so when the system runs a playback intent in the app process
+        // (the Control Center toggle, a Siri phrase, a Live Activity button) it reaches the real
+        // `PlaybackController`. Done in `init` — not a scene `.task` — so a background app-launch to
+        // service an intent (no scene rendered) still registers it before `perform()` runs.
+        AudioPlaybackIntentBridge.register(playback: appState.playback)
         #if DEBUG && os(macOS)
         PerfSpikeClock.processLaunch = Date()
         #endif
