@@ -73,10 +73,22 @@ Legend: **Do** = the action to perform · **Expect** = the pass criterion.
   progress-only pushes — but it must not go stale for more than ~15s during active playback).
 - **Do:** Let playback continue for a minute or two without touching anything.
 - **Expect:** The progress bar and elapsed time visibly advance on their own (not frozen at the
-  value from when the Activity started).
-- **Do:** Stop playback (pause and leave it, or close the item / sign out).
-- **Expect:** The Live Activity **ends** — it disappears from the Lock Screen and Dynamic Island;
-  it does not linger showing a stale paused state indefinitely.
+  value from when the Activity started) — the system advances them on-device via ActivityKit's
+  self-updating `timerInterval`, so no per-second app update is needed. **Rate caveat:** this
+  advances in real wall-clock time, so it is exact at **1× speed** and an *approximation* at other
+  playback speeds; the app re-anchors it to the true position on every pause / seek / chapter
+  transition, so any drift is bounded and self-correcting (never off by more than the interval since
+  the last such transition).
+- **Do:** Pause playback and leave it paused (do NOT close the item).
+- **Expect:** The Live Activity **persists** on the Lock Screen / Dynamic Island, showing the paused
+  state (cover, title, a play/pause glyph now showing "play"), progress/elapsed frozen at the paused
+  position. It does **not** end merely because playback paused — this matches Apple Music / Podcasts,
+  which keep the now-playing Live Activity up while paused so you can resume from it.
+- **Do:** Now STOP for real — close the item (retire the session), start a different book, or sign out.
+- **Expect:** The Live Activity **ends** on stop/retire — it disappears from the Lock Screen and
+  Dynamic Island. (Starting a different book ends the old Activity and starts a new one — see the
+  load-bearing "exactly one, always current" check below.) It never lingers after the session is
+  torn down.
 - **Do (the load-bearing check):** Start book A, let its Live Activity appear, then — without
   manually dismissing it — start playing book B (or a podcast episode) instead. Repeat by
   switching to a **different connection/server** (if you have a second one set up) mid-playback.
@@ -162,6 +174,12 @@ Legend: **Do** = the action to perform · **Expect** = the pass criterion.
   surface for M2b per every relevant task report — the lifecycle decision logic is thoroughly
   unit-tested against a fake ActivityKit seam, but the real ActivityKit host (and Dynamic Island
   hardware) can only be exercised by hand.
+- Item **b** note: the Live Activity **persists while paused** (it does not end on pause) — it ends
+  only when the session is torn down (stop / close / sign-out), and a book switch ends the old one
+  and starts a new one. Its elapsed/progress advance on-device via ActivityKit's self-updating
+  `timerInterval` while playing, which is exact at 1× and approximate at other speeds (it re-anchors
+  on every pause / seek / chapter transition) — so a small elapsed drift at 1.5×/2× is expected, not
+  a bug.
 - The App Group never carries auth tokens or credentials — only display snapshots (titles, ids,
   progress, small artwork thumbnails). If you're auditing for a security concern, that's the
   boundary to check; there is nothing sensitive to leak via the widget/Live Activity/Spotlight

@@ -304,6 +304,12 @@ final class AppState {
     /// The query the Search surface should adopt when the shell routes to it (the "Search Colophon
     /// <query>" Siri phrase, M2b Task 5). `SearchView` reads it and calls `consumePendingSearchQuery`.
     private(set) var pendingSearchQuery: String?
+    /// A `colophon://resume` / `ResumeIntent` that arrived BEFORE any connection was active (a
+    /// cold-launch resume — the intent runs immediately, unlike the nav deep links which park in
+    /// `pendingNavigation` for the shell to consume). Parked here and honored once a connection
+    /// becomes active (`honorPendingResumeIfNeeded`), so a cold-launch resume no longer no-ops
+    /// (M2b review #7).
+    private(set) var pendingResume = false
     /// Core Spotlight indexer (M2b Task 5): indexes the active connection's library items on refresh so
     /// a system Spotlight search surfaces books, and de-indexes per connection on sign-out / removal so
     /// items never leak across servers. Best-effort; compiles + runs on both platforms.
@@ -706,6 +712,9 @@ final class AppState {
         persistLastActive(connection.id)
         loadConnections()
         phase = .connected
+        // Honor a cold-launch resume that parked before any connection existed (M2b review #7); no-op
+        // unless one was queued. The client/`activeConnectionID` are live by here.
+        honorPendingResumeIfNeeded()
         // Same download reconcile as `activateConnection`'s cached-first path — the fresh sign-in is
         // also a launch/activation moment where the background session's state must meet the cache.
         Task { await downloads.reattachOnLaunch() }
@@ -853,6 +862,10 @@ final class AppState {
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
         self.client = client
+        // The connection is now active with a live client — honor a cold-launch resume that parked
+        // before any connection existed (M2b review #7). Placed AFTER `self.client` is set so the
+        // deferred `startPlayback` has a client to stream with; no-op unless a resume was queued.
+        honorPendingResumeIfNeeded()
 
         // The network probe: detached so `activateConnection` returns now, with cached browsing
         // already live. Every branch re-checks the epoch (authoritative — a sign-out/removal
@@ -949,6 +962,12 @@ final class AppState {
         if snapshots.store.readContinueListening()?.connectionID == id {
             snapshots.clearContinueListening()
         }
+        // Prune this connection's App-Group cover thumbnails (M2b review #6): they're keyed under a
+        // per-connection subdirectory, so this removes ONLY the signed-out/removed server's covers
+        // (never the active one's) — matching removeConnection's "leave nothing on disk" contract +
+        // the Spotlight de-index + snapshot clear above. Unconditional (the dir is connection-scoped,
+        // so pruning an inactive connection's covers can't touch the active one's).
+        snapshots.store.clearArtwork(connectionID: id)
         // Drop this connection's up-next entries (Task 8): a signed-out / removed connection can't
         // play, so its queued books shouldn't linger. `advanceToNext`'s valid-connection guard is
         // the defense-in-depth backstop; this keeps the visible queue honest immediately.
@@ -1992,7 +2011,7 @@ final class AppState {
         // cover cache). Keyed by item(+episode). `setNowPlayingArtwork` already republished (without a
         // path); this second publish carries the path once the write lands.
         let key = itemID + "/" + (nowPlayingEpisodeID ?? "")
-        if let path = snapshots.writeArtwork(data, forKey: key) {
+        if let path = snapshots.writeArtwork(data, forKey: key, connectionID: connectionID) {
             nowPlayingArtworkPath = path
             publishNowPlayingSnapshot()
         }
@@ -2038,6 +2057,10 @@ final class AppState {
             progress: progress,
             isPlaying: playback.isPlaying,
             elapsed: t,
+            // Carry the total duration so the Live Activity can build the self-advancing
+            // `timerInterval` range (anchor `t` back from now, run to `now + (duration - t)`) —
+            // the surface then advances elapsed/progress on-device between discrete publishes (M2b review #3).
+            duration: total,
             artworkThumbnailPath: nowPlayingArtworkPath))
     }
 
@@ -2137,7 +2160,7 @@ final class AppState {
                     return (index, nil)
                 }
                 let key = entry.itemID + "/" + (entry.episodeID ?? "")
-                return (index, store.writeArtwork(thumbnail, forKey: key))
+                return (index, store.writeArtwork(thumbnail, forKey: key, connectionID: connectionID))
             }
         }
         var updated = entries
@@ -2218,11 +2241,32 @@ final class AppState {
             if !playback.isPlaying { playback.togglePlayPause() }
             return
         }
+        // No connection active yet (a cold-launch resume that ran before boot finished activating a
+        // connection): PARK the request and honor it once a connection becomes active
+        // (`honorPendingResumeIfNeeded`). Without this, resume would run immediately and no-op — the
+        // resume-target read below gates on an active connection — so the cold-launch resume would be
+        // silently lost, unlike the nav deep links which defer via `pendingNavigation` (M2b review #7).
+        guard activeConnectionID != nil else {
+            pendingResume = true
+            return
+        }
+        pendingResume = false
         // Gate on the snapshot's own connectionID matching the active one — never resume a different /
         // signed-out server's item against the active connection's client.
         guard let entry = DeepLinkRouter.resumeTarget(
             in: snapshots.store.readContinueListening(), activeConnectionID: activeConnectionID) else { return }
         await startPlayback(itemID: entry.itemID, episodeId: entry.episodeID)
+    }
+
+    /// Honor a resume request that arrived before any connection was active (a cold-launch
+    /// `colophon://resume` / `ResumeIntent`). Called once a connection becomes active with a live
+    /// client — from `activateConnection`'s cached-first path and the fresh-login `completeConnection`
+    /// tail. A no-op unless a resume was parked; detached so it never blocks activation's fast return
+    /// (M2b review #7).
+    private func honorPendingResumeIfNeeded() {
+        guard pendingResume else { return }
+        pendingResume = false
+        Task { await resumePlayback() }
     }
 
     /// The active shell calls this after driving its stacks/selection to `pendingNavigation`.

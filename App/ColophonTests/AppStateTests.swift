@@ -519,6 +519,77 @@ struct AppStateTests {
         #expect(app.nowPlayingItemID == "book1")
     }
 
+    /// M2b review #7: a `colophon://resume` / `ResumeIntent` that fires BEFORE any connection is active
+    /// (a cold-launch resume) is PARKED, not lost — nothing plays and `pendingResume` records it for
+    /// `honorPendingResumeIfNeeded`. RED-meaningful: the pre-fix resume ran immediately and no-op'd (no
+    /// active connection → no resume target), silently dropping the request.
+    @Test func resumePlaybackDefersWhenNoConnectionActive() async throws {
+        let transport = MockTransport()
+        let app = makeApp(transportProvider: { transport }, dir: makeTempDir())
+        app.playback.muted = true
+
+        #expect(app.activeConnectionID == nil)
+        await app.resumePlayback()
+
+        #expect(app.nowPlayingItemID == nil)   // nothing started — no connection to play against
+        #expect(app.pendingResume == true)     // …but the request is parked, not lost
+    }
+
+    /// M2b review #7: a cold-launch resume parked before any connection is HONORED once a connection
+    /// becomes active — the top continue-listening entry (published by that connection) starts playing.
+    /// Models a fresh `AppState` over a stored connection's cache (the relaunch pattern) whose resume
+    /// fired before boot activated the connection.
+    @Test func coldLaunchResumeHonoredOnceConnectionActive() async throws {
+        let dir = makeTempDir()
+
+        // A first launch establishes the connection (its row + id land in the shared cache dir).
+        let t1 = MockTransport()
+        await enqueueSuccessfulConnect(t1)
+        let app1 = makeApp(transportProvider: { t1 }, dir: dir)
+        await app1.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        let connID = try #require(app1.activeConnectionID)
+
+        // The widget shelf that connection published (persisted in the App Group).
+        let container = makeTempDir()
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let store = SharedStore(suiteName: "colophon.tests.\(UUID().uuidString)", containerURL: container)
+        store.writeContinueListening(ContinueListeningSnapshot(
+            entries: [ContinueListeningSnapshot.Entry(itemID: "book1", title: "A Book", author: "An Author", progress: 0.4)],
+            connectionID: connID))
+
+        // A cold relaunch: fresh AppState over the SAME cache dir + that App-Group store.
+        let t2 = MockTransport()
+        let app2 = AppState(
+            transportProvider: { t2 },
+            cacheDirectory: dir,
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: InMemoryTokenStore(),
+            oidcTransportProvider: { t2 },
+            downloadManagerProvider: { FakeDownloadManaging() },
+            snapshotStore: store)
+        app2.playback.muted = true
+
+        // Resume fires BEFORE the connection is active → parked, nothing plays yet.
+        await app2.resumePlayback()
+        #expect(app2.nowPlayingItemID == nil)
+        #expect(app2.pendingResume == true)
+
+        // The connection comes up (fresh login reuses the stored connection's id) → the parked resume
+        // is honored and starts the top entry. The honor is detached, so drain until /play lands.
+        await enqueueSuccessfulConnect(t2)
+        await t2.enqueue(status: 200, json: bookPlayJSON)   // the honored resume's /play
+        await app2.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        #expect(app2.activeConnectionID == connID)
+
+        var attempts = 0
+        while (await t2.recorded.filter { $0.url?.path.hasSuffix("/play") == true }).isEmpty && attempts < 1000 {
+            await Task.yield()
+            attempts += 1
+        }
+        #expect(app2.nowPlayingItemID == "book1")
+        #expect(app2.pendingResume == false)
+    }
+
     /// A fake `ActivityManaging` recording the Live Activity start/update/end the app drives — the
     /// seam that lets the lifecycle wiring be asserted on the simulator without a live ActivityKit
     /// host. `isActive` mirrors the real manager's contract (true after start, false after end).

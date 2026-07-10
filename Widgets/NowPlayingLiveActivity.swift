@@ -17,9 +17,12 @@ struct NowPlayingLiveActivity: Widget {
             NowPlayingLockScreenView(attributes: context.attributes, state: context.state)
                 .activityBackgroundTint(.black.opacity(0.5))
                 .activitySystemActionForegroundColor(.white)
-                // Tapping the banner (outside the transport buttons) deep-links into the app — the same
-                // `colophon://resume` grammar the Dynamic Island uses (inert until Task 5 wires onOpenURL).
-                .widgetURL(ColophonDeepLink.resume.url)
+                // Tapping the banner body (outside the transport buttons) OPENS the now-playing item —
+                // the native Music / Podcasts idiom (a body tap navigates; the transport buttons own
+                // play/pause). NOT `resume`, which would just toggle playback / no-op for the item that
+                // is already loaded (M2b review #2). The transport buttons still own play/pause/skip.
+                .widgetURL(ColophonDeepLink.item(
+                    id: context.attributes.itemID, episodeID: context.attributes.episodeID).url)
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {
@@ -27,9 +30,7 @@ struct NowPlayingLiveActivity: Widget {
                         .frame(width: 44, height: 44)
                 }
                 DynamicIslandExpandedRegion(.trailing) {
-                    Text(NowPlayingTime.string(context.state.elapsed))
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    NowPlayingElapsed(state: context.state)
                 }
                 DynamicIslandExpandedRegion(.center) {
                     VStack(alignment: .leading, spacing: 2) {
@@ -45,8 +46,7 @@ struct NowPlayingLiveActivity: Widget {
                 }
                 DynamicIslandExpandedRegion(.bottom) {
                     VStack(spacing: 8) {
-                        ProgressView(value: context.state.progress.clampedUnit)
-                            .tint(.white)
+                        NowPlayingProgressBar(state: context.state)
                         NowPlayingTransport(isPlaying: context.state.isPlaying)
                     }
                 }
@@ -60,7 +60,10 @@ struct NowPlayingLiveActivity: Widget {
                 Image(systemName: context.state.isPlaying ? "waveform" : "pause.fill")
                     .foregroundStyle(.white)
             }
-            .widgetURL(ColophonDeepLink.resume.url)
+            // A body tap OPENS the now-playing item (native Music/Podcasts idiom), NOT `resume` — the
+            // transport buttons own play/pause (M2b review #2).
+            .widgetURL(ColophonDeepLink.item(
+                id: context.attributes.itemID, episodeID: context.attributes.episodeID).url)
         }
     }
 }
@@ -86,13 +89,75 @@ private struct NowPlayingLockScreenView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                ProgressView(value: state.progress.clampedUnit)
-                    .tint(.white)
+                NowPlayingProgressBar(state: state)
             }
             NowPlayingTransport(isPlaying: state.isPlaying)
         }
         .padding()
         .foregroundStyle(.white)
+    }
+}
+
+// MARK: - Self-advancing elapsed + progress (M2b review #3)
+
+/// The elapsed-time label. While PLAYING it renders ActivityKit's SELF-ADVANCING `Text(timerInterval:)`
+/// — the system counts it up on-device from the position anchor with NO app updates (the app publishes
+/// only on discrete transitions, so a static value would otherwise FREEZE between them). While PAUSED it
+/// shows the static elapsed value.
+///
+/// RATE CAVEAT: `timerInterval` advances in REAL wall-clock time, so the label is exact at **1× speed**
+/// and an APPROXIMATION at other playback speeds. That's acceptable — the app re-anchors it (pushes a
+/// fresh update) on every pause / seek / chapter transition, so the drift is bounded and self-correcting.
+private struct NowPlayingElapsed: View {
+    let state: NowPlayingActivityAttributes.ContentState
+
+    var body: some View {
+        Group {
+            if state.isPlaying, let range = state.timerRange {
+                Text(timerInterval: range, countsDown: false)
+            } else {
+                Text(NowPlayingTime.string(state.elapsed))
+            }
+        }
+        .font(.caption2.monospacedDigit())
+        .foregroundStyle(.secondary)
+    }
+}
+
+/// The progress bar. While PLAYING it renders ActivityKit's SELF-ADVANCING `ProgressView(timerInterval:)`
+/// (fills on-device from the anchor, no per-tick app pushes; labels suppressed so it reads as a bare
+/// bar); while PAUSED it shows the static fraction. Same 1×-exact / other-speeds-approximate caveat as
+/// `NowPlayingElapsed`.
+private struct NowPlayingProgressBar: View {
+    let state: NowPlayingActivityAttributes.ContentState
+
+    var body: some View {
+        Group {
+            if state.isPlaying, let range = state.timerRange {
+                ProgressView(timerInterval: range, countsDown: false) {
+                    EmptyView()
+                } currentValueLabel: {
+                    EmptyView()
+                }
+            } else {
+                ProgressView(value: state.progress.clampedUnit)
+            }
+        }
+        .tint(.white)
+    }
+}
+
+private extension NowPlayingActivityAttributes.ContentState {
+    /// The wall-clock range the self-advancing timer/progress advance across: `anchor ... anchor +
+    /// duration`, where `anchor = updatedAt - elapsed` is the instant the book's position-0 corresponds
+    /// to. `nil` (→ the static fallback) when the duration is unknown or the position is already at/past
+    /// the end, so `Text`/`ProgressView(timerInterval:)` always get a valid, non-empty forward range.
+    var timerRange: ClosedRange<Date>? {
+        guard duration > 0, elapsed >= 0, elapsed < duration else { return nil }
+        let start = updatedAt.addingTimeInterval(-elapsed)
+        let end = start.addingTimeInterval(duration)
+        guard start < end else { return nil }
+        return start...end
     }
 }
 

@@ -19,6 +19,11 @@ public struct LiveActivityState: Sendable, Equatable {
     public var isPlaying: Bool
     /// Seconds elapsed into the book (for a monospaced-digits elapsed label on the surface).
     public var elapsed: TimeInterval
+    /// Total book/episode duration in seconds — the denominator the surface uses to build the
+    /// self-advancing `timerInterval` range (`anchor ... anchor + duration`) so its elapsed/progress
+    /// advance on-device with NO per-tick app updates (M2b review #3). `0` when unknown → the surface
+    /// falls back to a static value.
+    public var duration: TimeInterval
     /// App-Group-relative cover-thumbnail path — the extension reads the bytes from the shared
     /// container. `nil` until the app has written a thumbnail (it arrives asynchronously, via an update).
     public var artworkThumbnailPath: String?
@@ -32,6 +37,7 @@ public struct LiveActivityState: Sendable, Equatable {
         progress: Double,
         isPlaying: Bool,
         elapsed: TimeInterval,
+        duration: TimeInterval = 0,
         artworkThumbnailPath: String? = nil
     ) {
         self.itemID = itemID
@@ -42,6 +48,7 @@ public struct LiveActivityState: Sendable, Equatable {
         self.progress = progress
         self.isPlaying = isPlaying
         self.elapsed = elapsed
+        self.duration = duration
         self.artworkThumbnailPath = artworkThumbnailPath
     }
 

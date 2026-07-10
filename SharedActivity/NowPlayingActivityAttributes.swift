@@ -21,7 +21,11 @@ struct NowPlayingActivityAttributes: ActivityAttributes {
         var isPlaying: Bool
         /// Seconds elapsed into the book (for the monospaced-digits elapsed label).
         var elapsed: TimeInterval
-        /// When this content was pushed (the app's wall clock).
+        /// Total book/episode duration in seconds — the denominator for the self-advancing
+        /// `ProgressView(timerInterval:)` and the end of the elapsed timer's range (M2b review #3).
+        var duration: TimeInterval
+        /// When this content was pushed (the app's wall clock). `updatedAt - elapsed` is the position
+        /// ANCHOR the surface builds its self-advancing `timerInterval` range from.
         var updatedAt: Date
         /// App-Group-relative cover-thumbnail path; the extension reads the bytes from the shared
         /// container. `nil` until the cover thumbnail has been written (it arrives via an update).
@@ -51,7 +55,8 @@ extension NowPlayingActivityAttributes.ContentState {
     init(state: LiveActivityState) {
         self.init(chapterTitle: state.chapterTitle, progress: state.progress,
                   isPlaying: state.isPlaying, elapsed: state.elapsed,
-                  updatedAt: Date(), artworkThumbnailPath: state.artworkThumbnailPath)
+                  duration: state.duration, updatedAt: Date(),
+                  artworkThumbnailPath: state.artworkThumbnailPath)
     }
 }
 #endif

@@ -151,11 +151,32 @@ private func tearDown(suite: String, container: URL) {
     defer { tearDown(suite: suite, container: container) }
 
     let bytes = Data([0x89, 0x50, 0x4E, 0x47, 0x01, 0x02, 0x03])
-    let relativePath = try #require(store.writeArtwork(bytes, forKey: "li_1/"))
+    let relativePath = try #require(store.writeArtwork(bytes, forKey: "li_1/", connectionID: "conn1"))
 
     #expect(relativePath.hasPrefix("artwork/"))
     #expect(store.readArtwork(atRelativePath: relativePath) == bytes)
     #expect(FileManager.default.fileExists(atPath: store.artworkURL(forRelativePath: relativePath).path))
+}
+
+/// M2b review #6: thumbnails are SCOPED per connection, and `clearArtwork(connectionID:)` prunes ONLY
+/// that connection's covers (a signed-out server's covers never linger; another connection's remain).
+@Test func artworkIsConnectionScopedAndPrunable() throws {
+    let (store, suite, container) = try makeStore()
+    defer { tearDown(suite: suite, container: container) }
+
+    let bytes = Data([0x01, 0x02, 0x03])
+    // The SAME item id under two connections resolves to DISTINCT scoped paths, both readable.
+    let pathA = try #require(store.writeArtwork(bytes, forKey: "item1/", connectionID: "connA"))
+    let pathB = try #require(store.writeArtwork(bytes, forKey: "item1/", connectionID: "connB"))
+    #expect(pathA != pathB)
+    #expect(pathA.hasPrefix("artwork/"))
+    #expect(store.readArtwork(atRelativePath: pathA) == bytes)
+    #expect(store.readArtwork(atRelativePath: pathB) == bytes)
+
+    // Pruning connA removes ONLY connA's covers; connB's survive.
+    store.clearArtwork(connectionID: "connA")
+    #expect(store.readArtwork(atRelativePath: pathA) == nil)
+    #expect(store.readArtwork(atRelativePath: pathB) == bytes)
 }
 
 // MARK: - Deep-link build + parse round-trips

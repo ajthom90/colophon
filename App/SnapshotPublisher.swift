@@ -41,10 +41,11 @@ struct SnapshotPublisher {
         reloadWidgets()
     }
 
-    /// Persist a cover thumbnail into the container, returning its container-relative path.
+    /// Persist a cover thumbnail into the container SCOPED to `connectionID` (so a sign-out can prune
+    /// the whole connection's covers), returning its container-relative path.
     @discardableResult
-    func writeArtwork(_ data: Data, forKey key: String) -> String? {
-        store.writeArtwork(data, forKey: key)
+    func writeArtwork(_ data: Data, forKey key: String, connectionID: String) -> String? {
+        store.writeArtwork(data, forKey: key, connectionID: connectionID)
     }
 
     private func reloadWidgets() {

@@ -99,15 +99,22 @@ struct SplitShell: View {
         // uses the dedicated player Window above).
         .iPadPlayerSheet(isPresented: $showingFullPlayer)
         // Drive navigation from a deep link / Siri phrase (M2b Task 5) — select the target sidebar
-        // row + push onto the Home detail stack. `.task` catches a cold-launch link that set
-        // `pendingNavigation` before this shell appeared.
+        // row + push onto the Home detail stack. `.onChange` catches a link that arrives while mounted;
+        // the connection-reset `.task(id:)` below consumes a cold-launch link that set
+        // `pendingNavigation` before this shell appeared (it always runs at mount).
         .onChange(of: app.pendingNavigation) { _, _ in consumePending() }
-        .task { consumePending() }
         .task(id: app.activeConnectionID) {
             // Reset before observing so a connection switch never flashes the previous
             // connection's libraries, and never leaves a stale library selected.
             libraries = []
             selection = .home
+            // Honor a pending deep-link / Siri nav AFTER the reset, in the SAME task — this makes
+            // reset→consume DETERMINISTIC. Previously a sibling `.task { consumePending() }` set
+            // `selection` (e.g. `.search`) while this task unconditionally reset it to `.home`, and
+            // SwiftUI does NOT order sibling mount tasks — so the reset could clobber a cold-launch
+            // Search/item deep-link selection back to Home (M2b review #1). Folding the consume in here,
+            // after the reset, removes that race: the reset always runs first, then the pending nav wins.
+            consumePending()
             guard let connectionID = app.activeConnectionID else { return }
             do {
                 for try await value in app.cache.observeLibraries(connectionID: connectionID) {

@@ -90,16 +90,33 @@ public struct SharedStore: Sendable {
         containerURL.appending(path: Self.artworkDirectoryName, directoryHint: .isDirectory)
     }
 
-    /// Write cover-thumbnail `data` under a filename derived from `key`, returning the path RELATIVE
-    /// to the container (what the snapshot stores). `nil` on write failure.
+    /// The per-connection artwork subdirectory. Thumbnails are SCOPED by connection (M2b review #6)
+    /// so a removed/signed-out server's covers can be pruned wholesale (`clearArtwork(connectionID:)`)
+    /// and never linger in the persisted, extension-readable container after sign-out.
+    private func artworkDirectoryURL(forConnection connectionID: String) -> URL {
+        artworkDirectoryURL.appending(path: Self.pathComponent(forKey: connectionID), directoryHint: .isDirectory)
+    }
+
+    /// Write cover-thumbnail `data` under a filename derived from `key`, SCOPED to `connectionID`,
+    /// returning the path RELATIVE to the container (what the snapshot stores). `nil` on write failure.
+    /// The returned path (`artwork/<connection>/<key>.img`) is what the widget / Live Activity reads
+    /// back via `readArtwork(atRelativePath:)`, so the read side needs no change to be connection-scoped.
     @discardableResult
-    public func writeArtwork(_ data: Data, forKey key: String) -> String? {
+    public func writeArtwork(_ data: Data, forKey key: String, connectionID: String) -> String? {
         ensureContainer()
-        try? FileManager.default.createDirectory(at: artworkDirectoryURL, withIntermediateDirectories: true)
+        let directory = artworkDirectoryURL(forConnection: connectionID)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let fileName = Self.artworkFileName(forKey: key)
-        let url = artworkDirectoryURL.appending(path: fileName)
+        let url = directory.appending(path: fileName)
         guard (try? data.write(to: url, options: .atomic)) != nil else { return nil }
-        return Self.artworkDirectoryName + "/" + fileName
+        return Self.artworkDirectoryName + "/" + Self.pathComponent(forKey: connectionID) + "/" + fileName
+    }
+
+    /// Delete ALL cover thumbnails for `connectionID` (sign-out / connection removal) so a signed-out
+    /// server's covers never linger in the persisted, extension-readable container — mirrors
+    /// `clearContinueListening()` + the Spotlight de-index (M2b review #6). A missing directory is a no-op.
+    public func clearArtwork(connectionID: String) {
+        try? FileManager.default.removeItem(at: artworkDirectoryURL(forConnection: connectionID))
     }
 
     /// The absolute URL for a container-relative artwork path (for `UIImage(contentsOfFile:)` etc.).
@@ -135,10 +152,15 @@ public struct SharedStore: Sendable {
         try? FileManager.default.createDirectory(at: containerURL, withIntermediateDirectories: true)
     }
 
+    /// A filesystem-safe path component for `key` (alphanumerics kept; everything else → `_`). Used for
+    /// both artwork filenames and the per-connection subdirectory name. Item/episode/connection ids are
+    /// alphanumeric-ish, so collisions across distinct keys are not a concern.
+    static func pathComponent(forKey key: String) -> String {
+        String(key.map { ($0.isLetter || $0.isNumber) ? $0 : "_" })
+    }
+
     /// A filesystem-safe, deterministic filename for `key` (alphanumerics kept; everything else → `_`).
-    /// Item/episode ids are alphanumeric-ish, so collisions across distinct keys are not a concern.
     static func artworkFileName(forKey key: String) -> String {
-        let safe = String(key.map { ($0.isLetter || $0.isNumber) ? $0 : "_" })
-        return safe + ".img"
+        pathComponent(forKey: key) + ".img"
     }
 }
