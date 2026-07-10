@@ -4,7 +4,51 @@ A native audiobook & podcast client for [Audiobookshelf](https://www.audiobooksh
 across iPhone, iPad, Mac, Apple TV, Vision Pro, and Apple Watch. Serif-typeset,
 Liquid Glass, and unapologetically Mac-assed on the Mac.
 
-**Status:** M2a offline — a book or podcast episode can be downloaded via a
+**Status:** M2b companions — Colophon's now-playing and continue-listening
+state now surfaces outside the app itself, all reading a small Codable
+snapshot (titles, ids, progress, artwork thumbnail paths — never tokens or
+credentials, which stay device-local in the Keychain) that the app
+publishes into a new App Group (`group.com.andrewthom.colophon`) via
+`ColophonShared` (the 5th local SwiftPM package), shared with a new
+`ColophonWidgets` extension target. No new GRDB migration — LibraryCache
+stays frozen at v5; the snapshot is a separate App-Group surface, not the
+local cache. A continue-listening home-screen **Widget** (small shows the
+single most-recent book with a cover, progress ring, title, author; medium
+shows up to three, each its own tap target) deep-links straight to that
+item through the app's existing `colophon://` routing. A now-playing
+**Live Activity** appears on the Lock Screen and in the Dynamic Island
+(compact and expanded) with cover, title/chapter, a progress bar, and
+play/pause/skip buttons; its start/update/end lifecycle is unit-tested
+against a fake ActivityKit seam to guarantee exactly one live Activity
+across a book switch or connection change — never leaked or duplicated. A
+**Control Center / Lock Screen** play-pause control (the Controls
+gallery, iOS 18+) toggles playback through a new `AudioPlaybackIntent`
+family; review caught that without the intents also conforming to the
+`AudioPlaybackIntent` marker protocol, the toggle would silently resolve
+against the widget extension's inert fallback instead of the running app
+once it suspended (a paused audio app does within ~30s) — fixed, and
+locked in by a compile-time conformance test, so resuming playback from a
+suspended app actually works. **Siri/Shortcuts** gained three phrases via
+an `AppShortcutsProvider` — "Resume my audiobook in Colophon," "Open
+Colophon," "Search Colophon" — and library items are indexed into system
+**Spotlight** (Core Spotlight, per-connection, de-indexed on sign-out so
+one server's books never surface under another's search); both route back
+into the app through the same deep-link handling. The existing
+`MPNowPlayingInfoCenter`/`MPRemoteCommandCenter` Now Playing/Control
+Center integration (M1c-b) is untouched — every companion surface here is
+additive to it, reusing the existing `AppState`/`PlayerEngine` rather than
+a parallel player. **Platform scope:** the `ColophonWidgets` extension
+(the Home Screen widget, the Live Activity, and the Control Center
+control) is iOS/iPadOS-only this milestone — no Mac widget shipped; the
+App Intents (Siri/Shortcuts) and Spotlight indexing build and function on
+macOS too. See `docs/superpowers/m2b-human-verification.md` for the
+device-only checklist (adding the widget, the Dynamic Island/Lock Screen
+Live Activity, the Control Center toggle after the app has been
+suspended, Siri phrases, Spotlight search) the automated, always-muted
+E2E/sim can't cover — the Dynamic Island in particular needs a real,
+supported iPhone.
+
+Built on M2a's offline downloads — a book or podcast episode can be downloaded via a
 background `URLSession` (a new `DownloadManager` package — the 4th local
 SwiftPM package — behind a testable `DownloadSession` seam, so transfers are
 unit-tested with a `FakeDownloadSession` and never touch the network in CI),
@@ -118,7 +162,10 @@ progress sync, live Socket.IO updates, on iOS + macOS). Underneath M1c-c:
 no new GRDB migration — the v2 `cachedEpisode` table and the 3-part
 `cachedProgress` PK (both from M1c-a) already modeled episodes; `v1`/`v2`/
 `v3` remain frozen (offline downloads landed in M2a — see the schema note
-above). Spikes for socket.io handshake, macOS grid performance, and the
+above); M2b's companion surfaces (widgets, Live Activity, Control Center,
+Siri/Spotlight) added no migration either — they read a separate
+App-Group snapshot, never the GRDB cache directly. Spikes for socket.io
+handshake, macOS grid performance, and the
 OIDC cookie/redirect walk are documented in `docs/superpowers/spikes/`.
 CarPlay entitlement application: pending user filing (will be recorded in
 docs/superpowers/carplay-entitlement.md).
@@ -131,7 +178,7 @@ Requirements: Xcode 26.6, XcodeGen (`brew install xcodegen`), Docker.
     make server-up    # start dev Audiobookshelf + Dex (OIDC) at localhost:13378 / :5556
     make seed         # root/colophon-dev + a LibriVox test book + a seeded 2-episode
                       #   podcast (local RSS fixture) + OIDC (Dex) config
-    make test         # package unit tests (ABSKit, PlayerEngine, LibraryCache, DownloadManager)
+    make test         # package unit tests (ABSKit, PlayerEngine, LibraryCache, DownloadManager, ColophonShared)
     make test-app     # ColophonTests: AppState state-machine unit tests (hosted bundle)
     make build-ios build-mac
 

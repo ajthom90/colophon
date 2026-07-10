@@ -6,6 +6,14 @@
     <true/>
     <key>com.apple.security.network.client</key>
     <true/>
+    <!-- App Group shared with the ColophonWidgets extension (Widgets/ColophonWidgets.entitlements):
+         the container the app publishes now-playing / continue-listening SNAPSHOTS into for the
+         companion surfaces. Automatic signing provisions app groups (no Apple approval needed).
+         Display data only — tokens/credentials stay device-local in the Keychain, never here. -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.andrewthom.colophon</string>
+    </array>
     <!-- Required for kSecUseDataProtectionKeychain under App Sandbox: without an explicit
          keychain-access-group, SecItemAdd/SecItemUpdate fail with errSecMissingEntitlement
          (-34018). Empirically confirmed via a Mac sanity launch during M1a Task 9. -->

@@ -113,6 +113,44 @@ final class ClockBox: @unchecked Sendable {
         #expect(controller.globalTime == controller.totalDuration) // parked at the end
     }
 
+    // MARK: - Now-playing-change hook (M2b Task 1 — the App-Group snapshot-publish trigger)
+
+    /// `onNowPlayingStateChange` fires on the DISCRETE player transitions AppState publishes a
+    /// `NowPlayingSnapshot` for — load / play / pause / seek / artwork — but NOT from the per-second
+    /// `tick()`. A per-tick fire would drive an App-Group write + `WidgetCenter.reloadAllTimelines()`
+    /// every second (a battery/IO problem), so this locks in "meaningful transitions only".
+    /// RED-meaningful: adding `onNowPlayingStateChange?()` to `tick()`/`updateElapsed` fails the
+    /// mid-test `#expect(fired == afterPlay)` (the ticks would bump the counter).
+    @Test func nowPlayingChangeHookFiresOnTransitionsNotTicks() {
+        let clock = ClockBox(Date(timeIntervalSince1970: 1_000_000))
+        let backend = FakePlayerBackend()
+        let controller = PlaybackController(backend: backend, now: { clock.now })
+        var fired = 0
+        controller.onNowPlayingStateChange = { fired += 1 }
+
+        controller.load(session: makeSession(), trackURLs: [
+            URL(string: "https://t/1")!, URL(string: "https://t/2")!, URL(string: "https://t/3")!,
+        ])
+        #expect(fired == 1)                 // load is a transition
+        controller.play()
+        #expect(fired == 2)                 // play is a transition
+
+        // Several per-second ticks (the backend's `onTick` → `PlaybackController.tick`) advance
+        // progress WITHIN the current track — none may fire the hook.
+        let afterPlay = fired
+        clock.advance(1); backend.advance(by: 1)
+        clock.advance(1); backend.advance(by: 1)
+        clock.advance(1); backend.advance(by: 1)
+        #expect(fired == afterPlay)         // NO per-tick spam
+
+        controller.pause()
+        #expect(fired == afterPlay + 1)     // pause is a transition
+        controller.seek(toGlobal: 12)
+        #expect(fired == afterPlay + 2)     // seek is a transition
+        controller.setNowPlayingArtwork(Data([0x01, 0x02]))
+        #expect(fired == afterPlay + 3)     // artwork arrival is a transition
+    }
+
     @Test func syncsAreSerialized() async {
         let (controller, backend, clock) = makeSUT()
         var inFlight = 0, maxInFlight = 0, calls = 0

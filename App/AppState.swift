@@ -9,6 +9,7 @@ import ABSRealtime
 import PlayerEngine
 import LibraryCache
 import DownloadManager
+import ColophonShared
 import Network
 
 /// The library-browse sort options surfaced in `LibraryGridView`'s toolbar, each mapped to a
@@ -273,6 +274,47 @@ final class AppState {
     /// so the grid shows exactly the filtered set without the cache ever deleting non-matching rows.
     private(set) var libraryItemOrder: [String: [String]] = [:]
 
+    /// Publishes now-playing + continue-listening SNAPSHOTS into the App Group for the companion
+    /// extensions (M2b Task 1). Display data only — never tokens (see `SnapshotPublisher`). Built in
+    /// `init` from the (default: production) `SharedStore`; a test injects a temp-dir store so the
+    /// publish/clear wiring can be asserted hermetically without a provisioned App Group container.
+    private let snapshots: SnapshotPublisher
+    /// The container-relative path of the current now-playing cover thumbnail (written into the App
+    /// Group by `loadNowPlayingArtwork`), carried on the published `NowPlayingSnapshot`. Cleared with
+    /// the session in `retireCurrentSession`.
+    private var nowPlayingArtworkPath: String?
+    /// While a session is being retired, suppress the transient now-playing snapshots the player's
+    /// `pause()`/`unload()` would otherwise publish mid-teardown (fields still set) — `retireCurrentSession`
+    /// publishes ONE authoritative clear at the end instead.
+    private var suppressSnapshotPublish = false
+    /// Drives the now-playing Live Activity (M2b Task 4) off the SAME `publishNowPlayingSnapshot`
+    /// signal: starts it on playback (if the system permits Live Activities), updates it (throttled)
+    /// on chapter / play-pause / progress, and ends it on retire — exactly ONE Activity across book
+    /// switches / connection changes. `nil` on macOS (Live Activities are iOS-only) and whenever no
+    /// manager is available; the DECISION logic lives in `ColophonShared` (`LiveActivityController`),
+    /// unit-tested against a fake `ActivityManaging` without a live ActivityKit host (a device).
+    private let liveActivity: LiveActivityController?
+
+    /// The pending deep-link / Siri navigation the active shell (`PhoneShell`/`SplitShell`) observes
+    /// and consumes (M2b Task 5). Navigation is PER-SHELL (there is no central `NavigationPath`), so
+    /// `onOpenURL` (widget / Live Activity / Spotlight deep links) and the Siri intents set this
+    /// one-shot request via `handleDeepLink`/`requestSearch`/`handleSpotlightActivity`; the shell drives
+    /// its `NavigationStack` + tab/sidebar selection to it, then calls `consumePendingNavigation`.
+    private(set) var pendingNavigation: DeepLinkDestination?
+    /// The query the Search surface should adopt when the shell routes to it (the "Search Colophon
+    /// <query>" Siri phrase, M2b Task 5). `SearchView` reads it and calls `consumePendingSearchQuery`.
+    private(set) var pendingSearchQuery: String?
+    /// A `colophon://resume` / `ResumeIntent` that arrived BEFORE any connection was active (a
+    /// cold-launch resume — the intent runs immediately, unlike the nav deep links which park in
+    /// `pendingNavigation` for the shell to consume). Parked here and honored once a connection
+    /// becomes active (`honorPendingResumeIfNeeded`), so a cold-launch resume no longer no-ops
+    /// (M2b review #7).
+    private(set) var pendingResume = false
+    /// Core Spotlight indexer (M2b Task 5): indexes the active connection's library items on refresh so
+    /// a system Spotlight search surfaces books, and de-indexes per connection on sign-out / removal so
+    /// items never leak across servers. Best-effort; compiles + runs on both platforms.
+    let spotlight = SpotlightIndexer()
+
     private var auth: AuthManager?
     private let tokenStore: any TokenStore
     private var sessionHandle: PlaybackSessionHandle?
@@ -375,11 +417,27 @@ final class AppState {
         // `DownloadManager` stands up a background `URLSession`, which must not happen merely by
         // constructing `AppState` in a unit test that never downloads. Tests inject a fake.
         downloadManagerProvider: (@MainActor () -> any DownloadManaging)? = nil,
-        downloadsRoot: URL? = nil
+        downloadsRoot: URL? = nil,
+        // Test seam: an explicit App-Group `SharedStore` (temp suite/dir) so the snapshot-publish
+        // wiring can be asserted hermetically. `nil` reproduces production (the real App-Group store).
+        snapshotStore: SharedStore? = nil,
+        // Test seam: an injected Live Activity manager (a fake `ActivityManaging`) so the now-playing
+        // Live Activity lifecycle wiring can be asserted without a live ActivityKit host (a device).
+        // `nil` reproduces production — iOS builds the real ActivityKit-backed `LiveActivityManager`;
+        // macOS gets none (ActivityKit is iOS-only).
+        liveActivityManager: (any ActivityManaging)? = nil
     ) {
         self.transport = transportProvider()
         self.oidcTransport = oidcTransportProvider?()
         self.tokenStore = tokenStore ?? KeychainTokenStore()
+        self.snapshots = snapshotStore.map(SnapshotPublisher.init(store:)) ?? SnapshotPublisher()
+        // The now-playing Live Activity controller (M2b Task 4) is built ONLY from an injected manager.
+        // Production wires the real ActivityKit-backed `LiveActivityManager` from `ColophonApp` (iOS
+        // only — the same "construct the OS-touching dependency in the app entry point, not `AppState`"
+        // discipline the Task-3 intent bridge follows); a unit test injects a fake `ActivityManaging`;
+        // everything else (macOS, tests that don't exercise the Live Activity) leaves it nil, so
+        // `AppState.init` never touches ActivityKit in a test host.
+        self.liveActivity = liveActivityManager.map { LiveActivityController(manager: $0) }
         // `playback` is initialized at its declaration, so it's already live here; the timer
         // captures only that controller (not `self`), keeping init capture-free.
         self.sleepTimer = SleepTimer(host: playback)
@@ -441,6 +499,12 @@ final class AppState {
         // and every download is scoped to the active connection.
         downloads.clientProvider = { [weak self] in self?.client }
         downloads.connectionIDProvider = { [weak self] in self?.activeConnectionID }
+        // Publish the now-playing SNAPSHOT to the App Group on every discrete player transition
+        // (load/play/pause/seek/artwork) so the widget / Live Activity / Control-Center extensions
+        // reflect play-pause + chapter changes. `[weak self]` avoids a retain cycle (AppState owns
+        // `playback`). Suppressed during `retireCurrentSession`'s teardown (see the guard in
+        // `publishNowPlayingSnapshot`).
+        playback.onNowPlayingStateChange = { [weak self] in self?.publishNowPlayingSnapshot() }
     }
 
     var deviceInfo: DeviceInfo {
@@ -648,6 +712,9 @@ final class AppState {
         persistLastActive(connection.id)
         loadConnections()
         phase = .connected
+        // Honor a cold-launch resume that parked before any connection existed (M2b review #7); no-op
+        // unless one was queued. The client/`activeConnectionID` are live by here.
+        honorPendingResumeIfNeeded()
         // Same download reconcile as `activateConnection`'s cached-first path — the fresh sign-in is
         // also a launch/activation moment where the background session's state must meet the cache.
         Task { await downloads.reattachOnLaunch() }
@@ -795,6 +862,10 @@ final class AppState {
         let client = ABSClient(baseURL: url, transport: transport, auth: auth)
         self.auth = auth
         self.client = client
+        // The connection is now active with a live client — honor a cold-launch resume that parked
+        // before any connection existed (M2b review #7). Placed AFTER `self.client` is set so the
+        // deferred `startPlayback` has a client to stream with; no-op unless a resume was queued.
+        honorPendingResumeIfNeeded()
 
         // The network probe: detached so `activateConnection` returns now, with cached browsing
         // already live. Every branch re-checks the epoch (authoritative — a sign-out/removal
@@ -880,6 +951,23 @@ final class AppState {
         }
         await tokenStore.clear(for: id)
         needsSignIn.insert(id)
+        // De-index this connection's Spotlight items (M2b Task 5) so a signed-out / removed server's
+        // books never linger in system Spotlight. Domain-scoped, so ONLY this connection's items go —
+        // `removeConnection` inherits it (its first step is this method).
+        spotlight.deindex(connectionID: id)
+        // Clear the continue-listening snapshot IF it belongs to this (signed-out/removed) connection,
+        // so its books never linger for the home widget or `resume` (mirrors the Spotlight de-index +
+        // `queue.removeEntries`). Gated on the snapshot's own `connectionID` so signing out an INACTIVE
+        // connection never wipes the ACTIVE one's widget shelf (the store holds a single shared blob).
+        if snapshots.store.readContinueListening()?.connectionID == id {
+            snapshots.clearContinueListening()
+        }
+        // Prune this connection's App-Group cover thumbnails (M2b review #6): they're keyed under a
+        // per-connection subdirectory, so this removes ONLY the signed-out/removed server's covers
+        // (never the active one's) — matching removeConnection's "leave nothing on disk" contract +
+        // the Spotlight de-index + snapshot clear above. Unconditional (the dir is connection-scoped,
+        // so pruning an inactive connection's covers can't touch the active one's).
+        snapshots.store.clearArtwork(connectionID: id)
         // Drop this connection's up-next entries (Task 8): a signed-out / removed connection can't
         // play, so its queued books shouldn't linger. `advanceToNext`'s valid-connection guard is
         // the defense-in-depth backstop; this keeps the visible queue honest immediately.
@@ -1147,6 +1235,13 @@ final class AppState {
         // Success clears only this library's banner — another library's failure stays visible
         // on its own screen until *it* refreshes successfully.
         if refreshBanner?.libraryID == libraryID { refreshBanner = nil }
+        // Spotlight (M2b Task 5): index the active connection's freshly-refreshed items so a system
+        // Spotlight search surfaces books. Only the COMPLETED, UNFILTERED full set — a filtered or
+        // safety-bound-truncated page-through would index an incomplete subset. Best-effort + off the
+        // main actor; never blocks the refresh.
+        if completed, !isLyingEmpty, activeFilter == nil {
+            indexItemsForSpotlight(accumulated, connectionID: connectionID)
+        }
     }
 
     /// Targeted single-item patch for `item_updated`/`item_added` socket events: fetches just
@@ -1303,6 +1398,9 @@ final class AppState {
         // `onSyncDue`→the LOCAL `cachedProgress` write — the sole divergence is the sync SINK, not the
         // teardown sequence.
         guard sessionHandle != nil || nowPlayingItemID != nil else { return }
+        // Hold back the transient snapshots `pause()`/`unload()` would publish while the now-playing
+        // fields are still set — the single authoritative clear happens at the end of this method.
+        suppressSnapshotPublish = true
         playback.pause()
         await playback.flushOnly()
         playback.onSyncDue = nil
@@ -1325,6 +1423,11 @@ final class AppState {
         sleepTimer.chapters = []
         // The bookmarks were scoped to that book too — drop them and the writer/item pointers.
         bookmarks.clear()
+        // Publish the authoritative now-playing CLEAR to the App Group (widget shows "nothing
+        // playing"); drop the cover-thumbnail pointer with the session.
+        nowPlayingArtworkPath = nil
+        suppressSnapshotPublish = false
+        publishNowPlayingSnapshot()
     }
 
     /// Open a playback session and hand it to the shared player.
@@ -1903,7 +2006,313 @@ final class AppState {
         ) else { return }
         guard nowPlayingItemID == itemID else { return }
         playback.setNowPlayingArtwork(data)
+        // Also stash the cover thumbnail in the App Group and republish the snapshot with its path,
+        // so the widget / Live Activity can show the same art (the extensions can't reach the app's
+        // cover cache). Keyed by item(+episode). `setNowPlayingArtwork` already republished (without a
+        // path); this second publish carries the path once the write lands.
+        let key = itemID + "/" + (nowPlayingEpisodeID ?? "")
+        if let path = snapshots.writeArtwork(data, forKey: key, connectionID: connectionID) {
+            nowPlayingArtworkPath = path
+            publishNowPlayingSnapshot()
+        }
     }
+
+    // MARK: - App Group snapshot publishing (M2b Task 1)
+
+    /// Build + publish the current `NowPlayingSnapshot` into the App Group (or clear it when nothing
+    /// is playing). Called on every discrete player transition via `playback.onNowPlayingStateChange`,
+    /// and directly after now-playing state or artwork changes. Suppressed mid-retire (see
+    /// `suppressSnapshotPublish`). Display data ONLY — no tokens ever reach the group.
+    func publishNowPlayingSnapshot() {
+        guard !suppressSnapshotPublish else { return }
+        guard let itemID = nowPlayingItemID else {
+            snapshots.publishNowPlaying(nil)
+            // Nothing playing → end the Live Activity (the authoritative clear on stop / retire /
+            // sign-out; the controller no-ops if none is active).
+            liveActivity?.sync(nil)
+            return
+        }
+        let total = playback.totalDuration
+        let t = playback.globalTime
+        let progress = total > 0 ? min(max(t / total, 0), 1) : 0
+        let chapterTitle = nowPlayingChapters.first { $0.start <= t && t < $0.end }?.title
+        snapshots.publishNowPlaying(NowPlayingSnapshot(
+            itemID: itemID,
+            episodeID: nowPlayingEpisodeID,
+            title: playback.title,
+            author: playback.author,
+            chapterTitle: chapterTitle,
+            progress: progress,
+            isPlaying: playback.isPlaying,
+            updatedAt: Date(),
+            artworkThumbnailPath: nowPlayingArtworkPath))
+        // Drive the Live Activity off the SAME signal — start on first play (if permitted), throttled
+        // updates on chapter / play-pause / progress, exactly one across book switches.
+        liveActivity?.sync(LiveActivityState(
+            itemID: itemID,
+            episodeID: nowPlayingEpisodeID,
+            title: playback.title,
+            author: playback.author,
+            chapterTitle: chapterTitle,
+            progress: progress,
+            isPlaying: playback.isPlaying,
+            elapsed: t,
+            // Carry the total duration so the Live Activity can build the self-advancing
+            // `timerInterval` range (anchor `t` back from now, run to `now + (duration - t)`) —
+            // the surface then advances elapsed/progress on-device between discrete publishes (M2b review #3).
+            duration: total,
+            artworkThumbnailPath: nowPlayingArtworkPath))
+    }
+
+    /// Widget thumbnails are downscaled to (at most) this many pixels on the long edge — small
+    /// enough to keep the shared App Group container tiny while still looking sharp in a
+    /// `.systemSmall`/`.systemMedium` widget cover slot.
+    private static let continueListeningThumbnailPixelSize = 200
+
+    /// Publish the continue-listening SHELF into the App Group for the home widget. Called by
+    /// `HomeView` after it (re)loads the personalized shelves (and joins progress), so the widget's
+    /// list mirrors Home's "Continue Listening" row. Progress is joined from the local cache (the
+    /// shelf entities themselves carry none — see `refreshProgress`). Display data ONLY.
+    ///
+    /// Synchronous + fast: it publishes the TEXT snapshot (title/author/progress, no artwork)
+    /// immediately so `HomeView.loadShelves`'s pull-to-refresh spinner never blocks on the
+    /// widget-only cover fetch, then spawns the artwork phase as an unawaited best-effort `Task`
+    /// (the same pattern as `loadNowPlayingArtwork`'s launch site) that fetches thumbnails and
+    /// republishes — guarded on staleness so a slow fetch for a since-superseded library/connection
+    /// can't clobber the current one.
+    func publishContinueListeningSnapshot(from shelves: [Shelf]) {
+        let entities = shelves.first { $0.id == "continue-listening" }?.entities ?? []
+        let entries: [ContinueListeningSnapshot.Entry] = entities.compactMap { entity in
+            switch entity {
+            case let .book(book):
+                return ContinueListeningSnapshot.Entry(
+                    itemID: book.id,
+                    episodeID: nil,
+                    title: book.media.metadata.title ?? "Untitled",
+                    author: book.media.metadata.authorName ?? book.media.metadata.author ?? "",
+                    progress: continueProgress(itemID: book.id, episodeID: nil, duration: book.media.duration),
+                    artworkThumbnailPath: nil)
+            case let .episode(episode):
+                let episodeID = episode.recentEpisode?.id
+                return ContinueListeningSnapshot.Entry(
+                    itemID: episode.id,
+                    episodeID: episodeID,
+                    title: episode.recentEpisode?.title ?? episode.media?.metadata.title ?? "Untitled",
+                    author: episode.media?.metadata.author ?? episode.media?.metadata.title ?? "",
+                    progress: continueProgress(itemID: episode.id, episodeID: episodeID,
+                                               duration: episode.recentEpisode?.duration),
+                    artworkThumbnailPath: nil)
+            case .author, .unknown:
+                return nil
+            }
+        }
+        // Stamp the publishing connection onto the snapshot (M2b Task 5) so `resume` never starts a
+        // different / signed-out server's item against the active connection's client.
+        snapshots.publishContinueListening(
+            ContinueListeningSnapshot(entries: entries, connectionID: activeConnectionID))
+
+        guard let client, let connectionID = activeConnectionID, !entries.isEmpty else { return }
+        // Capture the shelf source's identity NOW; the guard in `loadContinueListeningArtwork`
+        // re-checks it before the artwork republish. Unawaited — a widget-only side effect that
+        // must not tie up `loadShelves` (up to `maxWidgetDisplayCount` cover round-trips).
+        let libraryID = activeLibraryID
+        Task { await loadContinueListeningArtwork(entries, client: client,
+                                                  connectionID: connectionID, libraryID: libraryID) }
+    }
+
+    /// The continue-listening widget's cover-thumbnail phase (M2b Task 2), split off
+    /// `publishContinueListeningSnapshot` so the fast text publish isn't blocked by network. Fetches
+    /// a cover per widget-visible entry (through the disk-backed `CoverStore`, the same cache
+    /// `CachedCoverView`/`ShelfRow` use), downscales it to a small thumbnail, writes it into the App
+    /// Group, and republishes the snapshot with the resolved paths.
+    ///
+    /// Each fetch runs in a `Task.detached` — OFF the main actor, since under this module's
+    /// default-MainActor isolation a plain `async` call would otherwise run the network round-trip +
+    /// `ArtworkThumbnail` decode/resize back on the main thread once resumed.
+    ///
+    /// STALENESS GUARD (mirrors `loadNowPlayingArtwork`'s `nowPlayingItemID == itemID` check): these
+    /// detached fetches are unstructured, so they escape `HomeView`'s `.task(id: activeLibrary?.id)`
+    /// cancellation — switching server/library mid-fetch could otherwise let the OLD library's
+    /// republish land after the new one's. So before the republish we re-assert the captured
+    /// `(connectionID, libraryID)` still matches the active one and bail if not. A missing/failed
+    /// cover for an entry just leaves its `artworkThumbnailPath` nil — the widget shows a placeholder.
+    private func loadContinueListeningArtwork(
+        _ entries: [ContinueListeningSnapshot.Entry],
+        client: ABSClient, connectionID: String, libraryID: String?
+    ) async {
+        let coverStore = self.coverStore
+        let store = snapshots.store
+        let pixelSize = Self.continueListeningThumbnailPixelSize
+
+        // Cap at `maxWidgetDisplayCount` — the widget never shows more than that many rows, so
+        // fetching/writing a thumbnail beyond it would waste network + container space. `width:
+        // pixelSize` on the request mirrors `ShelfRow.prefetchCovers()`'s `updatedAt: nil` cache
+        // key (shelf entities carry no `updatedAt`); `ArtworkThumbnail.downscale` below is the
+        // guarantee that what's WRITTEN is always small even on a cache hit against a larger image.
+        let fetchCount = min(entries.count, ContinueListeningSnapshot.maxWidgetDisplayCount)
+        let fetches = entries.enumerated().prefix(fetchCount).map { index, entry in
+            Task.detached(priority: .utility) { () -> (Int, String?) in
+                let coverURL = client.coverURL(itemID: entry.itemID, width: pixelSize, updatedAt: nil)
+                guard let data = try? await coverStore.coverData(
+                    connectionID: connectionID, itemID: entry.itemID, updatedAt: nil,
+                    fetch: { try await URLSession.shared.data(from: coverURL).0 }
+                ), let thumbnail = ArtworkThumbnail.downscale(data, maxPixelSize: pixelSize) else {
+                    return (index, nil)
+                }
+                let key = entry.itemID + "/" + (entry.episodeID ?? "")
+                return (index, store.writeArtwork(thumbnail, forKey: key, connectionID: connectionID))
+            }
+        }
+        var updated = entries
+        var didResolveAny = false
+        for fetch in fetches {
+            let (index, path) = await fetch.value
+            if let path {
+                updated[index].artworkThumbnailPath = path
+                didResolveAny = true
+            }
+        }
+        guard didResolveAny else { return }
+        // The staleness bail: the active connection/library changed while covers were fetching, so
+        // this snapshot is for a superseded shelf source — drop it rather than overwrite the current.
+        guard activeConnectionID == connectionID, activeLibraryID == libraryID else { return }
+        snapshots.publishContinueListening(
+            ContinueListeningSnapshot(entries: updated, connectionID: connectionID))
+    }
+
+    /// Fractional progress (0…1) for a continue-listening entry, joined from the local `cachedProgress`
+    /// (the shelf entity carries none). A finished item reads 1; a missing row/duration reads 0.
+    private func continueProgress(itemID: String, episodeID: String?, duration: Double?) -> Double {
+        guard let connectionID = activeConnectionID,
+              let progress = (try? cache.progress(connectionID: connectionID, itemID: itemID,
+                                                  episodeID: episodeID)) ?? nil else { return 0 }
+        if progress.isFinished { return 1 }
+        guard let duration, duration > 0 else { return 0 }
+        return min(max(progress.currentTime / duration, 0), 1)
+    }
+
+    // MARK: - Deep-link routing + Siri/Shortcuts actions (M2b Task 5)
+
+    /// Handle an incoming `colophon://` URL from `onOpenURL` (the widget / Live Activity / Spotlight
+    /// deep links FINALLY landing here). Parses it via `ColophonDeepLink` (silently ignoring anything
+    /// that isn't one — e.g. an OAuth callback on the same scheme), resolves it to a destination with
+    /// the PURE `DeepLinkRouter`, then either PLAYS (resume) or hands the active shell a
+    /// `pendingNavigation` to drive — reusing the existing `ItemDetailRoute`/`PodcastDetailRoute`/
+    /// `EpisodeDetailRoute`, never a parallel navigator.
+    func handleDeepLink(_ url: URL) {
+        guard let link = ColophonDeepLink(url: url) else { return }
+        let destination = DeepLinkRouter.destination(for: link) { [weak self] id in
+            self?.deepLinkItemInfo(for: id)
+        }
+        switch destination {
+        case .resume:
+            Task { await resumePlayback() }
+        case .item, .podcast, .episode, .search, .home:
+            pendingNavigation = destination
+        }
+    }
+
+    /// Resolve a deep-linked item id to its cached display metadata for `DeepLinkRouter`. Podcast-ness
+    /// is inferred from whether the item has cached episodes (a book never does) — enough to route a
+    /// bare `colophon://item/<id>` to the podcast page for a podcast the user has opened; an uncached
+    /// item returns nil and falls back to the book detail (which fetches). Pure cache reads, no network.
+    private func deepLinkItemInfo(for itemID: String) -> DeepLinkItemInfo? {
+        guard let connectionID = activeConnectionID,
+              let item = (try? cache.item(connectionID: connectionID, itemID: itemID)) ?? nil else { return nil }
+        let isPodcast = !((try? cache.episodes(connectionID: connectionID, itemID: itemID)) ?? []).isEmpty
+        return DeepLinkItemInfo(title: item.title, author: item.authorName,
+                                updatedAt: item.updatedAt, duration: item.duration, isPodcast: isPodcast)
+    }
+
+    /// The Siri/Shortcuts "Search Colophon" action (M2b Task 5): route to the Search surface, seeding
+    /// its query when one was supplied (an empty/blank query just opens Search).
+    func requestSearch(query: String?) {
+        let trimmed = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingSearchQuery = (trimmed?.isEmpty == false) ? trimmed : nil
+        pendingNavigation = .search(query: pendingSearchQuery)
+    }
+
+    /// Resume playback for `colophon://resume` / `ResumeIntent` (M2b Task 5, the widget's resume
+    /// target). If a session is already loaded, just resume it in place; otherwise start the TOP
+    /// continue-listening entry — read back from the SAME published snapshot the widget shows — via
+    /// the pure `DeepLinkRouter.resumeTarget`. A no-op when nothing is loaded and the shelf is empty.
+    func resumePlayback() async {
+        if nowPlayingItemID != nil {
+            if !playback.isPlaying { playback.togglePlayPause() }
+            return
+        }
+        // No connection active yet (a cold-launch resume that ran before boot finished activating a
+        // connection): PARK the request and honor it once a connection becomes active
+        // (`honorPendingResumeIfNeeded`). Without this, resume would run immediately and no-op — the
+        // resume-target read below gates on an active connection — so the cold-launch resume would be
+        // silently lost, unlike the nav deep links which defer via `pendingNavigation` (M2b review #7).
+        guard activeConnectionID != nil else {
+            pendingResume = true
+            return
+        }
+        pendingResume = false
+        // Gate on the snapshot's own connectionID matching the active one — never resume a different /
+        // signed-out server's item against the active connection's client.
+        guard let entry = DeepLinkRouter.resumeTarget(
+            in: snapshots.store.readContinueListening(), activeConnectionID: activeConnectionID) else { return }
+        await startPlayback(itemID: entry.itemID, episodeId: entry.episodeID)
+    }
+
+    /// Honor a resume request that arrived before any connection was active (a cold-launch
+    /// `colophon://resume` / `ResumeIntent`). Called once a connection becomes active with a live
+    /// client — from `activateConnection`'s cached-first path and the fresh-login `completeConnection`
+    /// tail. A no-op unless a resume was parked; detached so it never blocks activation's fast return
+    /// (M2b review #7).
+    private func honorPendingResumeIfNeeded() {
+        guard pendingResume else { return }
+        pendingResume = false
+        Task { await resumePlayback() }
+    }
+
+    /// The active shell calls this after driving its stacks/selection to `pendingNavigation`.
+    func consumePendingNavigation() { pendingNavigation = nil }
+    /// `SearchView` calls this after adopting `pendingSearchQuery`.
+    func consumePendingSearchQuery() { pendingSearchQuery = nil }
+
+    /// Resolve a Spotlight selection (`onContinueUserActivity(CSSearchableItemActionType)`): recover
+    /// `(connectionID, itemID)` from the searchable item's identifier and route to it via the SAME
+    /// deep-link path — but ONLY when it belongs to the ACTIVE connection, so a stale hit for another
+    /// server's item never cross-opens (the "don't leak across connections" guarantee on the read side).
+    func handleSpotlightActivity(uniqueIdentifier: String) {
+        guard let (connectionID, itemID) = SpotlightIndexer.components(fromUniqueIdentifier: uniqueIdentifier),
+              connectionID == activeConnectionID else { return }
+        handleDeepLink(ColophonDeepLink.item(id: itemID, episodeID: nil).url)
+    }
+
+    /// Index the given items into Core Spotlight for a connection (M2b Task 5). Cover thumbnails are
+    /// read DISK-ONLY (the `fetch` throws so a miss never hits the network) and capped, so a library
+    /// refresh never triggers a cover-download storm; beyond the cap items index text-only (title/
+    /// author still make them findable). Best-effort + off the main actor.
+    private func indexItemsForSpotlight(_ items: [CachedItem], connectionID: String) {
+        guard !items.isEmpty else { return }
+        let coverStore = self.coverStore
+        let thumbnailIDs = Set(items.prefix(Self.spotlightThumbnailCap).map(\.id))
+        spotlight.index(
+            items: items, connectionID: connectionID,
+            thumbnail: { item in
+                guard thumbnailIDs.contains(item.id),
+                      let data = try? await coverStore.coverData(
+                        connectionID: connectionID, itemID: item.id, updatedAt: item.updatedAt,
+                        fetch: { throw CancellationError() })
+                else { return nil }
+                return ArtworkThumbnail.downscale(data, maxPixelSize: Self.spotlightThumbnailPixelSize)
+            },
+            // TOCTOU guard: skip the (possibly-lagging) index write if this connection is no longer the
+            // active, signed-in one — a sign-out nils `client` (and a switch changes `activeConnectionID`),
+            // so a de-indexed connection's items are never resurrected by an in-flight index Task.
+            isStillActive: { [weak self] in self?.activeConnectionID == connectionID && self?.client != nil })
+    }
+
+    /// Cap on how many items get a Spotlight cover thumbnail per refresh (disk reads + image decodes),
+    /// and the thumbnail's long-edge pixel size — small enough to keep the Spotlight index light.
+    /// `nonisolated` so the off-main thumbnail closure can read the pixel size.
+    nonisolated private static let spotlightThumbnailCap = 120
+    nonisolated private static let spotlightThumbnailPixelSize = 180
 
     /// The `SpeedControl` write path (Task 7): applies `rate` to the LIVE `PlaybackController`
     /// immediately, and persists it as this (connection, item)'s per-book preference so a later

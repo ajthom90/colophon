@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- Same App Group as the app (App/Colophon.entitlements) — the shared snapshot container.
+         Automatic signing provisions app groups with no Apple approval needed. -->
+    <key>com.apple.security.application-groups</key>
+    <array>
+        <string>group.com.andrewthom.colophon</string>
+    </array>
+</dict>
+</plist>

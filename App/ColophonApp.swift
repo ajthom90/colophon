@@ -1,4 +1,5 @@
 import SwiftUI
+import CoreSpotlight
 
 #if DEBUG && os(macOS)
 /// Headless perf-spike hook: if `COLOPHON_PERF_AUTOSCROLL=1` is set, opens the
@@ -20,7 +21,7 @@ private struct PerfSpikeAutoOpener: View {
 
 @main
 struct ColophonApp: App {
-    @State private var app = AppState()
+    @State private var app: AppState
     @Environment(\.scenePhase) private var scenePhase
     /// Single source of truth for typography (Global Constraints: `colophon.typeface`, "serif"
     /// default | "sans"). Applied outermost in the `WindowGroup` content's modifier chain, so it
@@ -38,6 +39,27 @@ struct ColophonApp: App {
     @AppStorage("colophon.skipInterval") private var skipInterval = AppState.defaultSkipInterval
 
     init() {
+        // Wire the real ActivityKit-backed now-playing Live Activity manager (M2b Task 4) here — the
+        // app entry point — rather than in `AppState.init`, so unit tests (which build `AppState`
+        // directly) never touch ActivityKit in the test host. iOS-only: Live Activities are iOS-only.
+        #if os(iOS)
+        let appState = AppState(liveActivityManager: LiveActivityManager())
+        #else
+        let appState = AppState()
+        #endif
+        _app = State(initialValue: appState)
+        // Register the App Intents dependency at app launch (M2b Task 3): the playback intents
+        // (`SetPlaybackIntent`/`TogglePlaybackIntent`/`SkipForward/BackwardIntent`) resolve this LIVE
+        // provider via `@Dependency`, so when the system runs a playback intent in the app process
+        // (the Control Center toggle, a Siri phrase, a Live Activity button) it reaches the real
+        // `PlaybackController`. Done in `init` — not a scene `.task` — so a background app-launch to
+        // service an intent (no scene rendered) still registers it before `perform()` runs.
+        AudioPlaybackIntentBridge.register(playback: appState.playback)
+        // Register the Siri/Shortcuts action dependency (M2b Task 5): `ResumeIntent`/
+        // `SearchColophonIntent` resolve this `AppActionProvider` (wrapping the live `AppState`) via
+        // `@Dependency`. Registered in `init` — like the playback bridge above — so a cold launch to
+        // service a Siri phrase has it before `perform()` runs.
+        AppIntentActionBridge.register(app: appState)
         #if DEBUG && os(macOS)
         PerfSpikeClock.processLaunch = Date()
         #endif
@@ -71,6 +93,19 @@ struct ColophonApp: App {
                 Text(app.errorMessage ?? "")
             }
             .environment(app)
+            // M2b Task 5: the widget / Live Activity / Control-Center deep links FINALLY LAND here.
+            // `colophon://item/<id>` (+ optional `?episode=`) → push the item/podcast/episode detail;
+            // `colophon://resume` → resume the top continue-listening item. `handleDeepLink` parses +
+            // dispatches through the pure `DeepLinkRouter`; a non-`colophon` / unrecognized URL (e.g. an
+            // OAuth callback) is silently ignored.
+            .onOpenURL { app.handleDeepLink($0) }
+            // A Spotlight result tap hands back an `NSUserActivity` whose identifier is the indexed
+            // item's `connectionID/itemID` — route it to the item detail (active connection only).
+            .onContinueUserActivity(CSSearchableItemActionType) { activity in
+                if let id = activity.userInfo?[CSSearchableItemActivityIdentifier] as? String {
+                    app.handleSpotlightActivity(uniqueIdentifier: id)
+                }
+            }
             .task {
                 app.loadConnections()
                 // Start the continuous NWPathMonitor reachability signal (M2a Task 6): its

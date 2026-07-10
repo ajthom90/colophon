@@ -23,6 +23,7 @@ import LibraryCache
 /// one-time reset on an explicit `initializedConnectionID` marker (also hoisted here) rather than
 /// unconditionally resetting on every task invocation.
 struct PhoneShell: View {
+    @Environment(AppState.self) private var app
     @State private var showingFullPlayer = false
     @State private var libraries: [CachedLibrary] = []
     @State private var selectedLibraryID: String?
@@ -31,17 +32,26 @@ struct PhoneShell: View {
     /// `LibraryTabContent`'s `.task(id:)` tell "a genuinely new connection" (reset) apart from "this
     /// task instance merely restarted after a remount, same connection as before" (don't reset).
     @State private var initializedConnectionID: String?
+    /// Which tab is selected — a binding so a deep link (M2b Task 5) can drive it (select Home for an
+    /// item/resume, Search for the Search phrase).
+    @State private var selectedTab: ShellTab = .home
+    /// The Home tab's navigation path — bound so a deep link can PUSH an item/podcast/episode detail
+    /// programmatically (a normal `NavigationLink(value:)` still appends to it too). Home registers
+    /// all three detail destinations at its stable root, so it's the single stack deep links drive.
+    @State private var homePath = NavigationPath()
+
+    private enum ShellTab: Hashable { case home, library, search, downloads }
 
     var body: some View {
-        TabView {
-            Tab("Home", systemImage: "house") {
-                NavigationStack {
+        TabView(selection: $selectedTab) {
+            Tab("Home", systemImage: "house", value: ShellTab.home) {
+                NavigationStack(path: $homePath) {
                     HomeView()
                         .offlineIndicator()
                         .accountMenu()
                 }
             }
-            Tab("Library", systemImage: "books.vertical") {
+            Tab("Library", systemImage: "books.vertical", value: ShellTab.library) {
                 NavigationStack {
                     LibraryTabContent(
                         libraries: $libraries,
@@ -52,7 +62,7 @@ struct PhoneShell: View {
                         .accountMenu()
                 }
             }
-            Tab("Search", systemImage: "magnifyingglass", role: .search) {
+            Tab("Search", systemImage: "magnifyingglass", value: ShellTab.search, role: .search) {
                 NavigationStack {
                     SearchView()
                         .offlineIndicator()
@@ -63,7 +73,7 @@ struct PhoneShell: View {
             // — downloaded books/episodes, state, storage, delete/manage. Declared LAST so it renders
             // after Search. No offline indicator here: this surface IS the offline-first one (fully
             // local, nothing here depends on the network), so the banner would be redundant noise.
-            Tab("Downloads", systemImage: "arrow.down.circle") {
+            Tab("Downloads", systemImage: "arrow.down.circle", value: ShellTab.downloads) {
                 NavigationStack { DownloadsView().accountMenu() }
             }
         }
@@ -72,6 +82,28 @@ struct PhoneShell: View {
         // slide-up). The presentation seam lives in `PlayerPresentation.swift` — see its morph note
         // for why this is a standard cover rather than a zoom morph.
         .iPhonePlayerCover(isPresented: $showingFullPlayer)
+        // Drive navigation from a deep link / Siri phrase (M2b Task 5). `.onChange` catches links that
+        // arrive while mounted; the `.task` catches one that set `pendingNavigation` before the shell
+        // appeared (a cold-launch deep link routed after connect).
+        .onChange(of: app.pendingNavigation) { _, _ in consumePending() }
+        .task { consumePending() }
+    }
+
+    /// Route the pending deep-link destination into this shell's tab selection + Home stack, then
+    /// clear it. Reads the LIVE `app.pendingNavigation` (not the `onChange` payload) so a mount-time
+    /// race between `.task` and `.onChange` consumes it exactly once. `resume` is handled by
+    /// `AppState` (playback), so there's nothing to navigate for it.
+    private func consumePending() {
+        guard let nav = app.pendingNavigation else { return }
+        switch nav {
+        case .item(let route): selectedTab = .home; homePath.append(route)
+        case .podcast(let route): selectedTab = .home; homePath.append(route)
+        case .episode(let route): selectedTab = .home; homePath.append(route)
+        case .search: selectedTab = .search
+        case .home: selectedTab = .home
+        case .resume: break
+        }
+        app.consumePendingNavigation()
     }
 }
 

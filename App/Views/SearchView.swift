@@ -33,6 +33,11 @@ struct SearchView: View {
             .navigationTitle("Search")
             .searchable(text: $query, prompt: Text("Titles, authors, series"))
             .onChange(of: query) { _, newValue in model?.updateQuery(newValue) }
+            // Adopt a query seeded by the "Search Colophon <query>" Siri phrase (M2b Task 5). Setting
+            // `query` fires the `onChange` above (→ `model.updateQuery`), or is picked up by
+            // `syncLibraries` once the model is built. `.task` also catches a query set before appear.
+            .onChange(of: app.pendingSearchQuery) { _, q in adoptPendingQuery(q) }
+            .task { adoptPendingQuery(app.pendingSearchQuery) }
             .task(id: app.activeConnectionID) { await syncLibraries() }
             // Registered at this stack's stable root — SearchView is the unconditional root of the
             // shell's Search `NavigationStack`, so (unlike the browse views) it may self-register.
@@ -62,6 +67,13 @@ struct SearchView: View {
                 Text("Connect a library to search its titles, authors, and series.")
             }
         }
+    }
+
+    /// Copy a Siri-seeded query into the search field, then clear the pending value (M2b Task 5).
+    private func adoptPendingQuery(_ q: String?) {
+        guard let q, !q.isEmpty else { return }
+        query = q
+        app.consumePendingSearchQuery()
     }
 
     /// Observes the connection's libraries and (re)builds the `SearchModel` for the active/first
