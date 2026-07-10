@@ -42,6 +42,11 @@ struct SnapshotPublisher {
 
     private func reloadWidgets() {
         #if os(iOS)
+        // Mirror the serif/default typeface preference (`@AppStorage("colophon.typeface")`,
+        // `ColophonApp.swift`) into the App Group so the (separate-process) widget can match the
+        // app's typography — piggybacked here since this already runs on every relevant snapshot
+        // change, so no dedicated `onChange` observation is needed.
+        store.writeTypefacePreference(UserDefaults.standard.string(forKey: "colophon.typeface") ?? "serif")
         // Live Activity + Control Center are iOS-only; the home widget also lives on iOS first.
         WidgetCenter.shared.reloadAllTimelines()
         #endif

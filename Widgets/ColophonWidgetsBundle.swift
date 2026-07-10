@@ -2,12 +2,12 @@ import SwiftUI
 import WidgetKit
 import ColophonShared
 
-/// The widget extension's `@main` entry point. Real widgets (continue-listening, Live Activity,
-/// Control Center) arrive in M2b Tasks 2–4; this Task-1 scaffold ships ONE placeholder widget so the
-/// extension target builds, links `ColophonShared`, and loads in the widget gallery.
+/// The widget extension's `@main` entry point. `ContinueListeningWidget` (M2b Task 2) replaces the
+/// Task-1 placeholder; the Live Activity + Control Center widgets (Tasks 3–4) join this bundle as
+/// they land.
 @main
 struct ColophonWidgetsBundle: WidgetBundle {
     var body: some Widget {
-        PlaceholderWidget()
+        ContinueListeningWidget()
     }
 }

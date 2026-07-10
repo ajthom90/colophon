@@ -1,5 +1,8 @@
+import CoreGraphics
 import Foundation
+import ImageIO
 import Testing
+import UniformTypeIdentifiers
 @testable import ColophonShared
 
 // MARK: - Fixtures
@@ -151,4 +154,95 @@ private func tearDown(suite: String, container: URL) {
     // A built item link with no episode must not resurface as an episode with an empty id.
     let url = ColophonDeepLink.item(id: "li_x", episodeID: "").url
     #expect(ColophonDeepLink(url: url) == .item(id: "li_x", episodeID: nil))
+}
+
+// MARK: - Typeface preference mirror (App Group suite)
+
+@Test func typefacePreferenceRoundTrips() throws {
+    let (store, suite, container) = try makeStore()
+    defer { tearDown(suite: suite, container: container) }
+
+    store.writeTypefacePreference("default")
+    #expect(store.readTypefacePreference() == "default")
+}
+
+@Test func typefacePreferenceDefaultsToSerifWhenUnset() throws {
+    let (store, suite, container) = try makeStore()
+    defer { tearDown(suite: suite, container: container) }
+    #expect(store.readTypefacePreference() == "serif")
+}
+
+// MARK: - ArtworkThumbnail (pure Data -> Data? downscale)
+
+/// A solid-color 500x500 PNG — big enough that downscaling to a small `maxPixelSize` is
+/// meaningful, small enough to stay fast in a unit test.
+private func makeTestImageData(sideLength: Int = 500) -> Data {
+    let colorSpace = CGColorSpaceCreateDeviceRGB()
+    let context = CGContext(
+        data: nil, width: sideLength, height: sideLength, bitsPerComponent: 8, bytesPerRow: 0,
+        space: colorSpace, bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+    context.setFillColor(CGColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 1))
+    context.fill(CGRect(x: 0, y: 0, width: sideLength, height: sideLength))
+    let cgImage = context.makeImage()!
+
+    let output = NSMutableData()
+    let destination = CGImageDestinationCreateWithData(
+        output, UTType.png.identifier as CFString, 1, nil)!
+    CGImageDestinationAddImage(destination, cgImage, nil)
+    CGImageDestinationFinalize(destination)
+    return output as Data
+}
+
+@Test func downscaleShrinksALargeImageToMaxPixelSize() throws {
+    let original = makeTestImageData(sideLength: 500)
+    let thumbnail = try #require(ArtworkThumbnail.downscale(original, maxPixelSize: 100))
+
+    let source = try #require(CGImageSourceCreateWithData(thumbnail as CFData, nil))
+    let image = try #require(CGImageSourceCreateImageAtIndex(source, 0, nil))
+    #expect(image.width <= 100)
+    #expect(image.height <= 100)
+    #expect(thumbnail.count < original.count)
+}
+
+@Test func downscaleReturnsNilForUndecodableData() {
+    #expect(ArtworkThumbnail.downscale(Data([0x00, 0x01, 0x02]), maxPixelSize: 200) == nil)
+}
+
+@Test func downscaleReturnsNilForEmptyData() {
+    #expect(ArtworkThumbnail.downscale(Data(), maxPixelSize: 200) == nil)
+}
+
+// MARK: - ContinueListeningSnapshot -> widget items (pure mapping, no widget host)
+
+@Test func widgetItemsMapsEntriesInOrderCappedAtLimit() {
+    let snapshot = ContinueListeningSnapshot(entries: [
+        .init(itemID: "li_1", title: "Book One", author: "Author One", progress: 0.1,
+              artworkThumbnailPath: "artwork/li_1.img"),
+        .init(itemID: "li_2", episodeID: "ep_2", title: "Episode Two", author: "Show Two",
+              progress: 0.5),
+        .init(itemID: "li_3", title: "Book Three", author: "Author Three", progress: 0.9),
+        .init(itemID: "li_4", title: "Book Four", author: "Author Four", progress: 0.0),
+    ])
+
+    let small = snapshot.widgetItems(limit: 1)
+    #expect(small.count == 1)
+    #expect(small[0].itemID == "li_1")
+    #expect(small[0].artworkThumbnailPath == "artwork/li_1.img")
+
+    let medium = snapshot.widgetItems(limit: ContinueListeningSnapshot.maxWidgetDisplayCount)
+    #expect(medium.map(\.itemID) == ["li_1", "li_2", "li_3"])
+    #expect(medium[1].episodeID == "ep_2")
+}
+
+@Test func widgetItemsOnEmptySnapshotReturnsEmpty() {
+    #expect(ContinueListeningSnapshot().widgetItems().isEmpty)
+}
+
+@Test func widgetItemDeepLinkMatchesColophonDeepLinkForBothBookAndEpisode() {
+    let book = ContinueListeningWidgetItem(itemID: "li_book", title: "T", author: "A", progress: 0)
+    #expect(book.deepLinkURL == ColophonDeepLink.item(id: "li_book", episodeID: nil).url)
+
+    let episode = ContinueListeningWidgetItem(
+        itemID: "li_pod", episodeID: "ep_9", title: "T", author: "A", progress: 0)
+    #expect(episode.deepLinkURL == ColophonDeepLink.item(id: "li_pod", episodeID: "ep_9").url)
 }

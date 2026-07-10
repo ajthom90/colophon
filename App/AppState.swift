@@ -1975,15 +1975,28 @@ final class AppState {
             artworkThumbnailPath: nowPlayingArtworkPath))
     }
 
-    /// Publish the continue-listening SHELF into the App Group for the home widget. Called by
-    /// `HomeView` after it (re)loads the personalized shelves (and joins progress), so the widget's
-    /// list mirrors Home's "Continue Listening" row. Progress is joined from the local cache (the
-    /// shelf entities themselves carry none — see `refreshProgress`). Artwork thumbnails are wired in
-    /// Task 2's widget; entries publish without them here (the plumbing + no-content state are what
-    /// Task 1 needs). Display data ONLY.
-    func publishContinueListeningSnapshot(from shelves: [Shelf]) {
+    /// Widget thumbnails are downscaled to (at most) this many pixels on the long edge — small
+    /// enough to keep the shared App Group container tiny while still looking sharp in a
+    /// `.systemSmall`/`.systemMedium` widget cover slot.
+    private static let continueListeningThumbnailPixelSize = 200
+
+    /// Publish the continue-listening SHELF into the App Group for the home widget, THEN fetch +
+    /// downscale a cover thumbnail for the entries the widget can actually show (M2b Task 2) and
+    /// republish with the resolved paths. Called by `HomeView` after it (re)loads the personalized
+    /// shelves (and joins progress), so the widget's list mirrors Home's "Continue Listening" row.
+    /// Progress is joined from the local cache (the shelf entities themselves carry none — see
+    /// `refreshProgress`). Display data ONLY.
+    ///
+    /// Two publishes: the FIRST (title/author/progress, no artwork) lands immediately so the
+    /// widget refreshes without waiting on any network fetch; the SECOND republishes with whatever
+    /// thumbnails resolved. Each fetch runs in a `Task.detached` — OFF the main actor, since under
+    /// this module's default-MainActor isolation a plain `async` call would otherwise run the
+    /// network round-trip + `ArtworkThumbnail` decode/resize back on the main thread once resumed.
+    /// A missing/failed cover for an entry just leaves that entry's `artworkThumbnailPath` nil —
+    /// the widget shows its placeholder cover, never a crash.
+    func publishContinueListeningSnapshot(from shelves: [Shelf]) async {
         let entities = shelves.first { $0.id == "continue-listening" }?.entities ?? []
-        let entries: [ContinueListeningSnapshot.Entry] = entities.compactMap { entity in
+        var entries: [ContinueListeningSnapshot.Entry] = entities.compactMap { entity in
             switch entity {
             case let .book(book):
                 return ContinueListeningSnapshot.Entry(
@@ -2007,6 +2020,41 @@ final class AppState {
                 return nil
             }
         }
+        snapshots.publishContinueListening(ContinueListeningSnapshot(entries: entries))
+
+        guard let client, let connectionID = activeConnectionID, !entries.isEmpty else { return }
+        let coverStore = self.coverStore
+        let store = snapshots.store
+        let pixelSize = Self.continueListeningThumbnailPixelSize
+
+        // Cap at `maxWidgetDisplayCount` — the widget never shows more than that many rows, so
+        // fetching/writing a thumbnail beyond it would waste network + container space. `width:
+        // pixelSize` on the request mirrors `ShelfRow.prefetchCovers()`'s `updatedAt: nil` cache
+        // key (shelf entities carry no `updatedAt`); `ArtworkThumbnail.downscale` below is the
+        // guarantee that what's WRITTEN is always small even on a cache hit against a larger image.
+        let fetchCount = min(entries.count, ContinueListeningSnapshot.maxWidgetDisplayCount)
+        let fetches = entries.enumerated().prefix(fetchCount).map { index, entry in
+            Task.detached(priority: .utility) { () -> (Int, String?) in
+                let coverURL = client.coverURL(itemID: entry.itemID, width: pixelSize, updatedAt: nil)
+                guard let data = try? await coverStore.coverData(
+                    connectionID: connectionID, itemID: entry.itemID, updatedAt: nil,
+                    fetch: { try await URLSession.shared.data(from: coverURL).0 }
+                ), let thumbnail = ArtworkThumbnail.downscale(data, maxPixelSize: pixelSize) else {
+                    return (index, nil)
+                }
+                let key = entry.itemID + "/" + (entry.episodeID ?? "")
+                return (index, store.writeArtwork(thumbnail, forKey: key))
+            }
+        }
+        var didResolveAny = false
+        for fetch in fetches {
+            let (index, path) = await fetch.value
+            if let path {
+                entries[index].artworkThumbnailPath = path
+                didResolveAny = true
+            }
+        }
+        guard didResolveAny else { return }
         snapshots.publishContinueListening(ContinueListeningSnapshot(entries: entries))
     }
 

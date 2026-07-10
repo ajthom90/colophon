@@ -20,6 +20,10 @@ public struct SharedStore: Sendable {
     private static let nowPlayingDefaultsKey = "colophon.snapshot.nowPlaying"
     private static let continueListeningFileName = "continue-listening.json"
     private static let artworkDirectoryName = "artwork"
+    /// SAME key as the app's `@AppStorage("colophon.typeface")` (`ColophonApp.swift`) — the
+    /// standard `UserDefaults` suite the app-group suite mirrors it into (see
+    /// `writeTypefacePreference`), so widgets/Live Activity can match the app's typography.
+    private static let typefaceDefaultsKey = "colophon.typeface"
 
     /// Production initializer: resolves the shared `UserDefaults` suite and file container from the
     /// App Group id. Falls back to a temp directory if the container can't be resolved (no
@@ -99,6 +103,23 @@ public struct SharedStore: Sendable {
     /// Read the raw thumbnail bytes at a container-relative path, or `nil` when absent.
     public func readArtwork(atRelativePath relativePath: String) -> Data? {
         try? Data(contentsOf: artworkURL(forRelativePath: relativePath))
+    }
+
+    // MARK: - Typeface preference (mirrored so companion surfaces can match the app's typography)
+
+    /// Mirrors the app's serif/default typeface preference into the shared suite. NOT sensitive
+    /// (no token/credential concern applies) — companion surfaces (widgets, Live Activity) run in
+    /// a separate process with their OWN standard `UserDefaults`, so they can't read the app's
+    /// `@AppStorage("colophon.typeface")` directly; this is the bridge.
+    public func writeTypefacePreference(_ typeface: String) {
+        defaults?.set(typeface, forKey: Self.typefaceDefaultsKey)
+    }
+
+    /// Reads the mirrored typeface preference, defaulting to `"serif"` — the app's own
+    /// `@AppStorage` default — when nothing has been mirrored yet (e.g. before the app's first
+    /// snapshot publish).
+    public func readTypefacePreference() -> String {
+        defaults?.string(forKey: Self.typefaceDefaultsKey) ?? "serif"
     }
 
     // MARK: - Helpers

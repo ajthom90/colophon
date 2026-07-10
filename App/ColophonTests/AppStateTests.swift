@@ -456,6 +456,43 @@ struct AppStateTests {
         #expect(store.readNowPlaying() == nil)
     }
 
+    /// `publishContinueListeningSnapshot`'s artwork-thumbnail fetch (M2b Task 2) is guarded on
+    /// `client`/`activeConnectionID`: with no active connection (never `connect()`ed — the app's
+    /// state right after launch, before Home's first shelf load resolves), the function still
+    /// publishes the shelf's title/author/progress and returns cleanly with NO attempted network
+    /// fetch and no crash — every entry's `artworkThumbnailPath` stays nil (the widget's
+    /// placeholder-cover path). RED-meaningful: dropping the early guard would force-unwrap `client`
+    /// or attempt a fetch with no `connectionID`, either crashing or throwing inside the function.
+    @Test func continueListeningSnapshotWithNoActiveConnectionPublishesWithoutArtwork() async throws {
+        let container = makeTempDir()
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let store = SharedStore(suiteName: "colophon.tests.\(UUID().uuidString)", containerURL: container)
+        let app = AppState(
+            transportProvider: { MockTransport() },
+            cacheDirectory: makeTempDir(),
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: InMemoryTokenStore(),
+            oidcTransportProvider: { MockTransport() },
+            downloadManagerProvider: { FakeDownloadManaging() },
+            snapshotStore: store)
+
+        let shelvesJSON = #"""
+        [{"id":"continue-listening","label":"Continue Listening","type":"book","entities":[
+          {"id":"book1","media":{"coverPath":"/x/cover.jpg","duration":100.0,
+            "metadata":{"title":"A Book","authorName":"An Author"}}}
+        ]}]
+        """#
+        let shelves = try JSONDecoder().decode([Shelf].self, from: Data(shelvesJSON.utf8))
+
+        await app.publishContinueListeningSnapshot(from: shelves)
+
+        let published = try #require(store.readContinueListening())
+        #expect(published.entries.count == 1)
+        #expect(published.entries[0].itemID == "book1")
+        #expect(published.entries[0].title == "A Book")
+        #expect(published.entries[0].artworkThumbnailPath == nil)
+    }
+
     /// A queued EPISODE (its `QueueEntry.episodeId` set) advances through the episode path:
     /// `advanceToNext` opens `/play/:episodeId`, sets `nowPlayingEpisodeID`, and passes the entry's
     /// `author` (the podcast title) through as the now-playing author — then commits (drops) the entry.
