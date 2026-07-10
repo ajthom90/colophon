@@ -56,7 +56,15 @@ final class StoreKitTipProvider: TipProviding, Sendable {
         self.productIDs = productIDs
         updatesTask = Task {
             for await result in Transaction.updates {
-                if case .verified(let transaction) = result {
+                // Finish BOTH verified AND unverified — mirroring `purchase()`'s unconditional
+                // finish (see its `.unverified` case): a tip consumable grants nothing regardless
+                // of verification status, and an unfinished transaction keeps redelivering via
+                // Transaction.updates on every launch forever. So an externally-arriving
+                // transaction (an Ask-to-Buy / Family Sharing approval) is finished either way —
+                // there's nothing to withhold when verification fails, only a redelivery loop to
+                // avoid.
+                switch result {
+                case .verified(let transaction), .unverified(let transaction, _):
                     await transaction.finish()
                 }
             }
