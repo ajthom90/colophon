@@ -27,6 +27,10 @@ struct SplitShell: View {
     /// every library's browse rows start expanded, since the dev fixture has exactly one library
     /// and hiding its only children by default would bury Task 9's entry points.
     @State private var collapsedLibraryIDs: Set<String> = []
+    /// The Home detail column's navigation path — bound so a deep link (M2b Task 5) can PUSH an
+    /// item/podcast/episode detail into it. Home registers all three detail destinations at its root,
+    /// so deep links select the `.home` sidebar row and push onto this one stack.
+    @State private var homePath = NavigationPath()
 
     enum SidebarItem: Hashable {
         case home
@@ -94,6 +98,11 @@ struct SplitShell: View {
         // iPad per-platform presentation (Task 4): a large detented sheet. No-op on macOS (the Mac
         // uses the dedicated player Window above).
         .iPadPlayerSheet(isPresented: $showingFullPlayer)
+        // Drive navigation from a deep link / Siri phrase (M2b Task 5) — select the target sidebar
+        // row + push onto the Home detail stack. `.task` catches a cold-launch link that set
+        // `pendingNavigation` before this shell appeared.
+        .onChange(of: app.pendingNavigation) { _, _ in consumePending() }
+        .task { consumePending() }
         .task(id: app.activeConnectionID) {
             // Reset before observing so a connection switch never flashes the previous
             // connection's libraries, and never leaves a stale library selected.
@@ -184,8 +193,25 @@ struct SplitShell: View {
                     .offlineIndicator()
             }
         case .home, .none:
-            NavigationStack { HomeView().offlineIndicator() }
+            NavigationStack(path: $homePath) { HomeView().offlineIndicator() }
         }
+    }
+
+    /// Route the pending deep-link destination into this shell's sidebar selection + Home stack, then
+    /// clear it. Reads the LIVE `app.pendingNavigation` (not the `onChange` payload) so a mount-time
+    /// race between `.task` and `.onChange` consumes it exactly once. `resume` is handled by
+    /// `AppState` (playback), so there's nothing to navigate for it.
+    private func consumePending() {
+        guard let nav = app.pendingNavigation else { return }
+        switch nav {
+        case .item(let route): selection = .home; homePath.append(route)
+        case .podcast(let route): selection = .home; homePath.append(route)
+        case .episode(let route): selection = .home; homePath.append(route)
+        case .search: selection = .search
+        case .home: selection = .home
+        case .resume: break
+        }
+        app.consumePendingNavigation()
     }
 }
 

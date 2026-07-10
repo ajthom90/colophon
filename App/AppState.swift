@@ -295,6 +295,20 @@ final class AppState {
     /// unit-tested against a fake `ActivityManaging` without a live ActivityKit host (a device).
     private let liveActivity: LiveActivityController?
 
+    /// The pending deep-link / Siri navigation the active shell (`PhoneShell`/`SplitShell`) observes
+    /// and consumes (M2b Task 5). Navigation is PER-SHELL (there is no central `NavigationPath`), so
+    /// `onOpenURL` (widget / Live Activity / Spotlight deep links) and the Siri intents set this
+    /// one-shot request via `handleDeepLink`/`requestSearch`/`handleSpotlightActivity`; the shell drives
+    /// its `NavigationStack` + tab/sidebar selection to it, then calls `consumePendingNavigation`.
+    private(set) var pendingNavigation: DeepLinkDestination?
+    /// The query the Search surface should adopt when the shell routes to it (the "Search Colophon
+    /// <query>" Siri phrase, M2b Task 5). `SearchView` reads it and calls `consumePendingSearchQuery`.
+    private(set) var pendingSearchQuery: String?
+    /// Core Spotlight indexer (M2b Task 5): indexes the active connection's library items on refresh so
+    /// a system Spotlight search surfaces books, and de-indexes per connection on sign-out / removal so
+    /// items never leak across servers. Best-effort; compiles + runs on both platforms.
+    let spotlight = SpotlightIndexer()
+
     private var auth: AuthManager?
     private let tokenStore: any TokenStore
     private var sessionHandle: PlaybackSessionHandle?
@@ -924,6 +938,10 @@ final class AppState {
         }
         await tokenStore.clear(for: id)
         needsSignIn.insert(id)
+        // De-index this connection's Spotlight items (M2b Task 5) so a signed-out / removed server's
+        // books never linger in system Spotlight. Domain-scoped, so ONLY this connection's items go —
+        // `removeConnection` inherits it (its first step is this method).
+        spotlight.deindex(connectionID: id)
         // Drop this connection's up-next entries (Task 8): a signed-out / removed connection can't
         // play, so its queued books shouldn't linger. `advanceToNext`'s valid-connection guard is
         // the defense-in-depth backstop; this keeps the visible queue honest immediately.
@@ -1191,6 +1209,13 @@ final class AppState {
         // Success clears only this library's banner — another library's failure stays visible
         // on its own screen until *it* refreshes successfully.
         if refreshBanner?.libraryID == libraryID { refreshBanner = nil }
+        // Spotlight (M2b Task 5): index the active connection's freshly-refreshed items so a system
+        // Spotlight search surfaces books. Only the COMPLETED, UNFILTERED full set — a filtered or
+        // safety-bound-truncated page-through would index an incomplete subset. Best-effort + off the
+        // main actor; never blocks the refresh.
+        if completed, !isLyingEmpty, activeFilter == nil {
+            indexItemsForSpotlight(accumulated, connectionID: connectionID)
+        }
     }
 
     /// Targeted single-item patch for `item_updated`/`item_added` socket events: fetches just
@@ -2131,6 +2156,99 @@ final class AppState {
         guard let duration, duration > 0 else { return 0 }
         return min(max(progress.currentTime / duration, 0), 1)
     }
+
+    // MARK: - Deep-link routing + Siri/Shortcuts actions (M2b Task 5)
+
+    /// Handle an incoming `colophon://` URL from `onOpenURL` (the widget / Live Activity / Spotlight
+    /// deep links FINALLY landing here). Parses it via `ColophonDeepLink` (silently ignoring anything
+    /// that isn't one — e.g. an OAuth callback on the same scheme), resolves it to a destination with
+    /// the PURE `DeepLinkRouter`, then either PLAYS (resume) or hands the active shell a
+    /// `pendingNavigation` to drive — reusing the existing `ItemDetailRoute`/`PodcastDetailRoute`/
+    /// `EpisodeDetailRoute`, never a parallel navigator.
+    func handleDeepLink(_ url: URL) {
+        guard let link = ColophonDeepLink(url: url) else { return }
+        let destination = DeepLinkRouter.destination(for: link) { [weak self] id in
+            self?.deepLinkItemInfo(for: id)
+        }
+        switch destination {
+        case .resume:
+            Task { await resumePlayback() }
+        case .item, .podcast, .episode, .search, .home:
+            pendingNavigation = destination
+        }
+    }
+
+    /// Resolve a deep-linked item id to its cached display metadata for `DeepLinkRouter`. Podcast-ness
+    /// is inferred from whether the item has cached episodes (a book never does) — enough to route a
+    /// bare `colophon://item/<id>` to the podcast page for a podcast the user has opened; an uncached
+    /// item returns nil and falls back to the book detail (which fetches). Pure cache reads, no network.
+    private func deepLinkItemInfo(for itemID: String) -> DeepLinkItemInfo? {
+        guard let connectionID = activeConnectionID,
+              let item = (try? cache.item(connectionID: connectionID, itemID: itemID)) ?? nil else { return nil }
+        let isPodcast = !((try? cache.episodes(connectionID: connectionID, itemID: itemID)) ?? []).isEmpty
+        return DeepLinkItemInfo(title: item.title, author: item.authorName,
+                                updatedAt: item.updatedAt, duration: item.duration, isPodcast: isPodcast)
+    }
+
+    /// The Siri/Shortcuts "Search Colophon" action (M2b Task 5): route to the Search surface, seeding
+    /// its query when one was supplied (an empty/blank query just opens Search).
+    func requestSearch(query: String?) {
+        let trimmed = query?.trimmingCharacters(in: .whitespacesAndNewlines)
+        pendingSearchQuery = (trimmed?.isEmpty == false) ? trimmed : nil
+        pendingNavigation = .search(query: pendingSearchQuery)
+    }
+
+    /// Resume playback for `colophon://resume` / `ResumeIntent` (M2b Task 5, the widget's resume
+    /// target). If a session is already loaded, just resume it in place; otherwise start the TOP
+    /// continue-listening entry — read back from the SAME published snapshot the widget shows — via
+    /// the pure `DeepLinkRouter.resumeTarget`. A no-op when nothing is loaded and the shelf is empty.
+    func resumePlayback() async {
+        if nowPlayingItemID != nil {
+            if !playback.isPlaying { playback.togglePlayPause() }
+            return
+        }
+        guard let entry = DeepLinkRouter.resumeTarget(in: snapshots.store.readContinueListening()) else { return }
+        await startPlayback(itemID: entry.itemID, episodeId: entry.episodeID)
+    }
+
+    /// The active shell calls this after driving its stacks/selection to `pendingNavigation`.
+    func consumePendingNavigation() { pendingNavigation = nil }
+    /// `SearchView` calls this after adopting `pendingSearchQuery`.
+    func consumePendingSearchQuery() { pendingSearchQuery = nil }
+
+    /// Resolve a Spotlight selection (`onContinueUserActivity(CSSearchableItemActionType)`): recover
+    /// `(connectionID, itemID)` from the searchable item's identifier and route to it via the SAME
+    /// deep-link path — but ONLY when it belongs to the ACTIVE connection, so a stale hit for another
+    /// server's item never cross-opens (the "don't leak across connections" guarantee on the read side).
+    func handleSpotlightActivity(uniqueIdentifier: String) {
+        guard let (connectionID, itemID) = SpotlightIndexer.components(fromUniqueIdentifier: uniqueIdentifier),
+              connectionID == activeConnectionID else { return }
+        handleDeepLink(ColophonDeepLink.item(id: itemID, episodeID: nil).url)
+    }
+
+    /// Index the given items into Core Spotlight for a connection (M2b Task 5). Cover thumbnails are
+    /// read DISK-ONLY (the `fetch` throws so a miss never hits the network) and capped, so a library
+    /// refresh never triggers a cover-download storm; beyond the cap items index text-only (title/
+    /// author still make them findable). Best-effort + off the main actor.
+    private func indexItemsForSpotlight(_ items: [CachedItem], connectionID: String) {
+        guard !items.isEmpty else { return }
+        let coverStore = self.coverStore
+        let thumbnailIDs = Set(items.prefix(Self.spotlightThumbnailCap).map(\.id))
+        spotlight.index(items: items, connectionID: connectionID) { item in
+            guard thumbnailIDs.contains(item.id),
+                  let data = try? await coverStore.coverData(
+                    connectionID: connectionID, itemID: item.id, updatedAt: item.updatedAt,
+                    fetch: { throw CancellationError() })
+            else { return nil }
+            return ArtworkThumbnail.downscale(data, maxPixelSize: Self.spotlightThumbnailPixelSize)
+        }
+    }
+
+    /// Cap on how many items get a Spotlight cover thumbnail per refresh (disk reads + image decodes),
+    /// and the thumbnail's long-edge pixel size — small enough to keep the Spotlight index light.
+    /// `nonisolated` so the off-main thumbnail closure can read the pixel size.
+    nonisolated private static let spotlightThumbnailCap = 120
+    nonisolated private static let spotlightThumbnailPixelSize = 180
 
     /// The `SpeedControl` write path (Task 7): applies `rate` to the LIVE `PlaybackController`
     /// immediately, and persists it as this (connection, item)'s per-book preference so a later
