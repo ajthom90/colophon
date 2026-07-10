@@ -1,0 +1,116 @@
+{
+  "identifier" : "13AE6F04",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "1.99",
+      "familyShareable" : false,
+      "internalID" : "B0389DAF",
+      "localizations" : [
+        {
+          "description" : "A small thank-you for the developer — every bit helps keep Colophon going.",
+          "displayName" : "Leave a Tip",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.andrewthom.colophon.tip.small",
+      "referenceName" : "Tip - Small",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "4.99",
+      "familyShareable" : false,
+      "internalID" : "CA4324F8",
+      "localizations" : [
+        {
+          "description" : "A generous tip — thank you for going the extra mile to support Colophon.",
+          "displayName" : "Generous Tip",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.andrewthom.colophon.tip.medium",
+      "referenceName" : "Tip - Medium",
+      "type" : "Consumable"
+    },
+    {
+      "displayPrice" : "9.99",
+      "familyShareable" : false,
+      "internalID" : "2B88E665",
+      "localizations" : [
+        {
+          "description" : "An amazing tip — you're helping keep Colophon free and independent. Thank you!",
+          "displayName" : "Amazing Tip",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.andrewthom.colophon.tip.large",
+      "referenceName" : "Tip - Large",
+      "type" : "Consumable"
+    }
+  ],
+  "settings" : {
+    "_askToBuyEnabled" : false,
+    "_billingIssuesEnabled" : false,
+    "_disableDialogs" : false,
+    "_failTransactionsEnabled" : false,
+    "_locale" : "en_US",
+    "_storeKitErrors" : [
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Load Products"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Purchase"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Verification"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Store Sync"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Subscription Status"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Transaction"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Manage Subscriptions Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Refund Request Sheet"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Offer Code Redeem Sheet"
+      }
+    ],
+    "_storefront" : "USA",
+    "_timeRate" : 1
+  },
+  "subscriptionGroups" : [
+
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}

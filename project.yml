@@ -5,6 +5,13 @@ options:
     iOS: "26.0"
     macOS: "26.0"
   createIntermediateGroups: true
+# The tip-jar StoreKit-Testing config (M2c Task 1). A plain top-level fileGroups entry — like
+# XcodeGen's own storeKitConfiguration fixture — gives it a PBXFileReference (visible in the
+# project navigator) WITHOUT adding it to any target's build phases (it's a scheme-consumed
+# config, not source/resource). Registered below as the Colophon scheme's run-action StoreKit
+# configuration so the Simulator serves its 3 consumables with no App Store Connect round-trip.
+fileGroups:
+  - Products.storekit
 packages:
   ABSKit:
     path: Packages/ABSKit
@@ -170,6 +177,13 @@ schemes:
   Colophon:
     build:
       targets: { Colophon: all }
+    # M2c Task 1: the tip jar's StoreKit-Testing config. Wiring it on the RUN action makes the
+    # Simulator (and a device debug run) serve `Products.storekit`'s 3 consumables with no App
+    # Store Connect round-trip — `TipStore`'s unit tests (via `FakeTipProvider`) never touch
+    # StoreKit at all, so this is purely for manual/Simulator verification of the real
+    # `StoreKitTipProvider` path.
+    run:
+      storeKitConfiguration: Products.storekit
     test:
       targets:
         - ColophonTests

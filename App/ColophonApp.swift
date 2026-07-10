@@ -178,10 +178,20 @@ struct ColophonApp: App {
         // `Settings` is a SEPARATE `Scene` from the `WindowGroup` above — it does NOT inherit the
         // `.fontDesign` applied to the WindowGroup's content, even though both scenes live in the
         // same `App` struct. So the same `@AppStorage("colophon.typeface")` key is applied again
-        // here, directly on `SettingsView`. Two call sites, one key: correct for two scenes.
+        // here, directly on the `NavigationStack` wrapping `SettingsView`. Multiple call sites,
+        // one key: correct for every scene.
+        //
+        // M2c Task 2: wrapped in a `NavigationStack` (it wasn't before) — `SettingsView` gained a
+        // `NavigationLink` to `TipJarView`, and without a `NavigationStack` ancestor here that link
+        // would dead-end on macOS (this project's navigationDestination-placement gotcha: a
+        // `NavigationLink` needs a `NavigationStack` to push into). The two other `SettingsView`
+        // call sites (`RootShell`'s account-menu sheet, `ConnectionsView`'s iOS sheet) already
+        // provide their own `NavigationStack`, so only this scene needed the change.
         Settings {
-            SettingsView()
-                .fontDesign(typeface == "serif" ? .serif : .default)
+            NavigationStack {
+                SettingsView()
+            }
+            .fontDesign(typeface == "serif" ? .serif : .default)
         }
         #endif
     }
