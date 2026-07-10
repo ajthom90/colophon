@@ -205,5 +205,8 @@ struct HomeView: View {
         }
         // The progress-join that feeds the pills — runs on appear and on every pull-to-refresh.
         await app.refreshProgress()
+        // Publish the continue-listening shelf into the App Group for the home widget (M2b Task 1).
+        // AFTER the progress join so the snapshot's per-entry progress reads the freshly-joined cache.
+        app.publishContinueListeningSnapshot(from: shelves)
     }
 }

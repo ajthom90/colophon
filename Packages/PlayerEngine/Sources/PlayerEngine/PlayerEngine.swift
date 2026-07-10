@@ -59,6 +59,14 @@ public final class PlaybackController {
     /// `globalTime` at `totalDuration` before invoking it, so the UI reads "finished" either way.
     public var onBookFinished: (() -> Void)?
 
+    /// Fired on discrete now-playing transitions — `load`, `play`, `pause`, `seek`, and artwork
+    /// arrival — the same moments `NowPlayingUpdater` refreshes the lock-screen surface. `AppState`
+    /// wires this to publish the `NowPlayingSnapshot` into the App Group so the widget / Live Activity
+    /// / Control-Center extensions (separate processes) reflect play/pause + chapter changes. NOT
+    /// fired from the per-second `tick`/`updateElapsed` (that would spam widget reloads) — progress in
+    /// the snapshot is refreshed on these transitions, which is enough for the home widget.
+    public var onNowPlayingStateChange: (() -> Void)?
+
     private let backend: PlayerBackend
     private let now: @Sendable () -> Date
     private var timeline = BookTimeline(tracks: [])
@@ -131,6 +139,7 @@ public final class PlaybackController {
         lastTickGlobalTime = session.startTime
         nowPlaying.configure(controller: self)
         configureAudioSession()
+        onNowPlayingStateChange?()
     }
 
     public func play() {
@@ -140,6 +149,7 @@ public final class PlaybackController {
         fadeTask?.cancel(); fadeTask = nil
         backend.volume = muted ? 0 : 1
         backend.play(); isPlaying = true; nowPlaying.update(controller: self)
+        onNowPlayingStateChange?()
     }
 
     /// Sleep-timer FIRE hook (Task 5): smoothly ramp the backend volume to 0 over `duration`
@@ -174,6 +184,7 @@ public final class PlaybackController {
     public func pause() {
         backend.pause(); isPlaying = false
         nowPlaying.update(controller: self)
+        onNowPlayingStateChange?()
         Task { await flushSync() }
     }
 
@@ -187,6 +198,7 @@ public final class PlaybackController {
     public func setNowPlayingArtwork(_ data: Data?) {
         artworkData = data
         nowPlaying.update(controller: self)
+        onNowPlayingStateChange?()
     }
 
     /// Re-advertise the current `skipInterval` to the lock-screen / Control-Center / media-key
@@ -208,6 +220,7 @@ public final class PlaybackController {
         globalTime = timeline.globalTime(trackIndex: position.trackIndex, offset: position.offset)
         lastTickGlobalTime = globalTime
         nowPlaying.update(controller: self)
+        onNowPlayingStateChange?()
     }
 
     // Tear down the now-playing surface with the backend: `retireCurrentSession` calls this, so a

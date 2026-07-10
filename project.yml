@@ -14,6 +14,8 @@ packages:
     path: Packages/LibraryCache
   DownloadManager:
     path: Packages/DownloadManager
+  ColophonShared:
+    path: Packages/ColophonShared
   # GRDB is a transitive dependency of LibraryCache whose public `AsyncValueObservation` API
   # leaks GRDB types into the app's own object files. The plain build action links it via
   # eager-linking response files, but the test-host app link drops those transitive inputs and
@@ -36,8 +38,20 @@ targets:
       - package: PlayerEngine
       - package: LibraryCache
       - package: DownloadManager
+      - package: ColophonShared
       - package: GRDB
         product: GRDB
+      # Embed the WidgetKit extension into the app (iOS ONLY). `platformFilter: iOS` stamps the
+      # "Embed Foundation Extensions" copy-files build FILE with `platformFilter = ios`, so the embed
+      # runs only for the iOS variant of this multi-platform (`supportedDestinations: [iOS, macOS]`)
+      # target; the macOS variant skips it. Combined with the extension's own
+      # `supportedDestinations: [iOS]` (xcodebuild skips building an iOS-only dependency for the macOS
+      # destination), this keeps `make build-mac` GREEN. NOTE: XcodeGen's dependency `platforms: [iOS]`
+      # was tried first and DROPPED the embed + dependency entirely under `supportedDestinations`;
+      # `platformFilter` is the stanza that actually works here.
+      - target: ColophonWidgets
+        embed: true
+        platformFilter: iOS
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.andrewthom.colophon
@@ -65,6 +79,40 @@ targets:
         CFBundleURLTypes:
           - CFBundleURLName: com.andrewthom.colophon.oauth
             CFBundleURLSchemes: [colophon]
+  # The WidgetKit widget extension (M2b companions foundation). iOS-ONLY
+  # (`supportedDestinations: [iOS]`) so it never enters the macOS build — the app embeds it via a
+  # `platforms: [iOS]`-filtered dependency (see the Colophon target above), keeping `make build-mac`
+  # green. Reads the shared snapshot the app publishes through `ColophonShared` + the App Group.
+  ColophonWidgets:
+    type: app-extension
+    supportedDestinations: [iOS]
+    sources: [Widgets]
+    dependencies:
+      - package: ColophonShared
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.andrewthom.colophon.widgets
+        DEVELOPMENT_TEAM: LL334G7KP2
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: Widgets/ColophonWidgets.entitlements
+        PRODUCT_NAME: ColophonWidgets
+        SWIFT_VERSION: "6.2"
+        SWIFT_STRICT_CONCURRENCY: complete
+        SWIFT_DEFAULT_ACTOR_ISOLATION: MainActor
+        ENABLE_USER_SCRIPT_SANDBOXING: true
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: 1
+        # WidgetKit extensions are UI-bearing; SwiftUI previews/asset catalogs aren't needed for the
+        # scaffold. The generated Info.plist below declares the widget extension point.
+        SKIP_INSTALL: true
+    info:
+      path: Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: Colophon Widgets
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
   ColophonTests:
     type: bundle.unit-test
     # iOS-only: this hosted bundle runs on the iOS Simulator via `make test-app`. See the

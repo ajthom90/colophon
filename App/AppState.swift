@@ -9,6 +9,7 @@ import ABSRealtime
 import PlayerEngine
 import LibraryCache
 import DownloadManager
+import ColophonShared
 import Network
 
 /// The library-browse sort options surfaced in `LibraryGridView`'s toolbar, each mapped to a
@@ -273,6 +274,18 @@ final class AppState {
     /// so the grid shows exactly the filtered set without the cache ever deleting non-matching rows.
     private(set) var libraryItemOrder: [String: [String]] = [:]
 
+    /// Publishes now-playing + continue-listening SNAPSHOTS into the App Group for the companion
+    /// extensions (M2b Task 1). Display data only — never tokens (see `SnapshotPublisher`).
+    private let snapshots = SnapshotPublisher()
+    /// The container-relative path of the current now-playing cover thumbnail (written into the App
+    /// Group by `loadNowPlayingArtwork`), carried on the published `NowPlayingSnapshot`. Cleared with
+    /// the session in `retireCurrentSession`.
+    private var nowPlayingArtworkPath: String?
+    /// While a session is being retired, suppress the transient now-playing snapshots the player's
+    /// `pause()`/`unload()` would otherwise publish mid-teardown (fields still set) — `retireCurrentSession`
+    /// publishes ONE authoritative clear at the end instead.
+    private var suppressSnapshotPublish = false
+
     private var auth: AuthManager?
     private let tokenStore: any TokenStore
     private var sessionHandle: PlaybackSessionHandle?
@@ -441,6 +454,12 @@ final class AppState {
         // and every download is scoped to the active connection.
         downloads.clientProvider = { [weak self] in self?.client }
         downloads.connectionIDProvider = { [weak self] in self?.activeConnectionID }
+        // Publish the now-playing SNAPSHOT to the App Group on every discrete player transition
+        // (load/play/pause/seek/artwork) so the widget / Live Activity / Control-Center extensions
+        // reflect play-pause + chapter changes. `[weak self]` avoids a retain cycle (AppState owns
+        // `playback`). Suppressed during `retireCurrentSession`'s teardown (see the guard in
+        // `publishNowPlayingSnapshot`).
+        playback.onNowPlayingStateChange = { [weak self] in self?.publishNowPlayingSnapshot() }
     }
 
     var deviceInfo: DeviceInfo {
@@ -1303,6 +1322,9 @@ final class AppState {
         // `onSyncDue`→the LOCAL `cachedProgress` write — the sole divergence is the sync SINK, not the
         // teardown sequence.
         guard sessionHandle != nil || nowPlayingItemID != nil else { return }
+        // Hold back the transient snapshots `pause()`/`unload()` would publish while the now-playing
+        // fields are still set — the single authoritative clear happens at the end of this method.
+        suppressSnapshotPublish = true
         playback.pause()
         await playback.flushOnly()
         playback.onSyncDue = nil
@@ -1325,6 +1347,11 @@ final class AppState {
         sleepTimer.chapters = []
         // The bookmarks were scoped to that book too — drop them and the writer/item pointers.
         bookmarks.clear()
+        // Publish the authoritative now-playing CLEAR to the App Group (widget shows "nothing
+        // playing"); drop the cover-thumbnail pointer with the session.
+        nowPlayingArtworkPath = nil
+        suppressSnapshotPublish = false
+        publishNowPlayingSnapshot()
     }
 
     /// Open a playback session and hand it to the shared player.
@@ -1903,6 +1930,89 @@ final class AppState {
         ) else { return }
         guard nowPlayingItemID == itemID else { return }
         playback.setNowPlayingArtwork(data)
+        // Also stash the cover thumbnail in the App Group and republish the snapshot with its path,
+        // so the widget / Live Activity can show the same art (the extensions can't reach the app's
+        // cover cache). Keyed by item(+episode). `setNowPlayingArtwork` already republished (without a
+        // path); this second publish carries the path once the write lands.
+        let key = itemID + "/" + (nowPlayingEpisodeID ?? "")
+        if let path = snapshots.writeArtwork(data, forKey: key) {
+            nowPlayingArtworkPath = path
+            publishNowPlayingSnapshot()
+        }
+    }
+
+    // MARK: - App Group snapshot publishing (M2b Task 1)
+
+    /// Build + publish the current `NowPlayingSnapshot` into the App Group (or clear it when nothing
+    /// is playing). Called on every discrete player transition via `playback.onNowPlayingStateChange`,
+    /// and directly after now-playing state or artwork changes. Suppressed mid-retire (see
+    /// `suppressSnapshotPublish`). Display data ONLY — no tokens ever reach the group.
+    func publishNowPlayingSnapshot() {
+        guard !suppressSnapshotPublish else { return }
+        guard let itemID = nowPlayingItemID else {
+            snapshots.publishNowPlaying(nil)
+            return
+        }
+        let total = playback.totalDuration
+        let t = playback.globalTime
+        let progress = total > 0 ? min(max(t / total, 0), 1) : 0
+        let chapterTitle = nowPlayingChapters.first { $0.start <= t && t < $0.end }?.title
+        snapshots.publishNowPlaying(NowPlayingSnapshot(
+            itemID: itemID,
+            episodeID: nowPlayingEpisodeID,
+            title: playback.title,
+            author: playback.author,
+            chapterTitle: chapterTitle,
+            progress: progress,
+            isPlaying: playback.isPlaying,
+            updatedAt: Date(),
+            artworkThumbnailPath: nowPlayingArtworkPath))
+    }
+
+    /// Publish the continue-listening SHELF into the App Group for the home widget. Called by
+    /// `HomeView` after it (re)loads the personalized shelves (and joins progress), so the widget's
+    /// list mirrors Home's "Continue Listening" row. Progress is joined from the local cache (the
+    /// shelf entities themselves carry none — see `refreshProgress`). Artwork thumbnails are wired in
+    /// Task 2's widget; entries publish without them here (the plumbing + no-content state are what
+    /// Task 1 needs). Display data ONLY.
+    func publishContinueListeningSnapshot(from shelves: [Shelf]) {
+        let entities = shelves.first { $0.id == "continue-listening" }?.entities ?? []
+        let entries: [ContinueListeningSnapshot.Entry] = entities.compactMap { entity in
+            switch entity {
+            case let .book(book):
+                return ContinueListeningSnapshot.Entry(
+                    itemID: book.id,
+                    episodeID: nil,
+                    title: book.media.metadata.title ?? "Untitled",
+                    author: book.media.metadata.authorName ?? book.media.metadata.author ?? "",
+                    progress: continueProgress(itemID: book.id, episodeID: nil, duration: book.media.duration),
+                    artworkThumbnailPath: nil)
+            case let .episode(episode):
+                let episodeID = episode.recentEpisode?.id
+                return ContinueListeningSnapshot.Entry(
+                    itemID: episode.id,
+                    episodeID: episodeID,
+                    title: episode.recentEpisode?.title ?? episode.media?.metadata.title ?? "Untitled",
+                    author: episode.media?.metadata.author ?? episode.media?.metadata.title ?? "",
+                    progress: continueProgress(itemID: episode.id, episodeID: episodeID,
+                                               duration: episode.recentEpisode?.duration),
+                    artworkThumbnailPath: nil)
+            case .author, .unknown:
+                return nil
+            }
+        }
+        snapshots.publishContinueListening(ContinueListeningSnapshot(entries: entries))
+    }
+
+    /// Fractional progress (0…1) for a continue-listening entry, joined from the local `cachedProgress`
+    /// (the shelf entity carries none). A finished item reads 1; a missing row/duration reads 0.
+    private func continueProgress(itemID: String, episodeID: String?, duration: Double?) -> Double {
+        guard let connectionID = activeConnectionID,
+              let progress = (try? cache.progress(connectionID: connectionID, itemID: itemID,
+                                                  episodeID: episodeID)) ?? nil else { return 0 }
+        if progress.isFinished { return 1 }
+        guard let duration, duration > 0 else { return 0 }
+        return min(max(progress.currentTime / duration, 0), 1)
     }
 
     /// The `SpeedControl` write path (Task 7): applies `rate` to the LIVE `PlaybackController`
