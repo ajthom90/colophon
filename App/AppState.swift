@@ -287,6 +287,13 @@ final class AppState {
     /// `pause()`/`unload()` would otherwise publish mid-teardown (fields still set) — `retireCurrentSession`
     /// publishes ONE authoritative clear at the end instead.
     private var suppressSnapshotPublish = false
+    /// Drives the now-playing Live Activity (M2b Task 4) off the SAME `publishNowPlayingSnapshot`
+    /// signal: starts it on playback (if the system permits Live Activities), updates it (throttled)
+    /// on chapter / play-pause / progress, and ends it on retire — exactly ONE Activity across book
+    /// switches / connection changes. `nil` on macOS (Live Activities are iOS-only) and whenever no
+    /// manager is available; the DECISION logic lives in `ColophonShared` (`LiveActivityController`),
+    /// unit-tested against a fake `ActivityManaging` without a live ActivityKit host (a device).
+    private let liveActivity: LiveActivityController?
 
     private var auth: AuthManager?
     private let tokenStore: any TokenStore
@@ -393,12 +400,24 @@ final class AppState {
         downloadsRoot: URL? = nil,
         // Test seam: an explicit App-Group `SharedStore` (temp suite/dir) so the snapshot-publish
         // wiring can be asserted hermetically. `nil` reproduces production (the real App-Group store).
-        snapshotStore: SharedStore? = nil
+        snapshotStore: SharedStore? = nil,
+        // Test seam: an injected Live Activity manager (a fake `ActivityManaging`) so the now-playing
+        // Live Activity lifecycle wiring can be asserted without a live ActivityKit host (a device).
+        // `nil` reproduces production — iOS builds the real ActivityKit-backed `LiveActivityManager`;
+        // macOS gets none (ActivityKit is iOS-only).
+        liveActivityManager: (any ActivityManaging)? = nil
     ) {
         self.transport = transportProvider()
         self.oidcTransport = oidcTransportProvider?()
         self.tokenStore = tokenStore ?? KeychainTokenStore()
         self.snapshots = snapshotStore.map(SnapshotPublisher.init(store:)) ?? SnapshotPublisher()
+        // The now-playing Live Activity controller (M2b Task 4) is built ONLY from an injected manager.
+        // Production wires the real ActivityKit-backed `LiveActivityManager` from `ColophonApp` (iOS
+        // only — the same "construct the OS-touching dependency in the app entry point, not `AppState`"
+        // discipline the Task-3 intent bridge follows); a unit test injects a fake `ActivityManaging`;
+        // everything else (macOS, tests that don't exercise the Live Activity) leaves it nil, so
+        // `AppState.init` never touches ActivityKit in a test host.
+        self.liveActivity = liveActivityManager.map { LiveActivityController(manager: $0) }
         // `playback` is initialized at its declaration, so it's already live here; the timer
         // captures only that controller (not `self`), keeping init capture-free.
         self.sleepTimer = SleepTimer(host: playback)
@@ -1957,6 +1976,9 @@ final class AppState {
         guard !suppressSnapshotPublish else { return }
         guard let itemID = nowPlayingItemID else {
             snapshots.publishNowPlaying(nil)
+            // Nothing playing → end the Live Activity (the authoritative clear on stop / retire /
+            // sign-out; the controller no-ops if none is active).
+            liveActivity?.sync(nil)
             return
         }
         let total = playback.totalDuration
@@ -1972,6 +1994,18 @@ final class AppState {
             progress: progress,
             isPlaying: playback.isPlaying,
             updatedAt: Date(),
+            artworkThumbnailPath: nowPlayingArtworkPath))
+        // Drive the Live Activity off the SAME signal — start on first play (if permitted), throttled
+        // updates on chapter / play-pause / progress, exactly one across book switches.
+        liveActivity?.sync(LiveActivityState(
+            itemID: itemID,
+            episodeID: nowPlayingEpisodeID,
+            title: playback.title,
+            author: playback.author,
+            chapterTitle: chapterTitle,
+            progress: progress,
+            isPlaying: playback.isPlaying,
+            elapsed: t,
             artworkThumbnailPath: nowPlayingArtworkPath))
     }
 

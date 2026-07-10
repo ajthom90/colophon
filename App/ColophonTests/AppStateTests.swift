@@ -456,6 +456,91 @@ struct AppStateTests {
         #expect(store.readNowPlaying() == nil)
     }
 
+    /// A fake `ActivityManaging` recording the Live Activity start/update/end the app drives — the
+    /// seam that lets the lifecycle wiring be asserted on the simulator without a live ActivityKit
+    /// host. `isActive` mirrors the real manager's contract (true after start, false after end).
+    @MainActor
+    private final class FakeLiveActivityManager: ActivityManaging {
+        var areActivitiesEnabled = true
+        private(set) var isActive = false
+        private(set) var startCount = 0
+        private(set) var updateCount = 0
+        private(set) var endCount = 0
+        private(set) var lastStartedIdentity: String?
+        func start(_ state: LiveActivityState) {
+            startCount += 1; isActive = true; lastStartedIdentity = state.identity
+        }
+        func update(_ state: LiveActivityState) { updateCount += 1 }
+        func end() { endCount += 1; isActive = false }
+    }
+
+    /// The Live Activity lifecycle wired end-to-end through the REAL `AppState` flow (M2b Task 4):
+    /// starting playback drives ONE Activity start; retiring the session (the public
+    /// `closeCurrentSession` entry) ends it. RED-meaningful: dropping the `publishNowPlayingSnapshot`
+    /// →`liveActivity?.sync` wiring leaves `startCount == 0`; dropping retire's final clear leaves the
+    /// Activity active after retire.
+    @Test func liveActivityStartsOnPlayAndEndsOnRetire() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let activity = FakeLiveActivityManager()
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: makeTempDir(),
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: InMemoryTokenStore(),
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() },
+            liveActivityManager: activity)
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        await transport.enqueue(status: 200, json: bookPlayJSON)
+        await app.startPlayback(itemID: "book1")
+
+        #expect(activity.startCount == 1)
+        #expect(activity.isActive == true)
+        #expect(activity.lastStartedIdentity == "book1|")
+
+        await app.closeCurrentSession()
+        #expect(activity.endCount >= 1)
+        #expect(activity.isActive == false)
+    }
+
+    /// A book switch through the real `startPlayback`→`retireCurrentSession`→`startPlayback` path
+    /// leaves EXACTLY ONE Activity: the old book's Activity is ended (via retire's clear) and the new
+    /// book's is started — never two. RED-meaningful: a lifecycle that failed to end on retire would
+    /// leave `endCount == 0` / two starts with no end between them.
+    @Test func liveActivityBookSwitchEndsOldAndStartsNew() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let activity = FakeLiveActivityManager()
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: makeTempDir(),
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: InMemoryTokenStore(),
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() },
+            liveActivityManager: activity)
+        app.playback.muted = true
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        await transport.enqueue(status: 200, json: bookPlayJSON)   // /play book1
+        await app.startPlayback(itemID: "book1")
+        #expect(activity.startCount == 1)
+
+        // Switching to book2 retires book1 first (flush + /close consume the queue) before book2's
+        // /play — mirror `advanceToNextPlaysFrontOfQueueThenRemovesIt`'s proven absorber sequence.
+        await transport.enqueue(status: 200, json: "{}")           // absorbs book1 flush
+        await transport.enqueue(status: 200, json: "{}")           // absorbs book1 /close on retire
+        await transport.enqueue(status: 200, json: bookPlayJSON)   // /play book2
+        await app.startPlayback(itemID: "book2")
+
+        #expect(activity.startCount == 2)          // the new book started
+        #expect(activity.endCount == 1)            // the old book's Activity was ended by retire
+        #expect(activity.isActive == true)         // exactly ONE remains
+        #expect(activity.lastStartedIdentity == "book2|")
+    }
+
     /// `publishContinueListeningSnapshot`'s artwork-thumbnail phase (M2b Task 2) is guarded on
     /// `client`/`activeConnectionID`: with no active connection (never `connect()`ed — the app's
     /// state right after launch, before Home's first shelf load resolves), the function still

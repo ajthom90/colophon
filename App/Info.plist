@@ -38,6 +38,8 @@
 	</dict>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Colophon connects to your Audiobookshelf server, which may be on your local network.</string>
+	<key>NSSupportsLiveActivities</key>
+	<true/>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>

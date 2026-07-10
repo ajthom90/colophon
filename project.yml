@@ -36,6 +36,10 @@ targets:
       # routes `perform()` to the running app process, where the live-player `@Dependency` is
       # registered — while the Control Center control (in the extension) references the same intents.
       - path: SharedIntents
+      # The now-playing Live Activity's ActivityKit attributes (M2b Task 4), compiled into BOTH the app
+      # (which manages the Activity) and the extension (which renders it). iOS-only inside the file
+      # (`#if os(iOS)`), so it compiles away on the macOS app build.
+      - path: SharedActivity
     dependencies:
       - package: ABSKit
       - package: ABSKit
@@ -78,6 +82,8 @@ targets:
         CFBundleVersion: $(CURRENT_PROJECT_VERSION)
         UILaunchScreen: {}
         UIBackgroundModes: [audio]
+        # Required for the now-playing Live Activity (M2b Task 4). Harmless/ignored on macOS.
+        NSSupportsLiveActivities: true
         NSAppTransportSecurity:
           NSAllowsArbitraryLoads: true
         NSLocalNetworkUsageDescription: "Colophon connects to your Audiobookshelf server, which may be on your local network."
@@ -96,6 +102,10 @@ targets:
       # The playback App Intents (M2b Task 3), shared with the app target — so the Control Center
       # control (`PlayPauseControlWidget`, in Widgets/) can reference `SetPlaybackIntent`.
       - SharedIntents
+      # The Live Activity's ActivityKit attributes (M2b Task 4), shared with the app target so the
+      # extension's `NowPlayingLiveActivity` renders the same `NowPlayingActivityAttributes` the app
+      # manages.
+      - SharedActivity
     dependencies:
       - package: ColophonShared
     settings:

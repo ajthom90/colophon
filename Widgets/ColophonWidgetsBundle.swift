@@ -5,7 +5,8 @@ import WidgetKit
 
 /// The widget extension's `@main` entry point. `ContinueListeningWidget` (M2b Task 2) is the home
 /// widget; `PlayPauseControlWidget` (M2b Task 3, iOS-only) is the Control Center / Lock Screen
-/// play-pause control. The Live Activity (Task 4) joins as it lands.
+/// play-pause control; `NowPlayingLiveActivity` (M2b Task 4, iOS-only) is the now-playing Live
+/// Activity (Lock Screen + Dynamic Island).
 @main
 struct ColophonWidgetsBundle: WidgetBundle {
     init() {
@@ -25,6 +26,7 @@ struct ColophonWidgetsBundle: WidgetBundle {
         ContinueListeningWidget()
         #if os(iOS)
         PlayPauseControlWidget()
+        NowPlayingLiveActivity()
         #endif
     }
 }

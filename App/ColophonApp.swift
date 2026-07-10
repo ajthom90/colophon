@@ -38,7 +38,14 @@ struct ColophonApp: App {
     @AppStorage("colophon.skipInterval") private var skipInterval = AppState.defaultSkipInterval
 
     init() {
+        // Wire the real ActivityKit-backed now-playing Live Activity manager (M2b Task 4) here — the
+        // app entry point — rather than in `AppState.init`, so unit tests (which build `AppState`
+        // directly) never touch ActivityKit in the test host. iOS-only: Live Activities are iOS-only.
+        #if os(iOS)
+        let appState = AppState(liveActivityManager: LiveActivityManager())
+        #else
         let appState = AppState()
+        #endif
         _app = State(initialValue: appState)
         // Register the App Intents dependency at app launch (M2b Task 3): the playback intents
         // (`SetPlaybackIntent`/`TogglePlaybackIntent`/`SkipForward/BackwardIntent`) resolve this LIVE
