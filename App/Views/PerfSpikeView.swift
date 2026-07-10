@@ -40,8 +40,17 @@ final class FrameGapMonitor {
         totalGapMS = 0
         sampleCount = 0
         hitchCount = 0
+        // The block-based Timer initializer's callback type is `@Sendable`, so the closure
+        // literal is nonisolated by default even though this timer is added to `RunLoop.main`
+        // in `.common` mode and therefore always fires on the main thread. `assumeIsolated`
+        // is the documented bridge for exactly this case (a callback the compiler can't
+        // annotate `@MainActor` but is known to run on the main actor's thread) — it asserts
+        // that fact at runtime rather than silently trusting it, with no change in when/where
+        // `tick()` actually runs.
         let t = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
-            self?.tick()
+            MainActor.assumeIsolated {
+                self?.tick()
+            }
         }
         RunLoop.main.add(t, forMode: .common)
         timer = t
