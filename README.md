@@ -131,7 +131,7 @@ Requirements: Xcode 26.6, XcodeGen (`brew install xcodegen`), Docker.
     make server-up    # start dev Audiobookshelf + Dex (OIDC) at localhost:13378 / :5556
     make seed         # root/colophon-dev + a LibriVox test book + a seeded 2-episode
                       #   podcast (local RSS fixture) + OIDC (Dex) config
-    make test         # package unit tests (ABSKit, PlayerEngine, LibraryCache, DownloadManager)
+    make test         # package unit tests (ABSKit, PlayerEngine, LibraryCache, DownloadManager, ColophonShared)
     make test-app     # ColophonTests: AppState state-machine unit tests (hosted bundle)
     make build-ios build-mac
 

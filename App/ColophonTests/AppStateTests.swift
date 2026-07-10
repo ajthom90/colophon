@@ -6,6 +6,7 @@ import ABSKitTestSupport
 import ABSRealtime
 import LibraryCache
 import PlayerEngine
+import ColophonShared
 @testable import Colophon
 
 /// State-machine coverage for `AppState` — where both M1a merge-gating bugs lived. Every test
@@ -412,6 +413,47 @@ struct AppStateTests {
         #expect(app.nowPlayingItemID == "book1")
         #expect(app.nowPlayingEpisodeID == nil)
         #expect(app.playback.author == "An Author")
+    }
+
+    // MARK: - App-Group snapshot publishing (M2b Task 1)
+
+    /// The now-playing snapshot-publish wiring end to end, hermetically (a temp-dir `SharedStore`
+    /// seam — no provisioned App Group needed). Starting playback publishes a `NowPlayingSnapshot`
+    /// the widget can read (right item + title); retiring the session publishes ONE authoritative
+    /// CLEAR so no stale now-playing lingers after playback ends.
+    /// RED-meaningful two ways: dropping the `onNowPlayingStateChange`→`publishNowPlayingSnapshot`
+    /// wiring leaves `readNowPlaying()` nil after start; dropping `retireCurrentSession`'s final
+    /// clear leaves the started snapshot lingering (non-nil) after retire.
+    @Test func startPublishesNowPlayingSnapshotAndRetireClearsIt() async throws {
+        let transport = MockTransport()
+        await enqueueSuccessfulConnect(transport)
+        let container = makeTempDir()
+        try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
+        let store = SharedStore(suiteName: "colophon.tests.\(UUID().uuidString)", containerURL: container)
+        let app = AppState(
+            transportProvider: { transport },
+            cacheDirectory: makeTempDir(),
+            socketFactory: { _, _ in FakeSocket() },
+            tokenStore: InMemoryTokenStore(),
+            oidcTransportProvider: { transport },
+            downloadManagerProvider: { FakeDownloadManaging() },
+            snapshotStore: store)
+
+        await app.connect(serverURL: "http://s:13378", username: "root", password: "pw")
+        await transport.enqueue(status: 200, json: bookPlayJSON)
+
+        await app.startPlayback(itemID: "book1")
+
+        // A now-playing snapshot was published into the (temp) App-Group store — right item + title.
+        let published = try #require(store.readNowPlaying())
+        #expect(published.itemID == "book1")
+        #expect(published.title == "A Book")
+        #expect(published.episodeID == nil)
+
+        // Retiring the session publishes the authoritative CLEAR — no stale now-playing lingers.
+        await app.closeCurrentSession()
+        #expect(app.nowPlayingItemID == nil)
+        #expect(store.readNowPlaying() == nil)
     }
 
     /// A queued EPISODE (its `QueueEntry.episodeId` set) advances through the episode path:

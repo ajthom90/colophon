@@ -275,8 +275,10 @@ final class AppState {
     private(set) var libraryItemOrder: [String: [String]] = [:]
 
     /// Publishes now-playing + continue-listening SNAPSHOTS into the App Group for the companion
-    /// extensions (M2b Task 1). Display data only — never tokens (see `SnapshotPublisher`).
-    private let snapshots = SnapshotPublisher()
+    /// extensions (M2b Task 1). Display data only — never tokens (see `SnapshotPublisher`). Built in
+    /// `init` from the (default: production) `SharedStore`; a test injects a temp-dir store so the
+    /// publish/clear wiring can be asserted hermetically without a provisioned App Group container.
+    private let snapshots: SnapshotPublisher
     /// The container-relative path of the current now-playing cover thumbnail (written into the App
     /// Group by `loadNowPlayingArtwork`), carried on the published `NowPlayingSnapshot`. Cleared with
     /// the session in `retireCurrentSession`.
@@ -388,11 +390,15 @@ final class AppState {
         // `DownloadManager` stands up a background `URLSession`, which must not happen merely by
         // constructing `AppState` in a unit test that never downloads. Tests inject a fake.
         downloadManagerProvider: (@MainActor () -> any DownloadManaging)? = nil,
-        downloadsRoot: URL? = nil
+        downloadsRoot: URL? = nil,
+        // Test seam: an explicit App-Group `SharedStore` (temp suite/dir) so the snapshot-publish
+        // wiring can be asserted hermetically. `nil` reproduces production (the real App-Group store).
+        snapshotStore: SharedStore? = nil
     ) {
         self.transport = transportProvider()
         self.oidcTransport = oidcTransportProvider?()
         self.tokenStore = tokenStore ?? KeychainTokenStore()
+        self.snapshots = snapshotStore.map(SnapshotPublisher.init(store:)) ?? SnapshotPublisher()
         // `playback` is initialized at its declaration, so it's already live here; the timer
         // captures only that controller (not `self`), keeping init capture-free.
         self.sleepTimer = SleepTimer(host: playback)
