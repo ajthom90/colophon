@@ -17,6 +17,9 @@ struct NowPlayingLiveActivity: Widget {
             NowPlayingLockScreenView(attributes: context.attributes, state: context.state)
                 .activityBackgroundTint(.black.opacity(0.5))
                 .activitySystemActionForegroundColor(.white)
+                // Tapping the banner (outside the transport buttons) deep-links into the app — the same
+                // `colophon://resume` grammar the Dynamic Island uses (inert until Task 5 wires onOpenURL).
+                .widgetURL(ColophonDeepLink.resume.url)
         } dynamicIsland: { context in
             DynamicIsland {
                 DynamicIslandExpandedRegion(.leading) {

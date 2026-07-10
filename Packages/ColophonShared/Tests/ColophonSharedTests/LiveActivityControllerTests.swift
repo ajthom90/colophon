@@ -8,12 +8,15 @@ import Foundation
 @MainActor
 private final class FakeActivityManager: ActivityManaging {
     var areActivitiesEnabled = true
+    /// When false, `start` records the call but does NOT go active — models a real ActivityKit
+    /// request that silently fails, so the record-gating retry can be asserted.
+    var startSucceeds = true
     private(set) var isActive = false
     private(set) var starts: [LiveActivityState] = []
     private(set) var updates: [LiveActivityState] = []
     private(set) var endCount = 0
 
-    func start(_ state: LiveActivityState) { starts.append(state); isActive = true }
+    func start(_ state: LiveActivityState) { starts.append(state); if startSucceeds { isActive = true } }
     func update(_ state: LiveActivityState) { updates.append(state) }
     func end() { endCount += 1; isActive = false }
 }
@@ -176,7 +179,7 @@ private func makeState(
 }
 
 @MainActor
-@Test func sameEpisodeReusesActivityDistinctEpisodeSwitches() {
+@Test func distinctEpisodeOfSamePodcastEndsOldAndStartsNew() {
     let fake = FakeActivityManager()
     let controller = LiveActivityController(manager: fake)
 
@@ -186,5 +189,30 @@ private func makeState(
 
     #expect(fake.starts.map(\.identity) == ["pod1|ep1", "pod1|ep2"])
     #expect(fake.endCount == 1)
+    #expect(fake.isActive == true)
+}
+
+// MARK: - Record only a start the manager actually honored
+
+@MainActor
+@Test func retriesStartWhenManagerStartSilentlyNoOps() {
+    let fake = FakeActivityManager()
+    fake.startSucceeds = false   // model a failed ActivityKit request
+    let controller = LiveActivityController(manager: fake)
+
+    controller.sync(makeState())
+    // The manager didn't go active, so the controller must NOT remember it as live…
+    #expect(fake.starts.count == 1)
+    #expect(fake.isActive == false)
+
+    // …and the next signal retries the start (rather than treating it as an update).
+    controller.sync(makeState(progress: 0.2))
+    #expect(fake.starts.count == 2)
+    #expect(fake.updates.isEmpty)
+
+    // Once the manager does go active, it starts once more and settles (no further retry).
+    fake.startSucceeds = true
+    controller.sync(makeState(progress: 0.3))
+    #expect(fake.starts.count == 3)
     #expect(fake.isActive == true)
 }

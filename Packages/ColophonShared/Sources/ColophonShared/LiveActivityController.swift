@@ -147,6 +147,10 @@ public final class LiveActivityController {
         clearTracking()
         guard manager.areActivitiesEnabled else { return }
         manager.start(state)
+        // The start can silently no-op (e.g. an ActivityKit request failure) — only record it as the
+        // active Activity if the manager actually became active, so a failed start is retried on the
+        // next signal instead of being remembered as live.
+        guard manager.isActive else { return }
         record(state)
     }
 
