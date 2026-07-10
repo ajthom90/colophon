@@ -456,14 +456,17 @@ struct AppStateTests {
         #expect(store.readNowPlaying() == nil)
     }
 
-    /// `publishContinueListeningSnapshot`'s artwork-thumbnail fetch (M2b Task 2) is guarded on
+    /// `publishContinueListeningSnapshot`'s artwork-thumbnail phase (M2b Task 2) is guarded on
     /// `client`/`activeConnectionID`: with no active connection (never `connect()`ed — the app's
     /// state right after launch, before Home's first shelf load resolves), the function still
-    /// publishes the shelf's title/author/progress and returns cleanly with NO attempted network
-    /// fetch and no crash — every entry's `artworkThumbnailPath` stays nil (the widget's
-    /// placeholder-cover path). RED-meaningful: dropping the early guard would force-unwrap `client`
-    /// or attempt a fetch with no `connectionID`, either crashing or throwing inside the function.
-    @Test func continueListeningSnapshotWithNoActiveConnectionPublishesWithoutArtwork() async throws {
+    /// publishes the shelf's title/author/progress synchronously and returns with NO spawned artwork
+    /// Task, no network fetch and no crash — every entry's `artworkThumbnailPath` stays nil (the
+    /// widget's placeholder-cover path). RED-meaningful: dropping the early guard would force-unwrap
+    /// `client` or spawn a fetch with no `connectionID`. (The staleness bail before the deferred
+    /// republish — `activeConnectionID == captured && activeLibraryID == captured` — mirrors
+    /// `loadNowPlayingArtwork`'s `nowPlayingItemID == itemID` guard and, like it, isn't unit-reached
+    /// here because the fetch goes through raw `URLSession` with no mock seam.)
+    @Test func continueListeningSnapshotWithNoActiveConnectionPublishesWithoutArtwork() throws {
         let container = makeTempDir()
         try FileManager.default.createDirectory(at: container, withIntermediateDirectories: true)
         let store = SharedStore(suiteName: "colophon.tests.\(UUID().uuidString)", containerURL: container)
@@ -484,7 +487,7 @@ struct AppStateTests {
         """#
         let shelves = try JSONDecoder().decode([Shelf].self, from: Data(shelvesJSON.utf8))
 
-        await app.publishContinueListeningSnapshot(from: shelves)
+        app.publishContinueListeningSnapshot(from: shelves)
 
         let published = try #require(store.readContinueListening())
         #expect(published.entries.count == 1)

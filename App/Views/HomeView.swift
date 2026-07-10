@@ -207,8 +207,9 @@ struct HomeView: View {
         await app.refreshProgress()
         // Publish the continue-listening shelf into the App Group for the home widget (M2b Task 1),
         // AFTER the progress join so the snapshot's per-entry progress reads the freshly-joined
-        // cache. `await`ed: the thumbnail fetch/downscale runs detached off the main actor (Task 2)
-        // but the second (artwork) publish still needs this call to stay alive until it completes.
-        await app.publishContinueListeningSnapshot(from: shelves)
+        // cache. Synchronous + fast: it publishes the text snapshot immediately and spawns the
+        // widget-only cover-thumbnail fetch as an unawaited best-effort Task (M2b Task 2), so this
+        // pull-to-refresh path never blocks on artwork.
+        app.publishContinueListeningSnapshot(from: shelves)
     }
 }

@@ -1980,23 +1980,20 @@ final class AppState {
     /// `.systemSmall`/`.systemMedium` widget cover slot.
     private static let continueListeningThumbnailPixelSize = 200
 
-    /// Publish the continue-listening SHELF into the App Group for the home widget, THEN fetch +
-    /// downscale a cover thumbnail for the entries the widget can actually show (M2b Task 2) and
-    /// republish with the resolved paths. Called by `HomeView` after it (re)loads the personalized
-    /// shelves (and joins progress), so the widget's list mirrors Home's "Continue Listening" row.
-    /// Progress is joined from the local cache (the shelf entities themselves carry none — see
-    /// `refreshProgress`). Display data ONLY.
+    /// Publish the continue-listening SHELF into the App Group for the home widget. Called by
+    /// `HomeView` after it (re)loads the personalized shelves (and joins progress), so the widget's
+    /// list mirrors Home's "Continue Listening" row. Progress is joined from the local cache (the
+    /// shelf entities themselves carry none — see `refreshProgress`). Display data ONLY.
     ///
-    /// Two publishes: the FIRST (title/author/progress, no artwork) lands immediately so the
-    /// widget refreshes without waiting on any network fetch; the SECOND republishes with whatever
-    /// thumbnails resolved. Each fetch runs in a `Task.detached` — OFF the main actor, since under
-    /// this module's default-MainActor isolation a plain `async` call would otherwise run the
-    /// network round-trip + `ArtworkThumbnail` decode/resize back on the main thread once resumed.
-    /// A missing/failed cover for an entry just leaves that entry's `artworkThumbnailPath` nil —
-    /// the widget shows its placeholder cover, never a crash.
-    func publishContinueListeningSnapshot(from shelves: [Shelf]) async {
+    /// Synchronous + fast: it publishes the TEXT snapshot (title/author/progress, no artwork)
+    /// immediately so `HomeView.loadShelves`'s pull-to-refresh spinner never blocks on the
+    /// widget-only cover fetch, then spawns the artwork phase as an unawaited best-effort `Task`
+    /// (the same pattern as `loadNowPlayingArtwork`'s launch site) that fetches thumbnails and
+    /// republishes — guarded on staleness so a slow fetch for a since-superseded library/connection
+    /// can't clobber the current one.
+    func publishContinueListeningSnapshot(from shelves: [Shelf]) {
         let entities = shelves.first { $0.id == "continue-listening" }?.entities ?? []
-        var entries: [ContinueListeningSnapshot.Entry] = entities.compactMap { entity in
+        let entries: [ContinueListeningSnapshot.Entry] = entities.compactMap { entity in
             switch entity {
             case let .book(book):
                 return ContinueListeningSnapshot.Entry(
@@ -2023,6 +2020,34 @@ final class AppState {
         snapshots.publishContinueListening(ContinueListeningSnapshot(entries: entries))
 
         guard let client, let connectionID = activeConnectionID, !entries.isEmpty else { return }
+        // Capture the shelf source's identity NOW; the guard in `loadContinueListeningArtwork`
+        // re-checks it before the artwork republish. Unawaited — a widget-only side effect that
+        // must not tie up `loadShelves` (up to `maxWidgetDisplayCount` cover round-trips).
+        let libraryID = activeLibraryID
+        Task { await loadContinueListeningArtwork(entries, client: client,
+                                                  connectionID: connectionID, libraryID: libraryID) }
+    }
+
+    /// The continue-listening widget's cover-thumbnail phase (M2b Task 2), split off
+    /// `publishContinueListeningSnapshot` so the fast text publish isn't blocked by network. Fetches
+    /// a cover per widget-visible entry (through the disk-backed `CoverStore`, the same cache
+    /// `CachedCoverView`/`ShelfRow` use), downscales it to a small thumbnail, writes it into the App
+    /// Group, and republishes the snapshot with the resolved paths.
+    ///
+    /// Each fetch runs in a `Task.detached` — OFF the main actor, since under this module's
+    /// default-MainActor isolation a plain `async` call would otherwise run the network round-trip +
+    /// `ArtworkThumbnail` decode/resize back on the main thread once resumed.
+    ///
+    /// STALENESS GUARD (mirrors `loadNowPlayingArtwork`'s `nowPlayingItemID == itemID` check): these
+    /// detached fetches are unstructured, so they escape `HomeView`'s `.task(id: activeLibrary?.id)`
+    /// cancellation — switching server/library mid-fetch could otherwise let the OLD library's
+    /// republish land after the new one's. So before the republish we re-assert the captured
+    /// `(connectionID, libraryID)` still matches the active one and bail if not. A missing/failed
+    /// cover for an entry just leaves its `artworkThumbnailPath` nil — the widget shows a placeholder.
+    private func loadContinueListeningArtwork(
+        _ entries: [ContinueListeningSnapshot.Entry],
+        client: ABSClient, connectionID: String, libraryID: String?
+    ) async {
         let coverStore = self.coverStore
         let store = snapshots.store
         let pixelSize = Self.continueListeningThumbnailPixelSize
@@ -2046,16 +2071,20 @@ final class AppState {
                 return (index, store.writeArtwork(thumbnail, forKey: key))
             }
         }
+        var updated = entries
         var didResolveAny = false
         for fetch in fetches {
             let (index, path) = await fetch.value
             if let path {
-                entries[index].artworkThumbnailPath = path
+                updated[index].artworkThumbnailPath = path
                 didResolveAny = true
             }
         }
         guard didResolveAny else { return }
-        snapshots.publishContinueListening(ContinueListeningSnapshot(entries: entries))
+        // The staleness bail: the active connection/library changed while covers were fetching, so
+        // this snapshot is for a superseded shelf source — drop it rather than overwrite the current.
+        guard activeConnectionID == connectionID, activeLibraryID == libraryID else { return }
+        snapshots.publishContinueListening(ContinueListeningSnapshot(entries: updated))
     }
 
     /// Fractional progress (0…1) for a continue-listening entry, joined from the local `cachedProgress`
