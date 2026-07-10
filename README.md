@@ -4,9 +4,43 @@ A native audiobook & podcast client for [Audiobookshelf](https://www.audiobooksh
 across iPhone, iPad, Mac, Apple TV, Vision Pro, and Apple Watch. Serif-typeset,
 Liquid Glass, and unapologetically Mac-assed on the Mac.
 
-**Status:** M2b companions — Colophon's now-playing and continue-listening
-state now surfaces outside the app itself, all reading a small Codable
-snapshot (titles, ids, progress, artwork thumbnail paths — never tokens or
+**Status:** M2c tip jar — a "Support the app" section at the bottom of
+Settings (below every real preference, since it unlocks nothing) opens a
+native tip jar: three StoreKit 2 **consumable** in-app purchases ("Leave a
+Tip" $1.99, "Generous Tip" $4.99, "Amazing Tip" $9.99), each showing a
+store-localized price (`Product.displayPrice`, never a hardcoded string)
+and, on purchase, a warm thank-you state. Tips can repeat freely — there is
+deliberately no lock-out and no "Restore Purchases" button, since
+consumables carry no entitlement to restore. Colophon remains a **free app
+with every feature included**: a `TipStore` state machine (`@Observable`,
+driven through a StoreKit-free `TipProviding` seam and unit-tested end to
+end against a `FakeTipProvider` — load success/failure, purchase success/
+cancel/pending/failure, a repeat-tip case — with no StoreKit host needed)
+only ever transitions its own transient state; it writes no `@AppStorage`/
+`UserDefaults` key and gates nothing, confirmed both by test and by grep.
+The real path is `StoreKitTipProvider` (`Product`/`Transaction`/
+`VerificationResult`, verifying and `finish()`ing every transaction —
+including ones arriving via `Transaction.updates` for Ask-to-Buy), backed
+by a committed `Products.storekit` StoreKit-Testing config wired into the
+scheme's Run action, so the full render-tiers → purchase → thank-you flow
+is testable with no App Store Connect round-trip — but only when **Xcode
+itself** launches the app (a bare simulator install bypasses StoreKit
+Testing entirely). A real sandbox purchase additionally needs the 3
+consumable products created in App Store Connect
+(`com.andrewthom.colophon.tip.{small,medium,large}`) at submission time,
+which has **not** happened yet — this milestone ships the code and the
+local `.storekit` config, not live App Store products. **CarPlay remains
+DEFERRED** — the `com.apple.developer.carplay-audio` entitlement is still
+pending (docs/superpowers/carplay-entitlement.md). See
+docs/superpowers/m2c-human-verification.md for the Xcode/device-only
+checklist (the local StoreKit Testing flow now, a real sandbox purchase
+once App Store Connect products exist, and confirming no feature is ever
+gated behind a tip) the automated, always-muted E2E can't cover.
+
+Built on M2b's companion surfaces — Colophon's now-playing and
+continue-listening state now surfaces outside the app itself, all reading
+a small Codable snapshot (titles, ids, progress, artwork thumbnail paths —
+never tokens or
 credentials, which stay device-local in the Keychain) that the app
 publishes into a new App Group (`group.com.andrewthom.colophon`) via
 `ColophonShared` (the 5th local SwiftPM package), shared with a new
